@@ -4,6 +4,11 @@ use super::paragraph::Paragraph;
 use super::shape::{common_obj_offsets, Caption};
 use super::*;
 
+pub const CELL_FLAG_HAS_MARGIN: u16 = 0x0001;
+pub const CELL_FLAG_PROTECT: u16 = 0x0002;
+pub const CELL_FLAG_HEADER: u16 = 0x0004;
+pub const CELL_FLAG_EDITABLE_IN_FORM: u16 = 0x0008;
+
 /// 표 개체 (HWPTAG_TABLE)
 #[derive(Debug, Default, Clone)]
 pub struct Table {
@@ -50,6 +55,18 @@ pub struct Table {
     /// 구조/내용 변경 시 true → 재측정 필요 (Default: false)
     #[doc(hidden)]
     pub dirty: bool,
+    /// Studio 보상 resize로 행별 독립 가로 경계를 보존해야 하는 행.
+    #[doc(hidden)]
+    pub local_resize_rows: Vec<u16>,
+    /// Studio 보상 resize로 열별 독립 세로 경계를 보존해야 하는 열.
+    #[doc(hidden)]
+    pub local_resize_cols: Vec<u16>,
+    /// Studio 로컬 가로 resize 후 셀별 목표 표시 폭(HWPUNIT).
+    #[doc(hidden)]
+    pub local_resize_cell_widths: Vec<(usize, u32)>,
+    /// Studio 로컬 세로 resize 후 셀별 목표 표시 높이(HWPUNIT).
+    #[doc(hidden)]
+    pub local_resize_cell_heights: Vec<(usize, u32)>,
 }
 
 /// 표 쪽 나눔 종류
@@ -129,6 +146,40 @@ pub enum VerticalAlign {
 }
 
 impl Cell {
+    pub fn set_apply_inner_margin(&mut self, value: bool) {
+        self.apply_inner_margin = value;
+        self.set_list_header_flag(CELL_FLAG_HAS_MARGIN, value);
+    }
+
+    pub fn cell_protect(&self) -> bool {
+        self.list_header_width_ref & CELL_FLAG_PROTECT != 0
+    }
+
+    pub fn set_cell_protect(&mut self, value: bool) {
+        self.set_list_header_flag(CELL_FLAG_PROTECT, value);
+    }
+
+    pub fn set_header(&mut self, value: bool) {
+        self.is_header = value;
+        self.set_list_header_flag(CELL_FLAG_HEADER, value);
+    }
+
+    pub fn editable_in_form(&self) -> bool {
+        self.list_header_width_ref & CELL_FLAG_EDITABLE_IN_FORM != 0
+    }
+
+    pub fn set_editable_in_form(&mut self, value: bool) {
+        self.set_list_header_flag(CELL_FLAG_EDITABLE_IN_FORM, value);
+    }
+
+    fn set_list_header_flag(&mut self, flag: u16, value: bool) {
+        if value {
+            self.list_header_width_ref |= flag;
+        } else {
+            self.list_header_width_ref &= !flag;
+        }
+    }
+
     /// 빈 셀을 생성한다 (빈 문단 1개 포함).
     pub fn new_empty(
         col: u16,
@@ -232,6 +283,102 @@ impl Table {
         }
     }
 
+    /// 저장/복구 후 Studio 런타임 힌트가 사라진 행 단위 가로 resize를 보수적으로 추론한다.
+    ///
+    /// 한컴 HWP5에는 `local_resize_rows` 같은 rhwp 내부 힌트를 저장할 곳이 없다. 따라서
+    /// 같은 셀 배치 패턴을 공유하는 행들 중 다수의 폭 벡터와 다른 소수 행만 행 단위
+    /// resize 결과로 간주한다. 병합 패턴이 유일한 행은 원본 문서 구조일 가능성이 높아
+    /// 추론 대상에서 제외한다.
+    pub fn inferred_local_resize_rows(&self) -> Vec<u16> {
+        let col_count = self.col_count as usize;
+        if col_count == 0 || self.row_count == 0 {
+            return Vec::new();
+        }
+
+        let explicit_rows = self
+            .local_resize_rows
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut grouped_rows =
+            std::collections::BTreeMap::<Vec<(u16, u16)>, Vec<(u16, Vec<u32>)>>::new();
+
+        for row in 0..self.row_count {
+            if explicit_rows.contains(&row) {
+                continue;
+            }
+
+            let mut row_cells = self
+                .cells
+                .iter()
+                .filter(|cell| cell.row == row && cell.row_span == 1)
+                .collect::<Vec<_>>();
+            row_cells.sort_by_key(|cell| cell.col);
+
+            let mut next_col = 0u16;
+            let mut pattern = Vec::new();
+            let mut widths = Vec::new();
+            let mut valid = !row_cells.is_empty();
+
+            for cell in row_cells {
+                let span = cell.col_span.max(1);
+                let end_col = cell.col.saturating_add(span);
+                if cell.col != next_col || end_col <= cell.col || end_col as usize > col_count {
+                    valid = false;
+                    break;
+                }
+
+                pattern.push((cell.col, span));
+                widths.push(cell.width);
+                next_col = end_col;
+            }
+
+            if !valid || next_col as usize != col_count {
+                continue;
+            }
+
+            grouped_rows.entry(pattern).or_default().push((row, widths));
+        }
+
+        let mut inferred = std::collections::BTreeSet::new();
+        for rows in grouped_rows.values() {
+            if rows.len() < 2 {
+                continue;
+            }
+
+            let mut width_counts = std::collections::BTreeMap::<Vec<u32>, usize>::new();
+            for (_, widths) in rows {
+                *width_counts.entry(widths.clone()).or_default() += 1;
+            }
+
+            let Some((dominant_widths, dominant_count)) =
+                width_counts.iter().max_by_key(|(_, count)| **count)
+            else {
+                continue;
+            };
+            if *dominant_count < 2 {
+                continue;
+            }
+
+            let dominant_is_tied = width_counts
+                .values()
+                .filter(|count| **count == *dominant_count)
+                .count()
+                > 1;
+            if dominant_is_tied {
+                continue;
+            }
+
+            for (row, widths) in rows {
+                if widths != dominant_widths {
+                    inferred.insert(*row);
+                }
+            }
+        }
+
+        inferred.into_iter().collect()
+    }
+
     /// 2D 그리드 인덱스를 재구축한다.
     /// 구조 변경(파싱, 행/열 추가/삭제, 병합/분할) 후 호출해야 한다.
     pub fn rebuild_grid(&mut self) {
@@ -301,6 +448,45 @@ impl Table {
         self.common.height = total_height;
     }
 
+    fn sync_ctrl_height(&mut self, height: HwpUnit) {
+        self.common.height = height;
+        if self.raw_ctrl_data.len() >= common_obj_offsets::HEIGHT.end {
+            self.raw_ctrl_data[common_obj_offsets::HEIGHT].copy_from_slice(&height.to_le_bytes());
+        }
+    }
+
+    fn stretched_row_heights(&self) -> Option<Vec<HwpUnit>> {
+        let mut heights = self.get_row_heights();
+        let raw_sum: u64 = heights.iter().map(|h| *h as u64).sum();
+        let target = self.common.height as u64;
+        if heights.is_empty() || raw_sum == 0 || target <= raw_sum {
+            return None;
+        }
+
+        let mut scaled_sum = 0u64;
+        for height in &mut heights {
+            let scaled = ((*height as u64 * target) + raw_sum / 2) / raw_sum;
+            *height = scaled.max(1).min(u32::MAX as u64) as HwpUnit;
+            scaled_sum += *height as u64;
+        }
+
+        if let Some(last) = heights.last_mut() {
+            match target.cmp(&scaled_sum) {
+                std::cmp::Ordering::Greater => {
+                    let delta = (target - scaled_sum).min(u32::MAX as u64);
+                    *last = last.saturating_add(delta as HwpUnit);
+                }
+                std::cmp::Ordering::Less => {
+                    let delta = (scaled_sum - target).min(*last as u64);
+                    *last = last.saturating_sub(delta as HwpUnit).max(1);
+                }
+                std::cmp::Ordering::Equal => {}
+            }
+        }
+
+        Some(heights)
+    }
+
     /// 열별 폭을 추출한다 (col_span==1인 셀 기준).
     pub fn get_column_widths(&self) -> Vec<HwpUnit> {
         let mut widths = vec![0u32; self.col_count as usize];
@@ -318,6 +504,36 @@ impl Table {
             }
         }
         widths
+    }
+
+    /// 열별 폭(HWPUNIT)을 절대값으로 설정한다.
+    ///
+    /// `widths.len()` 은 `col_count` 와 같아야 한다. 병합 셀(`col_span > 1`)은
+    /// 걸친 열들의 폭 합으로 설정된다. 설정 후 표 전체 크기
+    /// (`update_ctrl_dimensions`)와 그리드 인덱스(`rebuild_grid`)를 갱신한다.
+    ///
+    /// `insert_column` 이 기준 열 폭을 복제해 표를 넓히는 것과 달리, 이 메서드는
+    /// 입력한 폭들의 합이 그대로 표 전체 폭이 된다. 페이지 폭에 맞추려면
+    /// 합이 본문 폭 이하가 되도록 전달한다.
+    pub fn set_column_widths(&mut self, widths: &[HwpUnit]) -> Result<(), String> {
+        if widths.len() != self.col_count as usize {
+            return Err(format!(
+                "열 폭 개수 {} 가 표의 열 수 {} 와 다릅니다",
+                widths.len(),
+                self.col_count
+            ));
+        }
+        for cell in &mut self.cells {
+            let c = cell.col as usize;
+            if c >= widths.len() {
+                continue;
+            }
+            let end = (c + cell.col_span as usize).min(widths.len());
+            cell.width = widths[c..end].iter().sum();
+        }
+        self.update_ctrl_dimensions();
+        self.rebuild_grid();
+        Ok(())
     }
 
     /// 행별 높이를 추출한다 (row_span==1인 셀 기준).
@@ -366,6 +582,10 @@ impl Table {
             ));
         }
 
+        let stretched_new_row_height = self
+            .stretched_row_heights()
+            .and_then(|heights| heights.get(row_idx as usize).copied());
+        let original_height = self.common.height;
         let target_row = if below { row_idx + 1 } else { row_idx };
         let col_widths = self.get_column_widths();
 
@@ -438,6 +658,11 @@ impl Table {
 
         // CommonObjAttr 크기 갱신
         self.update_ctrl_dimensions();
+        if let Some(new_row_height) = stretched_new_row_height {
+            // 일반 표는 셀 저장 height보다 큰 표시 height를 별도로 가진다.
+            // 행 추가 시 표시 기준 행 높이를 더해 표가 납작해지지 않도록 보존한다.
+            self.sync_ctrl_height(original_height.saturating_add(new_row_height));
+        }
 
         // 그리드 인덱스 재구축
         self.rebuild_grid();
@@ -518,6 +743,7 @@ impl Table {
             ));
         }
 
+        let original_height = self.common.height;
         let target_col = if right { col_idx + 1 } else { col_idx };
         let col_widths = self.get_column_widths();
         let row_heights = self.get_row_heights();
@@ -583,6 +809,14 @@ impl Table {
 
         // CommonObjAttr 크기 갱신
         self.update_ctrl_dimensions();
+        if original_height > 0 {
+            // 열 추가는 행 수를 바꾸지 않으므로 표 외곽 높이는 기존 값을 유지한다.
+            self.common.height = original_height;
+            if self.raw_ctrl_data.len() >= common_obj_offsets::HEIGHT.end {
+                self.raw_ctrl_data[common_obj_offsets::HEIGHT]
+                    .copy_from_slice(&original_height.to_le_bytes());
+            }
+        }
 
         // 그리드 인덱스 재구축
         self.rebuild_grid();
@@ -666,6 +900,11 @@ impl Table {
             return Err("최소 1행은 유지해야 합니다".to_string());
         }
 
+        let stretched_deleted_row_height = self
+            .stretched_row_heights()
+            .and_then(|heights| heights.get(row_idx as usize).copied());
+        let original_height = self.common.height;
+
         // 삭제 행을 걸치는 병합 셀: row_span 축소
         for cell in &mut self.cells {
             if cell.row < row_idx && cell.row + cell.row_span > row_idx {
@@ -700,6 +939,16 @@ impl Table {
 
         // CommonObjAttr 크기 갱신
         self.update_ctrl_dimensions();
+        if let Some(deleted_row_height) = stretched_deleted_row_height {
+            // 일반 표의 표시 높이는 셀 저장 height 합보다 크므로 삭제 행의 표시
+            // 높이만큼 외곽 height를 줄여 한컴식 비례를 유지한다.
+            let raw_sum: HwpUnit = self.get_row_heights().iter().sum();
+            self.sync_ctrl_height(
+                original_height
+                    .saturating_sub(deleted_row_height)
+                    .max(raw_sum),
+            );
+        }
 
         // 그리드 인덱스 재구축
         self.rebuild_grid();
@@ -720,6 +969,8 @@ impl Table {
         if self.col_count <= 1 {
             return Err("최소 1열은 유지해야 합니다".to_string());
         }
+
+        let original_height = self.common.height;
 
         // 삭제 열의 폭 (셀 width 축소용)
         let col_widths = self.get_column_widths();
@@ -765,6 +1016,14 @@ impl Table {
 
         // CommonObjAttr 크기 갱신
         self.update_ctrl_dimensions();
+        if original_height > 0 {
+            // 열 삭제는 행 수를 바꾸지 않으므로 표 외곽 높이는 기존 값을 유지한다.
+            self.common.height = original_height;
+            if self.raw_ctrl_data.len() >= common_obj_offsets::HEIGHT.end {
+                self.raw_ctrl_data[common_obj_offsets::HEIGHT]
+                    .copy_from_slice(&original_height.to_le_bytes());
+            }
+        }
 
         // 그리드 인덱스 재구축
         self.rebuild_grid();

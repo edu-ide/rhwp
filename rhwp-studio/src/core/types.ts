@@ -248,6 +248,7 @@ export interface FieldInfoResult {
   endCharIdx?: number;
   isGuide?: boolean;
   guideName?: string;
+  editableInForm?: boolean;
 }
 
 /** WASM getLineInfo() 반환 타입 */
@@ -410,6 +411,8 @@ export interface ParaProperties {
   patternColor?: string;   // '#RRGGBB'
   patternType?: number;    // 0=없음, 1~6=무늬
   borderSpacing?: number[];  // [좌, 우, 상, 하] HWPUNIT
+  borderConnect?: boolean;   // 문단 테두리 연결
+  borderIgnoreMargin?: boolean; // 문단 여백 무시
 }
 
 /** 테두리 선 정보 */
@@ -430,6 +433,8 @@ export interface CellProperties {
   paddingRight: number;
   paddingTop: number;
   paddingBottom: number;
+  /** 셀 고유 안 여백 지정 */
+  applyInnerMargin: boolean;
   /** 0=top, 1=center, 2=bottom */
   verticalAlign: number;
   /** 0=horizontal, 1=vertical */
@@ -437,6 +442,10 @@ export interface CellProperties {
   isHeader: boolean;
   /** 셀 보호 */
   cellProtect?: boolean;
+  /** 셀 필드 이름 */
+  fieldName?: string;
+  /** 양식 모드에서 편집 가능 */
+  editableInForm?: boolean;
   /** 테두리/배경 */
   borderFillId?: number;
   borderLeft?: BorderLineInfo;
@@ -534,6 +543,18 @@ export interface ControlLayoutItem {
   noteRef?: NoteControlRef;
   outerTableControlIdx?: number;
   headerFooter?: { kind: 'header' | 'footer'; outerParaIdx: number; outerControlIdx: number };
+  /**
+   * [Task #1280 v2] 렌더 정렬키 — 겹침 클릭 시 "최상단 개체" 판정용.
+   * Rust `paper_node_sort_key`(layout.rs)와 단일 진실 원천. 클수록 위.
+   * plane: BehindText=1, 어울림/기본=2, InFrontOfText=3.
+   */
+  plane?: number;
+  /** [Task #1280 v2] 개체 z-order (작을수록 먼저 그림 = 아래). */
+  zOrder?: number;
+  /** [Task #1280 v2] 같은 plane/zOrder 내 안정 정렬 tie-breaker. */
+  stableIndex?: number;
+  /** [Task #1280 v2] 텍스트 어울림 모드(이미지뿐 아니라 shape/line/group에도 노출). */
+  wrap?: string;
 }
 
 /** 개체 참조 (그림/글상자 공용) */
@@ -561,6 +582,8 @@ export interface ShapeProperties {
   vertOffset: number;
   horzOffset: number;
   textWrap: string;
+  /** 크기 고정 */
+  sizeProtect?: boolean;
   tbMarginLeft?: number;
   tbMarginRight?: number;
   tbMarginTop?: number;
@@ -605,6 +628,8 @@ export interface EquationProperties {
   vertOffset?: number;
   horzOffset?: number;
   textWrap?: string;
+  /** 크기 고정 */
+  sizeProtect?: boolean;
   zOrder?: number;
   instanceId?: number;
   outerMarginLeft?: number;
@@ -635,9 +660,17 @@ export interface PictureProperties {
   vertOffset: number;
   horzOffset: number;
   textWrap: string;
+  /** 쪽 영역 안으로 제한 */
+  restrictInPage?: boolean;
+  /** 서로 겹침 허용 */
+  allowOverlap?: boolean;
+  /** 크기 고정 */
+  sizeProtect?: boolean;
   brightness: number;
   contrast: number;
   effect: string;
+  /** 그림 개체 전체 투명도. 한컴 UI 기준 0=불투명, 100=완전 투명. */
+  transparency?: number;
   description: string;
   rotationAngle: number;
   horzFlip: boolean;
@@ -833,13 +866,23 @@ export interface PageLayerTree {
   unit?: 'px';
   coordinateSystem?: string;
   profile?: LayerRenderProfile;
+  buildOptions?: {
+    showTransparentBorders?: boolean;
+    clipEnabled?: boolean;
+  };
+  debugOptions?: {
+    debugOverlay?: boolean;
+  };
   pageWidth: number;
   pageHeight: number;
   outputOptions?: {
     showParagraphMarks?: boolean;
     showControlCodes?: boolean;
+    /** Compatibility mirror; prefer buildOptions.showTransparentBorders. */
     showTransparentBorders?: boolean;
+    /** Compatibility mirror; prefer buildOptions.clipEnabled. */
     clipEnabled?: boolean;
+    /** Compatibility mirror; prefer debugOptions.debugOverlay. */
     debugOverlay?: boolean;
   };
   resources?: LayerResources;
@@ -1038,6 +1081,7 @@ export interface LayerImageOp {
   effect?: string;
   brightness?: number;
   contrast?: number;
+  opacity?: number;
   bakedWatermark?: boolean;
   wrap?: 'behindText' | 'inFrontOfText' | string;
   transform?: LayerPathTransform;

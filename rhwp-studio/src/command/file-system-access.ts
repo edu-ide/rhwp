@@ -42,9 +42,14 @@ export interface SaveDocumentResult {
   fileName: string;
 }
 
+export const HWP_DOCUMENT_ACCEPT: Record<string, string[]> = {
+  'application/x-hwp': ['.hwp'],
+  'application/hwp+zip': ['.hwpx'],
+};
+
 const HWP_OPEN_PICKER_TYPES = [{
   description: 'HWP/HWPX 문서',
-  accept: { 'application/x-hwp': ['.hwp', '.hwpx'] },
+  accept: HWP_DOCUMENT_ACCEPT,
 }];
 
 const HWP_SAVE_PICKER_TYPES = [{
@@ -56,6 +61,14 @@ function isAbortError(error: unknown): boolean {
   return error instanceof DOMException && error.name === 'AbortError';
 }
 
+export function isSupportedDocumentFileName(fileName: string): boolean {
+  return /\.(hwp|hwpx)$/i.test(fileName.trim());
+}
+
+export function canUseOpenFilePicker(windowLike: FileSystemWindowLike): boolean {
+  return typeof windowLike.showOpenFilePicker === 'function';
+}
+
 async function writeBlobToHandle(handle: FileSystemFileHandleLike, blob: Blob): Promise<void> {
   const writable = await handle.createWritable();
   await writable.write(blob);
@@ -63,10 +76,10 @@ async function writeBlobToHandle(handle: FileSystemFileHandleLike, blob: Blob): 
 }
 
 export async function pickOpenFileHandle(windowLike: FileSystemWindowLike): Promise<FileSystemFileHandleLike | null> {
-  if (!windowLike.showOpenFilePicker) return null;
+  if (!canUseOpenFilePicker(windowLike)) return null;
 
   try {
-    const handles = await windowLike.showOpenFilePicker({
+    const handles = await windowLike.showOpenFilePicker!({
       excludeAcceptAllOption: true,
       multiple: false,
       types: HWP_OPEN_PICKER_TYPES,
