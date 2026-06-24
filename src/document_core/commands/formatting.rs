@@ -1084,6 +1084,74 @@ impl DocumentCore {
         Ok("{\"ok\":true}".to_string())
     }
 
+    /// 글자 서식 적용 (네이티브) — 중첩 셀/글상자 path 문단
+    pub fn apply_char_format_in_cell_by_path_native(
+        &mut self,
+        sec_idx: usize,
+        parent_para_idx: usize,
+        path: &[(usize, usize, usize)],
+        start_offset: usize,
+        end_offset: usize,
+        props_json: &str,
+    ) -> Result<String, HwpError> {
+        if path.is_empty() {
+            return Err(HwpError::RenderError("경로가 비어있습니다".to_string()));
+        }
+        let mut mods = parse_char_shape_mods(props_json);
+        if json_has_border_keys(props_json) {
+            let bf_id = self.create_border_fill_from_json(props_json);
+            mods.border_fill_id = Some(bf_id);
+        }
+
+        let base_id = {
+            let paragraph = self.get_cell_paragraph_mut_by_path(sec_idx, parent_para_idx, path)?;
+            paragraph.char_shape_id_at(start_offset).unwrap_or(0)
+        };
+        let new_id = self.document.find_or_create_char_shape(base_id, &mods);
+        {
+            let paragraph = self.get_cell_paragraph_mut_by_path(sec_idx, parent_para_idx, path)?;
+            paragraph.apply_char_shape_range(start_offset, end_offset, new_id);
+        }
+
+        if char_shape_mods_affect_text_flow(&mods) {
+            let dpi = self.dpi;
+            let styles = resolve_styles(&self.document.doc_info, dpi);
+            let section = &self.document.sections[sec_idx];
+            let page_def = &section.section_def.page_def;
+            let column_def = DocumentCore::find_initial_column_def(&section.paragraphs);
+            let layout = PageLayoutInfo::from_page_def(page_def, &column_def, dpi);
+            let col_width = layout
+                .column_areas
+                .first()
+                .map(|a| a.width)
+                .unwrap_or(layout.body_area.width);
+            let para_shape_id = {
+                let paragraph =
+                    self.get_cell_paragraph_mut_by_path(sec_idx, parent_para_idx, path)?;
+                paragraph.para_shape_id
+            };
+            let para_style = styles.para_styles.get(para_shape_id as usize);
+            let margin_left = para_style.map(|s| s.margin_left).unwrap_or(0.0);
+            let margin_right = para_style.map(|s| s.margin_right).unwrap_or(0.0);
+            let available_width = (col_width - margin_left - margin_right).max(1.0);
+            let paragraph = self.get_cell_paragraph_mut_by_path(sec_idx, parent_para_idx, path)?;
+            paragraph.line_segs.clear();
+            reflow_line_segs(paragraph, available_width, &styles, dpi);
+        }
+
+        let outer_ctrl = path[0].0;
+        self.mark_cell_control_dirty(sec_idx, parent_para_idx, outer_ctrl);
+        self.document.sections[sec_idx].raw_stream = None;
+        self.rebuild_section(sec_idx);
+        self.event_log.push(DocumentEvent::CharFormatChanged {
+            section: sec_idx,
+            para: parent_para_idx,
+            start: start_offset,
+            end: end_offset,
+        });
+        Ok("{\"ok\":true}".to_string())
+    }
+
     /// 문단 서식 적용 (네이티브) — 본문 문단
     pub fn apply_para_format_native(
         &mut self,
@@ -1286,6 +1354,90 @@ impl DocumentCore {
             }
         }
 
+        self.document.sections[sec_idx].raw_stream = None;
+        self.rebuild_section(sec_idx);
+        self.event_log.push(DocumentEvent::ParaFormatChanged {
+            section: sec_idx,
+            para: parent_para_idx,
+        });
+        Ok("{\"ok\":true}".to_string())
+    }
+
+    /// 문단 서식 적용 (네이티브) — 중첩 셀/글상자 path 문단
+    pub fn apply_para_format_in_cell_by_path_native(
+        &mut self,
+        sec_idx: usize,
+        parent_para_idx: usize,
+        path: &[(usize, usize, usize)],
+        props_json: &str,
+    ) -> Result<String, HwpError> {
+        if path.is_empty() {
+            return Err(HwpError::RenderError("경로가 비어있습니다".to_string()));
+        }
+        let mut mods = parse_para_shape_mods(props_json);
+
+        if json_has_tab_keys(props_json) {
+            let base_para_shape_id = {
+                let paragraph =
+                    self.get_cell_paragraph_mut_by_path(sec_idx, parent_para_idx, path)?;
+                paragraph.para_shape_id
+            };
+            let base_tab_def_id = self
+                .document
+                .doc_info
+                .para_shapes
+                .get(base_para_shape_id as usize)
+                .map(|ps| ps.tab_def_id)
+                .unwrap_or(0);
+            let new_td = build_tab_def_from_json(
+                props_json,
+                base_tab_def_id,
+                &self.document.doc_info.tab_defs,
+            );
+            let new_tab_id = self.document.find_or_create_tab_def(new_td);
+            mods.tab_def_id = Some(new_tab_id);
+        }
+
+        if json_has_border_keys(props_json) {
+            let bf_id = self.create_border_fill_from_json(props_json);
+            mods.border_fill_id = Some(bf_id);
+        }
+        if let Some(arr) = parse_json_i16_array(props_json, "borderSpacing", 4) {
+            mods.border_spacing = Some([arr[0], arr[1], arr[2], arr[3]]);
+        }
+
+        let base_id = {
+            let paragraph = self.get_cell_paragraph_mut_by_path(sec_idx, parent_para_idx, path)?;
+            paragraph.para_shape_id
+        };
+        let new_id = self.document.find_or_create_para_shape(base_id, &mods);
+        {
+            let paragraph = self.get_cell_paragraph_mut_by_path(sec_idx, parent_para_idx, path)?;
+            paragraph.para_shape_id = new_id;
+        }
+
+        if mods.line_spacing.is_some() || mods.line_spacing_type.is_some() {
+            let dpi = self.dpi;
+            let styles = resolve_styles(&self.document.doc_info, dpi);
+            let section = &self.document.sections[sec_idx];
+            let page_def = &section.section_def.page_def;
+            let column_def = DocumentCore::find_initial_column_def(&section.paragraphs);
+            let layout = PageLayoutInfo::from_page_def(page_def, &column_def, dpi);
+            let col_width = layout
+                .column_areas
+                .first()
+                .map(|a| a.width)
+                .unwrap_or(layout.body_area.width);
+            let para_style = styles.para_styles.get(new_id as usize);
+            let margin_left = para_style.map(|s| s.margin_left).unwrap_or(0.0);
+            let margin_right = para_style.map(|s| s.margin_right).unwrap_or(0.0);
+            let available_width = (col_width - margin_left - margin_right).max(1.0);
+            let paragraph = self.get_cell_paragraph_mut_by_path(sec_idx, parent_para_idx, path)?;
+            reflow_line_segs(paragraph, available_width, &styles, dpi);
+        }
+
+        let outer_ctrl = path[0].0;
+        self.mark_cell_control_dirty(sec_idx, parent_para_idx, outer_ctrl);
         self.document.sections[sec_idx].raw_stream = None;
         self.rebuild_section(sec_idx);
         self.event_log.push(DocumentEvent::ParaFormatChanged {

@@ -787,8 +787,10 @@ impl DocumentCore {
 
         // 채우기 파싱
         let fill_type_str = json_str(json, "fillType").unwrap_or_default();
-        let fill = if fill_type_str == "solid" {
-            let bg = json_color(json, "fillColor").unwrap_or(0xFFFFFF);
+        let fill_color = json_color(json, "fillColor");
+        let fill = if fill_type_str == "solid" || (fill_type_str.is_empty() && fill_color.is_some())
+        {
+            let bg = fill_color.unwrap_or(0xFFFFFF);
             let pat_c = json_color(json, "patternColor").unwrap_or(0);
             let pat_t = json_i32(json, "patternType").unwrap_or(0);
             Fill {

@@ -1,3 +1,5 @@
+[workspace]
+
 [package]
 name = "rhwp"
 version = "0.7.15"

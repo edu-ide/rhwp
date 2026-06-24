@@ -876,6 +876,7 @@ impl Paragraph {
                         | Control::Equation(_)
                         | Control::Footnote(_)
                         | Control::Endnote(_)
+                        | Control::Form(_)
                         | Control::AutoNumber(_)
                 ) {
                     pos += 1;

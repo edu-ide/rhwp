@@ -2,10 +2,12 @@
 //!
 //! 문서 전체에서 필드를 재귀 탐색하여 조회·설정하는 기능을 제공한다.
 
+use crate::document_core::helpers::find_control_text_positions;
 use crate::document_core::DocumentCore;
 use crate::error::HwpError;
 use crate::model::control::{Control, Field, FieldType};
-use crate::model::paragraph::Paragraph;
+use crate::model::paragraph::{FieldRange, Paragraph};
+use crate::parser::tags;
 
 /// 필드 위치 정보
 #[derive(Debug, Clone)]
@@ -110,6 +112,250 @@ impl DocumentCore {
             }
         }
         Err(HwpError::InvalidField(format!("필드 이름 '{}' 없음", name)))
+    }
+
+    fn next_clickhere_field_id(&self, name: &str) -> Result<u32, HwpError> {
+        if name.is_empty() {
+            return Err(HwpError::InvalidField(
+                "필드명은 비어 있을 수 없습니다.".into(),
+            ));
+        }
+
+        let fields = self.collect_all_fields();
+        if fields
+            .iter()
+            .any(|f| f.field.field_name().map(|n| n == name).unwrap_or(false))
+        {
+            return Err(HwpError::InvalidField(format!(
+                "필드 이름 '{}' 이미 있음",
+                name
+            )));
+        }
+
+        Ok(fields
+            .iter()
+            .filter(|f| f.field.ctrl_id != 0)
+            .map(|f| f.field.field_id)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1)
+            .max(1))
+    }
+
+    /// 본문 문단에 이름 있는 누름틀(ClickHere) 필드를 생성한다.
+    pub fn insert_clickhere_field_native(
+        &mut self,
+        section_idx: usize,
+        para_idx: usize,
+        char_offset: usize,
+        name: &str,
+        guide: &str,
+        memo: &str,
+        value: &str,
+    ) -> Result<String, HwpError> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(HwpError::InvalidField(
+                "필드명은 비어 있을 수 없습니다.".into(),
+            ));
+        }
+
+        let field_id = self.next_clickhere_field_id(name)?;
+
+        if let Some(sec) = self.document.sections.get_mut(section_idx) {
+            sec.raw_stream = None;
+        }
+
+        let (insert_idx, end_char_idx) = {
+            let para = self
+                .document
+                .sections
+                .get_mut(section_idx)
+                .and_then(|s| s.paragraphs.get_mut(para_idx))
+                .ok_or_else(|| HwpError::InvalidField("문단 위치 초과".into()))?;
+            insert_clickhere_field_into_paragraph(
+                para,
+                char_offset,
+                field_id,
+                name,
+                guide,
+                memo,
+                value,
+            )?
+        };
+        self.recompose_section(section_idx);
+
+        Ok(format!(
+            "{{\"ok\":true,\"operation\":\"insert-clickhere-field\",\"fieldId\":{},\"name\":{},\"guide\":{},\"value\":{},\"section\":{},\"para\":{},\"offset\":{},\"controlIdx\":{},\"startCharIdx\":{},\"endCharIdx\":{}}}",
+            field_id,
+            json_escape(name),
+            json_escape(guide),
+            json_escape(value),
+            section_idx,
+            para_idx,
+            char_offset,
+            insert_idx,
+            char_offset,
+            end_char_idx,
+        ))
+    }
+
+    /// 표 셀 또는 글상자 문단 안에 누름틀 필드를 삽입한다.
+    pub fn insert_clickhere_field_in_cell_native(
+        &mut self,
+        section_idx: usize,
+        parent_para_idx: usize,
+        control_idx: usize,
+        cell_idx: usize,
+        cell_para_idx: usize,
+        char_offset: usize,
+        is_textbox: bool,
+        name: &str,
+        guide: &str,
+        memo: &str,
+        value: &str,
+    ) -> Result<String, HwpError> {
+        let name = name.trim();
+        let field_id = self.next_clickhere_field_id(name)?;
+        let container = if is_textbox { "textbox" } else { "cell" };
+        let (insert_idx, end_char_idx) = {
+            let section = self
+                .document
+                .sections
+                .get_mut(section_idx)
+                .ok_or_else(|| HwpError::InvalidField("구역 위치 초과".into()))?;
+            section.raw_stream = None;
+            let host = section
+                .paragraphs
+                .get_mut(parent_para_idx)
+                .ok_or_else(|| HwpError::InvalidField("호스트 문단 위치 초과".into()))?;
+            let ctrl = host
+                .controls
+                .get_mut(control_idx)
+                .ok_or_else(|| HwpError::InvalidField("컨트롤 인덱스 초과".into()))?;
+            let para = if is_textbox {
+                if cell_idx != 0 {
+                    return Err(HwpError::InvalidField(
+                        "글상자 필드의 cell_idx는 0이어야 합니다.".into(),
+                    ));
+                }
+                if let Control::Shape(shape) = ctrl {
+                    let drawing = shape.drawing_mut().ok_or_else(|| {
+                        HwpError::InvalidField("Shape에 DrawingObjAttr 없음".into())
+                    })?;
+                    let tb = drawing
+                        .text_box
+                        .as_mut()
+                        .ok_or_else(|| HwpError::InvalidField("Shape에 TextBox 없음".into()))?;
+                    tb.paragraphs
+                        .get_mut(cell_para_idx)
+                        .ok_or_else(|| HwpError::InvalidField("글상자 문단 인덱스 초과".into()))?
+                } else {
+                    return Err(HwpError::InvalidField("예상된 Shape 컨트롤이 아님".into()));
+                }
+            } else if let Control::Table(table) = ctrl {
+                let cell = table
+                    .cells
+                    .get_mut(cell_idx)
+                    .ok_or_else(|| HwpError::InvalidField("셀 인덱스 초과".into()))?;
+                cell.paragraphs
+                    .get_mut(cell_para_idx)
+                    .ok_or_else(|| HwpError::InvalidField("셀 문단 인덱스 초과".into()))?
+            } else {
+                return Err(HwpError::InvalidField("예상된 Table 컨트롤이 아님".into()));
+            };
+            insert_clickhere_field_into_paragraph(
+                para,
+                char_offset,
+                field_id,
+                name,
+                guide,
+                memo,
+                value,
+            )?
+        };
+        self.recompose_section(section_idx);
+
+        Ok(format!(
+            "{{\"ok\":true,\"fieldId\":{},\"name\":{},\"guide\":{},\"value\":{},\"container\":\"{}\",\"section\":{},\"para\":{},\"control\":{},\"cell\":{},\"cellPara\":{},\"textbox\":{},\"offset\":{},\"controlIdx\":{},\"startCharIdx\":{},\"endCharIdx\":{}}}",
+            field_id,
+            json_escape(name),
+            json_escape(guide),
+            json_escape(value),
+            container,
+            section_idx,
+            parent_para_idx,
+            control_idx,
+            cell_idx,
+            cell_para_idx,
+            is_textbox,
+            char_offset,
+            insert_idx,
+            char_offset,
+            end_char_idx,
+        ))
+    }
+
+    /// path 기반: 중첩 표 셀 또는 셀 내부 글상자 문단 안에 누름틀 필드를 삽입한다.
+    pub fn insert_clickhere_field_by_path_native(
+        &mut self,
+        section_idx: usize,
+        parent_para_idx: usize,
+        path: &[(usize, usize, usize)],
+        char_offset: usize,
+        name: &str,
+        guide: &str,
+        memo: &str,
+        value: &str,
+    ) -> Result<String, HwpError> {
+        if path.is_empty() {
+            return Err(HwpError::InvalidField("cellPath가 비어 있습니다.".into()));
+        }
+        let name = name.trim();
+        let field_id = self.next_clickhere_field_id(name)?;
+        let (insert_idx, end_char_idx) = {
+            let para = self.get_cell_paragraph_mut_by_path(section_idx, parent_para_idx, path)?;
+            insert_clickhere_field_into_paragraph(
+                para,
+                char_offset,
+                field_id,
+                name,
+                guide,
+                memo,
+                value,
+            )?
+        };
+
+        let first = path[0];
+        let last = *path.last().unwrap();
+        let container = if path.len() > 1 && last.1 == 0 {
+            "cell_textbox"
+        } else {
+            "cell_path"
+        };
+        self.document.sections[section_idx].raw_stream = None;
+        self.mark_cell_control_dirty(section_idx, parent_para_idx, first.0);
+        self.recompose_section(section_idx);
+
+        Ok(format!(
+            "{{\"ok\":true,\"operation\":\"insert-clickhere-field\",\"fieldId\":{},\"name\":{},\"guide\":{},\"value\":{},\"container\":\"{}\",\"section\":{},\"para\":{},\"tableControl\":{},\"cellIndex\":{},\"cellParaIndex\":{},\"textboxParagraph\":{},\"cellPath\":{},\"offset\":{},\"controlIdx\":{},\"startCharIdx\":{},\"endCharIdx\":{}}}",
+            field_id,
+            json_escape(name),
+            json_escape(guide),
+            json_escape(value),
+            container,
+            section_idx,
+            parent_para_idx,
+            first.0,
+            first.1,
+            first.2,
+            last.2,
+            cell_path_json(path),
+            char_offset,
+            insert_idx,
+            char_offset,
+            end_char_idx,
+        ))
     }
 
     /// setFieldValue: field_id로 필드 값 설정
@@ -466,15 +712,22 @@ impl DocumentCore {
         para_idx: usize,
         char_offset: usize,
     ) -> Result<String, HwpError> {
-        let para = self
+        let section = self
             .document
             .sections
             .get_mut(section_idx)
-            .and_then(|s| s.paragraphs.get_mut(para_idx))
+            .ok_or_else(|| HwpError::InvalidField("구역 위치 초과".into()))?;
+        section.raw_stream = None;
+        let para = section
+            .paragraphs
+            .get_mut(para_idx)
             .ok_or_else(|| HwpError::InvalidField("문단 위치 초과".into()))?;
         remove_field_in_para(para, char_offset)?;
         self.recompose_section(section_idx);
-        Ok(r#"{"ok":true}"#.to_string())
+        Ok(format!(
+            "{{\"ok\":true,\"operation\":\"remove-field\",\"section\":{},\"para\":{},\"offset\":{}}}",
+            section_idx, para_idx, char_offset
+        ))
     }
 
     /// 셀/글상자 내 문단의 커서 위치에서 필드를 제거한다.
@@ -489,11 +742,15 @@ impl DocumentCore {
         is_textbox: bool,
     ) -> Result<String, HwpError> {
         let para = {
-            let host = self
+            let section = self
                 .document
                 .sections
                 .get_mut(section_idx)
-                .and_then(|s| s.paragraphs.get_mut(parent_para_idx))
+                .ok_or_else(|| HwpError::InvalidField("구역 위치 초과".into()))?;
+            section.raw_stream = None;
+            let host = section
+                .paragraphs
+                .get_mut(parent_para_idx)
                 .ok_or_else(|| HwpError::InvalidField("호스트 문단 위치 초과".into()))?;
             let ctrl = host
                 .controls
@@ -531,6 +788,45 @@ impl DocumentCore {
         remove_field_in_para(para, char_offset)?;
         self.recompose_section(section_idx);
         Ok(r#"{"ok":true}"#.to_string())
+    }
+
+    /// path 기반: 중첩 표 셀 또는 셀 내부 글상자 문단의 필드를 제거한다.
+    pub fn remove_field_at_by_path(
+        &mut self,
+        section_idx: usize,
+        parent_para_idx: usize,
+        path: &[(usize, usize, usize)],
+        char_offset: usize,
+    ) -> Result<String, HwpError> {
+        if path.is_empty() {
+            return Err(HwpError::InvalidField("cellPath가 비어 있습니다.".into()));
+        }
+        let first = path[0];
+        let last = *path.last().unwrap();
+        let container = if path.len() > 1 && last.1 == 0 {
+            "cell_textbox"
+        } else {
+            "cell_path"
+        };
+        {
+            let para = self.get_cell_paragraph_mut_by_path(section_idx, parent_para_idx, path)?;
+            remove_field_in_para(para, char_offset)?;
+        }
+        self.document.sections[section_idx].raw_stream = None;
+        self.mark_cell_control_dirty(section_idx, parent_para_idx, first.0);
+        self.recompose_section(section_idx);
+        Ok(format!(
+            "{{\"ok\":true,\"operation\":\"remove-field\",\"container\":\"{}\",\"section\":{},\"para\":{},\"tableControl\":{},\"cellIndex\":{},\"cellParaIndex\":{},\"textboxParagraph\":{},\"cellPath\":{},\"offset\":{}}}",
+            container,
+            section_idx,
+            parent_para_idx,
+            first.0,
+            first.1,
+            first.2,
+            last.2,
+            cell_path_json(path),
+            char_offset,
+        ))
     }
 
     /// 커서가 진입한 활성 필드를 설정한다 (안내문 렌더링 스킵용).
@@ -866,6 +1162,19 @@ fn field_location_json(loc: &FieldLocation) -> String {
     }
 }
 
+fn cell_path_json(path: &[(usize, usize, usize)]) -> String {
+    let entries: Vec<String> = path
+        .iter()
+        .map(|(control_index, cell_index, cell_para_index)| {
+            format!(
+                "{{\"controlIndex\":{},\"cellIndex\":{},\"cellParaIndex\":{}}}",
+                control_index, cell_index, cell_para_index
+            )
+        })
+        .collect();
+    format!("[{}]", entries.join(","))
+}
+
 impl DocumentCore {
     /// 본문 문단에서 커서 위치의 필드 컨트롤 인덱스를 찾는다.
     fn find_field_control_idx(
@@ -935,6 +1244,71 @@ fn find_field_ctrl_idx_in_para(para: &Paragraph, char_offset: usize) -> Option<u
     None
 }
 
+fn find_control_insert_index_for_field(para: &Paragraph, char_offset: usize) -> usize {
+    let positions = find_control_text_positions(para);
+    for (idx, &pos) in positions.iter().enumerate() {
+        if pos > char_offset {
+            return idx;
+        }
+    }
+    para.controls.len()
+}
+
+fn insert_clickhere_field_into_paragraph(
+    para: &mut Paragraph,
+    char_offset: usize,
+    field_id: u32,
+    name: &str,
+    guide: &str,
+    memo: &str,
+    value: &str,
+) -> Result<(usize, usize), HwpError> {
+    let text_len = para.text.chars().count();
+    if char_offset > text_len {
+        return Err(HwpError::InvalidField(format!(
+            "문자 오프셋 {}이 문단 길이 {}를 초과합니다.",
+            char_offset, text_len
+        )));
+    }
+
+    let insert_idx = find_control_insert_index_for_field(para, char_offset);
+    for fr in &mut para.field_ranges {
+        if fr.control_idx >= insert_idx {
+            fr.control_idx += 1;
+        }
+    }
+
+    let field = Field {
+        field_type: FieldType::ClickHere,
+        command: Field::build_clickhere_command(guide, memo, name),
+        properties: 1,
+        extra_properties: 0,
+        field_id,
+        ctrl_id: tags::FIELD_CLICKHERE,
+        ctrl_data_name: Some(name.to_string()),
+        memo_index: 0,
+        memo_paragraphs: Vec::new(),
+    };
+    para.controls.insert(insert_idx, Control::Field(field));
+    if para.ctrl_data_records.len() >= insert_idx {
+        para.ctrl_data_records.insert(insert_idx, None);
+    }
+
+    if !value.is_empty() {
+        para.insert_text_at(char_offset, value);
+    }
+    let end_char_idx = char_offset + value.chars().count();
+    para.field_ranges.push(FieldRange {
+        start_char_idx: char_offset,
+        end_char_idx,
+        control_idx: insert_idx,
+    });
+    para.field_ranges
+        .sort_by_key(|fr| (fr.start_char_idx, fr.end_char_idx, fr.control_idx));
+    rebuild_char_offsets(para);
+    Ok((insert_idx, end_char_idx))
+}
+
 /// 문단 내 커서 위치의 누름틀 필드를 제거한다 (FieldRange만 삭제, 텍스트 유지).
 fn remove_field_in_para(para: &mut Paragraph, char_offset: usize) -> Result<(), HwpError> {
     let idx = para.field_ranges.iter().position(|fr| {
@@ -949,7 +1323,21 @@ fn remove_field_in_para(para: &mut Paragraph, char_offset: usize) -> Result<(), 
     });
     match idx {
         Some(i) => {
+            let control_idx = para.field_ranges[i].control_idx;
             para.field_ranges.remove(i);
+            para.field_ranges.retain(|fr| fr.control_idx != control_idx);
+            if control_idx < para.controls.len() {
+                para.controls.remove(control_idx);
+            }
+            if control_idx < para.ctrl_data_records.len() {
+                para.ctrl_data_records.remove(control_idx);
+            }
+            for fr in &mut para.field_ranges {
+                if fr.control_idx > control_idx {
+                    fr.control_idx -= 1;
+                }
+            }
+            rebuild_char_offsets(para);
             Ok(())
         }
         None => Err(HwpError::InvalidField(
@@ -974,11 +1362,17 @@ fn rebuild_char_offsets(para: &mut Paragraph) {
 
     // 원본 char_offsets에서 첫 문자 이전 컨트롤 수 추정
     // (원본 gap / 8 = 컨트롤 수)
-    let ctrls_before_text = if !para.char_offsets.is_empty() {
+    let base_ctrls_before_text = if !para.char_offsets.is_empty() {
         para.char_offsets[0] as usize / 8
     } else {
         para.controls.len()
     };
+    let new_start_fields_before_text = para
+        .field_ranges
+        .iter()
+        .filter(|fr| fr.start_char_idx == 0 && fr.control_idx >= base_ctrls_before_text)
+        .count();
+    let ctrls_before_text = base_ctrls_before_text + new_start_fields_before_text;
 
     // FIELD_BEGIN: control_idx >= ctrls_before_text이고 start > 0인 필드의 시작 위치에 갭 필요
     let mut field_begin_at: Vec<usize> = vec![0; text_len + 1];

@@ -1,14 +1,129 @@
 //! 텍스트 삽입/삭제/문단 분리·병합/범위 삭제/문단 쿼리 관련 native 메서드
 
-use super::super::helpers::get_textbox_from_shape;
+use super::super::helpers::{get_textbox_from_shape, get_textbox_from_shape_mut};
 use crate::document_core::DocumentCore;
 use crate::error::HwpError;
 use crate::model::control::Control;
 use crate::model::event::DocumentEvent;
 use crate::model::page::ColumnDef;
 use crate::model::paragraph::Paragraph;
+use crate::model::shape::common_obj_offsets;
 use crate::renderer::composer::{compose_paragraph, reflow_line_segs, ComposedParagraph};
 use crate::renderer::page_layout::PageLayoutInfo;
+
+fn make_inserted_cell_paragraph(template: Option<&Paragraph>, text: Option<&str>) -> Paragraph {
+    let mut paragraph = Paragraph::new_empty();
+    if let Some(template) = template {
+        paragraph.para_shape_id = template.para_shape_id;
+        paragraph.style_id = template.style_id;
+        paragraph.raw_header_extra = template.raw_header_extra.clone();
+        if let Some(line_seg) = template.line_segs.first() {
+            let mut inherited = line_seg.clone();
+            inherited.text_start = 0;
+            paragraph.line_segs = vec![inherited];
+        }
+        if let Some(char_shape) = template.char_shapes.first() {
+            let mut inherited = char_shape.clone();
+            inherited.start_pos = 0;
+            paragraph.char_shapes = vec![inherited];
+        }
+    }
+    if let Some(text) = text {
+        if !text.is_empty() {
+            paragraph.has_para_text = true;
+            paragraph.insert_text_at(0, text);
+        }
+    }
+    paragraph
+}
+
+fn prepare_paragraph_as_copy(paragraph: &mut Paragraph) {
+    paragraph.char_count_msb = false;
+    if paragraph.raw_header_extra.len() >= 10 {
+        paragraph.raw_header_extra[6..10].copy_from_slice(&[0, 0, 0, 0]);
+    }
+    for control in &mut paragraph.controls {
+        match control {
+            Control::Table(table) => table.prepare_as_copied_table(),
+            Control::Picture(picture) => {
+                picture.common.instance_id = 0;
+                picture.instance_id = 0;
+            }
+            Control::Shape(shape) => {
+                shape.common_mut().instance_id = 0;
+            }
+            Control::Equation(equation) => {
+                equation.common.instance_id = 0;
+                if equation.raw_ctrl_data.len() >= common_obj_offsets::INSTANCE_ID.end {
+                    equation.raw_ctrl_data[common_obj_offsets::INSTANCE_ID]
+                        .copy_from_slice(&[0, 0, 0, 0]);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn replace_text_in_paragraph_only(paragraph: &mut Paragraph, old: &str, new: &str) -> usize {
+    if old.is_empty() {
+        return 0;
+    }
+    let matches: Vec<usize> = paragraph
+        .text
+        .match_indices(old)
+        .map(|(byte_idx, _)| byte_idx)
+        .collect();
+    let count = matches.len();
+    let old_len = old.chars().count();
+    for byte_idx in matches.into_iter().rev() {
+        let char_offset = paragraph.text[..byte_idx].chars().count();
+        paragraph.delete_text_at(char_offset, old_len);
+        paragraph.insert_text_at(char_offset, new);
+    }
+    count
+}
+
+pub(crate) fn apply_replacements_to_copied_paragraph(
+    paragraph: &mut Paragraph,
+    replacements: &[(String, String)],
+) -> usize {
+    let mut count = 0;
+    for (old, new) in replacements {
+        count += replace_text_in_paragraph_only(paragraph, old, new);
+    }
+    for control in &mut paragraph.controls {
+        match control {
+            Control::Table(table) => {
+                for cell in &mut table.cells {
+                    for cell_para in &mut cell.paragraphs {
+                        count += apply_replacements_to_copied_paragraph(cell_para, replacements);
+                    }
+                }
+                if let Some(caption) = &mut table.caption {
+                    for caption_para in &mut caption.paragraphs {
+                        count += apply_replacements_to_copied_paragraph(caption_para, replacements);
+                    }
+                }
+            }
+            Control::Shape(shape) => {
+                if let Some(textbox) = get_textbox_from_shape_mut(shape) {
+                    for textbox_para in &mut textbox.paragraphs {
+                        count += apply_replacements_to_copied_paragraph(textbox_para, replacements);
+                    }
+                }
+            }
+            Control::Picture(picture) => {
+                if let Some(caption) = &mut picture.caption {
+                    for caption_para in &mut caption.paragraphs {
+                        count += apply_replacements_to_copied_paragraph(caption_para, replacements);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    count
+}
 
 impl DocumentCore {
     pub fn insert_text_native(
@@ -1061,6 +1176,7 @@ impl DocumentCore {
                     cd.column_type = col_type;
                     cd.same_width = same_width;
                     cd.spacing = spacing_hu;
+                    cd.raw_attr = 0;
                     if same_width {
                         cd.widths.clear();
                         cd.gaps.clear();
@@ -1271,6 +1387,151 @@ impl DocumentCore {
         )))
     }
 
+    /// 문단 전체 복제 (네이티브 에러 타입)
+    pub fn copy_paragraph_native(
+        &mut self,
+        section_idx: usize,
+        para_idx: usize,
+        after: bool,
+    ) -> Result<String, HwpError> {
+        if section_idx >= self.document.sections.len() {
+            return Err(HwpError::RenderError(format!(
+                "구역 인덱스 {} 범위 초과 (총 {}개)",
+                section_idx,
+                self.document.sections.len()
+            )));
+        }
+        let section = &self.document.sections[section_idx];
+        if para_idx >= section.paragraphs.len() {
+            return Err(HwpError::RenderError(format!(
+                "문단 인덱스 {} 범위 초과 (총 {}개)",
+                para_idx,
+                section.paragraphs.len()
+            )));
+        }
+
+        let mut copied = self.document.sections[section_idx].paragraphs[para_idx].clone();
+        prepare_paragraph_as_copy(&mut copied);
+        let target_para_idx = if after { para_idx + 1 } else { para_idx };
+
+        self.document.sections[section_idx].raw_stream = None;
+        self.document.sections[section_idx]
+            .paragraphs
+            .insert(target_para_idx, copied);
+        self.rebuild_section(section_idx);
+        self.paginate_if_needed();
+
+        let new_count = self.document.sections[section_idx].paragraphs.len();
+        self.event_log.push(DocumentEvent::ParagraphInserted {
+            section: section_idx,
+            para: target_para_idx,
+        });
+        Ok(super::super::helpers::json_ok_with(&format!(
+            "\"sourceParaIdx\":{},\"targetParaIdx\":{},\"newParagraphCount\":{}",
+            para_idx, target_para_idx, new_count
+        )))
+    }
+
+    /// 연속 문단 범위 복제 (네이티브 에러 타입, start/end 포함)
+    pub fn copy_paragraph_range_native(
+        &mut self,
+        section_idx: usize,
+        start_para_idx: usize,
+        end_para_idx: usize,
+        after: bool,
+    ) -> Result<String, HwpError> {
+        self.copy_paragraph_range_with_replacements_native(
+            section_idx,
+            start_para_idx,
+            end_para_idx,
+            after,
+            &[],
+        )
+    }
+
+    /// 연속 문단 범위 복제 후 복제본에만 텍스트 치환 적용
+    pub fn copy_paragraph_range_with_replacements_native(
+        &mut self,
+        section_idx: usize,
+        start_para_idx: usize,
+        end_para_idx: usize,
+        after: bool,
+        replacements: &[(String, String)],
+    ) -> Result<String, HwpError> {
+        if section_idx >= self.document.sections.len() {
+            return Err(HwpError::RenderError(format!(
+                "구역 인덱스 {} 범위 초과 (총 {}개)",
+                section_idx,
+                self.document.sections.len()
+            )));
+        }
+        if let Some((old, _)) = replacements.iter().find(|(old, _)| old.is_empty()) {
+            return Err(HwpError::RenderError(format!(
+                "치환 검색어는 비어 있을 수 없습니다: {:?}",
+                old
+            )));
+        }
+        let section = &self.document.sections[section_idx];
+        if start_para_idx > end_para_idx {
+            return Err(HwpError::RenderError(
+                "시작 문단 인덱스가 끝 문단 인덱스보다 큽니다".to_string(),
+            ));
+        }
+        if end_para_idx >= section.paragraphs.len() {
+            return Err(HwpError::RenderError(format!(
+                "문단 범위 {}~{}가 총 {}개 문단을 초과합니다",
+                start_para_idx,
+                end_para_idx,
+                section.paragraphs.len()
+            )));
+        }
+
+        let copied_count = end_para_idx - start_para_idx + 1;
+        let mut copied: Vec<Paragraph> = self.document.sections[section_idx].paragraphs
+            [start_para_idx..=end_para_idx]
+            .iter()
+            .cloned()
+            .collect();
+        for paragraph in &mut copied {
+            prepare_paragraph_as_copy(paragraph);
+        }
+        let replacement_count = copied
+            .iter_mut()
+            .map(|paragraph| apply_replacements_to_copied_paragraph(paragraph, replacements))
+            .sum::<usize>();
+
+        let target_start_para_idx = if after {
+            end_para_idx + 1
+        } else {
+            start_para_idx
+        };
+        self.document.sections[section_idx].raw_stream = None;
+        for (offset, paragraph) in copied.into_iter().enumerate() {
+            self.document.sections[section_idx]
+                .paragraphs
+                .insert(target_start_para_idx + offset, paragraph);
+        }
+        self.rebuild_section(section_idx);
+        self.paginate_if_needed();
+
+        let target_end_para_idx = target_start_para_idx + copied_count - 1;
+        let new_count = self.document.sections[section_idx].paragraphs.len();
+        self.event_log.push(DocumentEvent::ParagraphInserted {
+            section: section_idx,
+            para: target_start_para_idx,
+        });
+        Ok(super::super::helpers::json_ok_with(&format!(
+            "\"sourceStartParaIdx\":{},\"sourceEndParaIdx\":{},\"targetStartParaIdx\":{},\"targetEndParaIdx\":{},\"copiedCount\":{},\"newParagraphCount\":{},\"replacementCount\":{}",
+            start_para_idx,
+            end_para_idx,
+            target_start_para_idx,
+            target_end_para_idx,
+            copied_count,
+            new_count,
+            replacement_count
+        )))
+    }
+
     /// 빈 문단 삽입 (네이티브 에러 타입)
     ///
     /// `para_idx == paragraphs.len()` 이면 구역 끝에 추가(append).
@@ -1343,6 +1604,331 @@ impl DocumentCore {
         Ok(super::super::helpers::json_ok_with(&format!(
             "\"paraIdx\":{},\"newParagraphCount\":{}",
             para_idx, new_count
+        )))
+    }
+
+    /// 셀 내부에 새 문단을 삽입한다.
+    ///
+    /// `cell_para_idx == paragraphs.len()` 이면 셀 끝에 추가(append).
+    pub fn insert_paragraph_in_cell_native(
+        &mut self,
+        section_idx: usize,
+        parent_para_idx: usize,
+        control_idx: usize,
+        cell_idx: usize,
+        cell_para_idx: usize,
+        text: Option<&str>,
+    ) -> Result<String, HwpError> {
+        if section_idx >= self.document.sections.len() {
+            return Err(HwpError::RenderError(format!(
+                "구역 인덱스 {} 범위 초과",
+                section_idx
+            )));
+        }
+        if parent_para_idx >= self.document.sections[section_idx].paragraphs.len() {
+            return Err(HwpError::RenderError(format!(
+                "부모 문단 인덱스 {} 범위 초과",
+                parent_para_idx
+            )));
+        }
+        if control_idx
+            >= self.document.sections[section_idx].paragraphs[parent_para_idx]
+                .controls
+                .len()
+        {
+            return Err(HwpError::RenderError(format!(
+                "컨트롤 인덱스 {} 범위 초과",
+                control_idx
+            )));
+        }
+
+        let new_count;
+        match self.document.sections[section_idx].paragraphs[parent_para_idx]
+            .controls
+            .get_mut(control_idx)
+        {
+            Some(Control::Table(table)) => {
+                if cell_idx == 65534 {
+                    let cap = table.caption.as_mut().ok_or_else(|| {
+                        HwpError::RenderError("지정된 표 컨트롤에 캡션이 없습니다".to_string())
+                    })?;
+                    if cell_para_idx > cap.paragraphs.len() {
+                        return Err(HwpError::RenderError(format!(
+                            "캡션 문단 인덱스 {} 범위 초과 (총 {}, 최대 {})",
+                            cell_para_idx,
+                            cap.paragraphs.len(),
+                            cap.paragraphs.len()
+                        )));
+                    }
+                    let template = if cell_para_idx > 0 {
+                        cap.paragraphs.get(cell_para_idx - 1)
+                    } else {
+                        cap.paragraphs.first()
+                    };
+                    let paragraph = make_inserted_cell_paragraph(template, text);
+                    cap.paragraphs.insert(cell_para_idx, paragraph);
+                    new_count = cap.paragraphs.len();
+                } else {
+                    let total_cells = table.cells.len();
+                    let cell = table.cells.get_mut(cell_idx).ok_or_else(|| {
+                        HwpError::RenderError(format!(
+                            "셀 인덱스 {} 범위 초과 (총 {}개)",
+                            cell_idx, total_cells
+                        ))
+                    })?;
+                    if cell_para_idx > cell.paragraphs.len() {
+                        return Err(HwpError::RenderError(format!(
+                            "셀 문단 인덱스 {} 범위 초과 (총 {}, 최대 {})",
+                            cell_para_idx,
+                            cell.paragraphs.len(),
+                            cell.paragraphs.len()
+                        )));
+                    }
+                    let template = if cell_para_idx > 0 {
+                        cell.paragraphs.get(cell_para_idx - 1)
+                    } else {
+                        cell.paragraphs.first()
+                    };
+                    let paragraph = make_inserted_cell_paragraph(template, text);
+                    cell.paragraphs.insert(cell_para_idx, paragraph);
+                    new_count = cell.paragraphs.len();
+                }
+                table.dirty = true;
+            }
+            Some(Control::Shape(shape)) => {
+                let tb =
+                    super::super::helpers::get_textbox_from_shape_mut(shape).ok_or_else(|| {
+                        HwpError::RenderError(
+                            "지정된 Shape 컨트롤에 텍스트 박스가 없습니다".to_string(),
+                        )
+                    })?;
+                if cell_para_idx > tb.paragraphs.len() {
+                    return Err(HwpError::RenderError(format!(
+                        "글상자 문단 인덱스 {} 범위 초과 (총 {}, 최대 {})",
+                        cell_para_idx,
+                        tb.paragraphs.len(),
+                        tb.paragraphs.len()
+                    )));
+                }
+                let template = if cell_para_idx > 0 {
+                    tb.paragraphs.get(cell_para_idx - 1)
+                } else {
+                    tb.paragraphs.first()
+                };
+                let paragraph = make_inserted_cell_paragraph(template, text);
+                tb.paragraphs.insert(cell_para_idx, paragraph);
+                new_count = tb.paragraphs.len();
+            }
+            Some(Control::Picture(pic)) => {
+                let cap = pic.caption.as_mut().ok_or_else(|| {
+                    HwpError::RenderError("지정된 그림 컨트롤에 캡션이 없습니다".to_string())
+                })?;
+                if cell_para_idx > cap.paragraphs.len() {
+                    return Err(HwpError::RenderError(format!(
+                        "캡션 문단 인덱스 {} 범위 초과 (총 {}, 최대 {})",
+                        cell_para_idx,
+                        cap.paragraphs.len(),
+                        cap.paragraphs.len()
+                    )));
+                }
+                let template = if cell_para_idx > 0 {
+                    cap.paragraphs.get(cell_para_idx - 1)
+                } else {
+                    cap.paragraphs.first()
+                };
+                let paragraph = make_inserted_cell_paragraph(template, text);
+                cap.paragraphs.insert(cell_para_idx, paragraph);
+                new_count = cap.paragraphs.len();
+            }
+            _ => {
+                return Err(HwpError::RenderError(
+                    "지정된 컨트롤이 표, 글상자 또는 그림이 아닙니다".to_string(),
+                ));
+            }
+        }
+
+        self.reflow_cell_paragraph(
+            section_idx,
+            parent_para_idx,
+            control_idx,
+            cell_idx,
+            cell_para_idx,
+        );
+        self.document.sections[section_idx].raw_stream = None;
+        self.mark_section_dirty(section_idx);
+        self.paginate_if_needed();
+
+        self.event_log.push(DocumentEvent::CellTextChanged {
+            section: section_idx,
+            para: parent_para_idx,
+            ctrl: control_idx,
+            cell: cell_idx,
+        });
+        Ok(super::super::helpers::json_ok_with(&format!(
+            "\"cellParaIndex\":{},\"newParagraphCount\":{}",
+            cell_para_idx, new_count
+        )))
+    }
+
+    /// 셀 내부 문단을 삭제한다.
+    pub fn delete_paragraph_in_cell_native(
+        &mut self,
+        section_idx: usize,
+        parent_para_idx: usize,
+        control_idx: usize,
+        cell_idx: usize,
+        cell_para_idx: usize,
+    ) -> Result<String, HwpError> {
+        if section_idx >= self.document.sections.len() {
+            return Err(HwpError::RenderError(format!(
+                "구역 인덱스 {} 범위 초과",
+                section_idx
+            )));
+        }
+        if parent_para_idx >= self.document.sections[section_idx].paragraphs.len() {
+            return Err(HwpError::RenderError(format!(
+                "부모 문단 인덱스 {} 범위 초과",
+                parent_para_idx
+            )));
+        }
+        if control_idx
+            >= self.document.sections[section_idx].paragraphs[parent_para_idx]
+                .controls
+                .len()
+        {
+            return Err(HwpError::RenderError(format!(
+                "컨트롤 인덱스 {} 범위 초과",
+                control_idx
+            )));
+        }
+
+        let removed_char_count;
+        let new_count;
+        match self.document.sections[section_idx].paragraphs[parent_para_idx]
+            .controls
+            .get_mut(control_idx)
+        {
+            Some(Control::Table(table)) => {
+                if cell_idx == 65534 {
+                    let cap = table.caption.as_mut().ok_or_else(|| {
+                        HwpError::RenderError("지정된 표 컨트롤에 캡션이 없습니다".to_string())
+                    })?;
+                    if cap.paragraphs.len() <= 1 {
+                        return Err(HwpError::RenderError(
+                            "캡션의 마지막 문단은 삭제할 수 없습니다".to_string(),
+                        ));
+                    }
+                    if cell_para_idx >= cap.paragraphs.len() {
+                        return Err(HwpError::RenderError(format!(
+                            "캡션 문단 인덱스 {} 범위 초과 (총 {}개)",
+                            cell_para_idx,
+                            cap.paragraphs.len()
+                        )));
+                    }
+                    let removed = cap.paragraphs.remove(cell_para_idx);
+                    removed_char_count = removed.text.chars().count();
+                    new_count = cap.paragraphs.len();
+                } else {
+                    let total_cells = table.cells.len();
+                    let cell = table.cells.get_mut(cell_idx).ok_or_else(|| {
+                        HwpError::RenderError(format!(
+                            "셀 인덱스 {} 범위 초과 (총 {}개)",
+                            cell_idx, total_cells
+                        ))
+                    })?;
+                    if cell.paragraphs.len() <= 1 {
+                        return Err(HwpError::RenderError(
+                            "셀의 마지막 문단은 삭제할 수 없습니다".to_string(),
+                        ));
+                    }
+                    if cell_para_idx >= cell.paragraphs.len() {
+                        return Err(HwpError::RenderError(format!(
+                            "셀 문단 인덱스 {} 범위 초과 (총 {}개)",
+                            cell_para_idx,
+                            cell.paragraphs.len()
+                        )));
+                    }
+                    let removed = cell.paragraphs.remove(cell_para_idx);
+                    removed_char_count = removed.text.chars().count();
+                    new_count = cell.paragraphs.len();
+                }
+                table.dirty = true;
+            }
+            Some(Control::Shape(shape)) => {
+                let tb =
+                    super::super::helpers::get_textbox_from_shape_mut(shape).ok_or_else(|| {
+                        HwpError::RenderError(
+                            "지정된 Shape 컨트롤에 텍스트 박스가 없습니다".to_string(),
+                        )
+                    })?;
+                if tb.paragraphs.len() <= 1 {
+                    return Err(HwpError::RenderError(
+                        "글상자의 마지막 문단은 삭제할 수 없습니다".to_string(),
+                    ));
+                }
+                if cell_para_idx >= tb.paragraphs.len() {
+                    return Err(HwpError::RenderError(format!(
+                        "글상자 문단 인덱스 {} 범위 초과 (총 {}개)",
+                        cell_para_idx,
+                        tb.paragraphs.len()
+                    )));
+                }
+                let removed = tb.paragraphs.remove(cell_para_idx);
+                removed_char_count = removed.text.chars().count();
+                new_count = tb.paragraphs.len();
+            }
+            Some(Control::Picture(pic)) => {
+                let cap = pic.caption.as_mut().ok_or_else(|| {
+                    HwpError::RenderError("지정된 그림 컨트롤에 캡션이 없습니다".to_string())
+                })?;
+                if cap.paragraphs.len() <= 1 {
+                    return Err(HwpError::RenderError(
+                        "캡션의 마지막 문단은 삭제할 수 없습니다".to_string(),
+                    ));
+                }
+                if cell_para_idx >= cap.paragraphs.len() {
+                    return Err(HwpError::RenderError(format!(
+                        "캡션 문단 인덱스 {} 범위 초과 (총 {}개)",
+                        cell_para_idx,
+                        cap.paragraphs.len()
+                    )));
+                }
+                let removed = cap.paragraphs.remove(cell_para_idx);
+                removed_char_count = removed.text.chars().count();
+                new_count = cap.paragraphs.len();
+            }
+            _ => {
+                return Err(HwpError::RenderError(
+                    "지정된 컨트롤이 표, 글상자 또는 그림이 아닙니다".to_string(),
+                ));
+            }
+        }
+
+        let reflow_idx = if cell_para_idx > 0 {
+            cell_para_idx - 1
+        } else {
+            0
+        };
+        self.reflow_cell_paragraph(
+            section_idx,
+            parent_para_idx,
+            control_idx,
+            cell_idx,
+            reflow_idx,
+        );
+        self.document.sections[section_idx].raw_stream = None;
+        self.mark_section_dirty(section_idx);
+        self.paginate_if_needed();
+
+        self.event_log.push(DocumentEvent::CellTextChanged {
+            section: section_idx,
+            para: parent_para_idx,
+            ctrl: control_idx,
+            cell: cell_idx,
+        });
+        Ok(super::super::helpers::json_ok_with(&format!(
+            "\"cellParaIndex\":{},\"removedCharCount\":{},\"newParagraphCount\":{}",
+            cell_para_idx, removed_char_count, new_count
         )))
     }
 
@@ -2220,24 +2806,51 @@ impl DocumentCore {
             .ok_or_else(|| HwpError::RenderError(format!("문단 {} 범위 초과", parent_para_idx)))?;
 
         for (i, &(ctrl_idx, cell_idx, cell_para_idx)) in path.iter().enumerate() {
-            let table = match para.controls.get_mut(ctrl_idx) {
-                Some(Control::Table(t)) => t.as_mut(),
+            match para.controls.get_mut(ctrl_idx) {
+                Some(Control::Table(t)) => {
+                    let cell = t.cells.get_mut(cell_idx).ok_or_else(|| {
+                        HwpError::RenderError(format!("경로[{}]: 셀 {} 범위 초과", i, cell_idx))
+                    })?;
+                    if i == path.len() - 1 {
+                        return Ok(&mut cell.paragraphs);
+                    }
+                    para = cell.paragraphs.get_mut(cell_para_idx).ok_or_else(|| {
+                        HwpError::RenderError(format!(
+                            "경로[{}]: 셀문단 {} 범위 초과",
+                            i, cell_para_idx
+                        ))
+                    })?;
+                }
+                Some(Control::Shape(shape)) => {
+                    if cell_idx != 0 {
+                        return Err(HwpError::RenderError(format!(
+                            "경로[{}]: 글상자의 cellIndex는 0이어야 합니다 ({})",
+                            i, cell_idx
+                        )));
+                    }
+                    let textbox = get_textbox_from_shape_mut(shape).ok_or_else(|| {
+                        HwpError::RenderError(format!(
+                            "경로[{}]: controls[{}]가 텍스트 글상자가 아닙니다",
+                            i, ctrl_idx
+                        ))
+                    })?;
+                    if i == path.len() - 1 {
+                        return Ok(&mut textbox.paragraphs);
+                    }
+                    para = textbox.paragraphs.get_mut(cell_para_idx).ok_or_else(|| {
+                        HwpError::RenderError(format!(
+                            "경로[{}]: 글상자 문단 {} 범위 초과",
+                            i, cell_para_idx
+                        ))
+                    })?;
+                }
                 _ => {
                     return Err(HwpError::RenderError(format!(
-                        "경로[{}]: controls[{}]가 표가 아닙니다",
+                        "경로[{}]: controls[{}]가 표/글상자가 아닙니다",
                         i, ctrl_idx
                     )))
                 }
-            };
-            let cell = table.cells.get_mut(cell_idx).ok_or_else(|| {
-                HwpError::RenderError(format!("경로[{}]: 셀 {} 범위 초과", i, cell_idx))
-            })?;
-            if i == path.len() - 1 {
-                return Ok(&mut cell.paragraphs);
             }
-            para = cell.paragraphs.get_mut(cell_para_idx).ok_or_else(|| {
-                HwpError::RenderError(format!("경로[{}]: 셀문단 {} 범위 초과", i, cell_para_idx))
-            })?;
         }
         unreachable!()
     }

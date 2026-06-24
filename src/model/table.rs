@@ -208,6 +208,30 @@ impl Cell {
 }
 
 impl Table {
+    /// 표 전체를 복제본으로 삽입하기 전에 중복 식별자와 셀 필드 이름을 제거한다.
+    ///
+    /// 셀 텍스트와 서식은 유지하되, 같은 문서 안에서 필드 이름/instance id가
+    /// 충돌하지 않도록 복제본 전용 메타데이터만 초기화한다.
+    pub fn prepare_as_copied_table(&mut self) {
+        self.common.instance_id = 0;
+        if self.raw_ctrl_data.len() >= common_obj_offsets::INSTANCE_ID.end {
+            self.raw_ctrl_data[common_obj_offsets::INSTANCE_ID].copy_from_slice(&[0, 0, 0, 0]);
+        }
+        for cell in &mut self.cells {
+            cell.field_name = None;
+            if cell.raw_list_extra.len() >= 17 {
+                cell.raw_list_extra[14] = 0;
+                cell.raw_list_extra[15] = 0;
+                cell.raw_list_extra[16] = 0;
+            }
+            for para in &mut cell.paragraphs {
+                if para.raw_header_extra.len() >= 10 {
+                    para.raw_header_extra[6..10].copy_from_slice(&[0, 0, 0, 0]);
+                }
+            }
+        }
+    }
+
     /// 2D 그리드 인덱스를 재구축한다.
     /// 구조 변경(파싱, 행/열 추가/삭제, 병합/분할) 후 호출해야 한다.
     pub fn rebuild_grid(&mut self) {
@@ -421,6 +445,68 @@ impl Table {
         Ok(())
     }
 
+    /// 기존 행을 내용과 서식까지 복제하여 위/아래에 삽입한다.
+    ///
+    /// 세로 병합(row_span)이 걸친 행은 복제 의미가 모호하므로 명시적으로 거부한다.
+    /// 가로 병합(col_span)은 원본 셀의 span을 보존한다.
+    pub fn copy_row(&mut self, row_idx: u16, below: bool) -> Result<u16, String> {
+        if row_idx >= self.row_count {
+            return Err(format!(
+                "행 인덱스 {} 범위 초과 (총 {}행)",
+                row_idx, self.row_count
+            ));
+        }
+        if self
+            .cells
+            .iter()
+            .any(|cell| cell.row < row_idx && cell.row + cell.row_span > row_idx)
+        {
+            return Err("세로 병합 셀이 걸친 행은 복제할 수 없습니다".to_string());
+        }
+
+        let mut source_cells: Vec<Cell> = self
+            .cells
+            .iter()
+            .filter(|cell| cell.row == row_idx)
+            .cloned()
+            .collect();
+        if source_cells.is_empty() {
+            return Err(format!("복제할 행 {}의 셀을 찾을 수 없습니다", row_idx));
+        }
+        if source_cells.iter().any(|cell| cell.row_span != 1) {
+            return Err("세로 병합 셀이 있는 행은 복제할 수 없습니다".to_string());
+        }
+
+        let target_row = if below { row_idx + 1 } else { row_idx };
+        self.insert_row(row_idx, below)?;
+
+        self.cells
+            .retain(|cell| !(cell.row == target_row && cell.row_span == 1));
+        for cell in &mut source_cells {
+            cell.row = target_row;
+            cell.row_span = 1;
+            cell.field_name = None;
+            if cell.raw_list_extra.len() >= 17 {
+                cell.raw_list_extra[14] = 0;
+                cell.raw_list_extra[15] = 0;
+                cell.raw_list_extra[16] = 0;
+            }
+            for para in &mut cell.paragraphs {
+                if para.raw_header_extra.len() >= 10 {
+                    para.raw_header_extra[6..10].copy_from_slice(&[0, 0, 0, 0]);
+                }
+            }
+        }
+        self.cells.extend(source_cells);
+
+        self.rebuild_row_sizes();
+        self.cells.sort_by_key(|c| (c.row, c.col));
+        self.update_ctrl_dimensions();
+        self.rebuild_grid();
+
+        Ok(target_row)
+    }
+
     /// 열을 삽입한다.
     ///
     /// `col_idx`: 기준 열 인덱스, `right`: true면 오른쪽에, false면 왼쪽에 삽입.
@@ -502,6 +588,68 @@ impl Table {
         self.rebuild_grid();
 
         Ok(())
+    }
+
+    /// 기존 열을 내용과 서식까지 복제하여 왼쪽/오른쪽에 삽입한다.
+    ///
+    /// 가로 병합(col_span)이 걸친 열은 복제 의미가 모호하므로 명시적으로 거부한다.
+    /// 세로 병합(row_span)은 원본 셀의 span을 보존한다.
+    pub fn copy_column(&mut self, col_idx: u16, right: bool) -> Result<u16, String> {
+        if col_idx >= self.col_count {
+            return Err(format!(
+                "열 인덱스 {} 범위 초과 (총 {}열)",
+                col_idx, self.col_count
+            ));
+        }
+        if self
+            .cells
+            .iter()
+            .any(|cell| cell.col < col_idx && cell.col + cell.col_span > col_idx)
+        {
+            return Err("가로 병합 셀이 걸친 열은 복제할 수 없습니다".to_string());
+        }
+
+        let mut source_cells: Vec<Cell> = self
+            .cells
+            .iter()
+            .filter(|cell| cell.col == col_idx)
+            .cloned()
+            .collect();
+        if source_cells.is_empty() {
+            return Err(format!("복제할 열 {}의 셀을 찾을 수 없습니다", col_idx));
+        }
+        if source_cells.iter().any(|cell| cell.col_span != 1) {
+            return Err("가로 병합 셀이 있는 열은 복제할 수 없습니다".to_string());
+        }
+
+        let target_col = if right { col_idx + 1 } else { col_idx };
+        self.insert_column(col_idx, right)?;
+
+        self.cells
+            .retain(|cell| !(cell.col == target_col && cell.col_span == 1));
+        for cell in &mut source_cells {
+            cell.col = target_col;
+            cell.col_span = 1;
+            cell.field_name = None;
+            if cell.raw_list_extra.len() >= 17 {
+                cell.raw_list_extra[14] = 0;
+                cell.raw_list_extra[15] = 0;
+                cell.raw_list_extra[16] = 0;
+            }
+            for para in &mut cell.paragraphs {
+                if para.raw_header_extra.len() >= 10 {
+                    para.raw_header_extra[6..10].copy_from_slice(&[0, 0, 0, 0]);
+                }
+            }
+        }
+        self.cells.extend(source_cells);
+
+        self.rebuild_row_sizes();
+        self.cells.sort_by_key(|c| (c.row, c.col));
+        self.update_ctrl_dimensions();
+        self.rebuild_grid();
+
+        Ok(target_col)
     }
 
     /// 행을 삭제한다.

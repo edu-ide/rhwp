@@ -6,7 +6,7 @@ use crate::error::HwpError;
 use crate::model::control::Control;
 use crate::model::event::DocumentEvent;
 use crate::model::paragraph::Paragraph;
-use crate::model::shape::{common_obj_offsets, ShapeObject};
+use crate::model::shape::{common_obj_offsets, CommonObjAttr, ShapeObject};
 
 /// 도형 최소 크기 (HWPUNIT).
 /// 0으로 내려가면 Rectangle은 x_coords=[0,0,0,0]이 되고,
@@ -15,6 +15,26 @@ use crate::model::shape::{common_obj_offsets, ShapeObject};
 const MIN_SHAPE_SIZE: u32 = 200;
 
 impl DocumentCore {
+    fn sync_common_obj_attr_known_bits(common: &mut CommonObjAttr) {
+        let known_mask: u32 = 0x01
+            | (0x03 << 3)
+            | (0x07 << 5)
+            | (0x03 << 8)
+            | (0x07 << 10)
+            | (1 << 13)
+            | (1 << 14)
+            | (0x07 << 15)
+            | (0x03 << 18)
+            | (1 << 20)
+            | (0x07 << 21)
+            | (0x03 << 24)
+            | (1 << 26)
+            | (1 << 28);
+        let packed_flags =
+            crate::document_core::converters::common_obj_attr_writer::pack_common_attr_bits(common);
+        common.attr = (common.attr & !known_mask) | (packed_flags & known_mask);
+    }
+
     fn resolve_shape_control_ref(
         &self,
         section_idx: usize,
@@ -1077,6 +1097,8 @@ impl DocumentCore {
         if let Some(v) = json_str(props_json, "description") {
             pic.common.description = v;
         }
+
+        Self::sync_common_obj_attr_known_bits(&mut pic.common);
 
         let mut caption_created = false;
 
@@ -2224,12 +2246,27 @@ impl DocumentCore {
 
         fn find_cell(
             node: &RenderNode,
+            section_idx: usize,
             parent_para: usize,
             path: &[(usize, usize, usize)],
         ) -> Option<(f64, f64)> {
-            if let RenderNodeType::Table(_) = node.node_type {
+            if let RenderNodeType::Table(ref table_node) = node.node_type {
+                let target_table_ctrl = path.first().unwrap().0;
+                let target_cell = path.last().unwrap().1;
+                if table_node.section_index == Some(section_idx)
+                    && table_node.para_index == Some(parent_para)
+                    && table_node.control_index == Some(target_table_ctrl)
+                {
+                    for child in node.children.iter() {
+                        if let RenderNodeType::TableCell(ref tc) = child.node_type {
+                            if tc.model_cell_index == Some(target_cell as u32) {
+                                return Some((child.bbox.x, child.bbox.y));
+                            }
+                        }
+                    }
+                }
+
                 if matches_cell_run(node, parent_para, path) {
-                    let target_cell = path.last().unwrap().1;
                     for child in node.children.iter() {
                         if let RenderNodeType::TableCell(ref tc) = child.node_type {
                             if tc.model_cell_index == Some(target_cell as u32) {
@@ -2240,21 +2277,22 @@ impl DocumentCore {
                 }
             }
             for child in &node.children {
-                if let Some(found) = find_cell(child, parent_para, path) {
+                if let Some(found) = find_cell(child, section_idx, parent_para, path) {
                     return Some(found);
                 }
             }
             None
         }
 
-        let total_pages = self.page_count();
+        let total_pages = self.page_count().max(1);
         for p in 0..total_pages {
             if let Ok(tree) = self.build_page_tree(p) {
-                if let Some((px, py)) = find_cell(&tree.root, parent_para_idx, cell_path) {
+                if let Some((px, py)) =
+                    find_cell(&tree.root, section_idx, parent_para_idx, cell_path)
+                {
                     // px → HWPUNIT (1px = 75 HWPUNIT at 96 DPI 가정).
                     // 단, section_idx 가 의미 있는 단위 정합을 위해 section 자체의
                     // 보정은 호출 측 (Picture.horz/vert_rel_to=Page) 가 처리.
-                    let _ = section_idx;
                     return ((px * 75.0) as i32, (py * 75.0) as i32);
                 }
             }
@@ -2530,6 +2568,7 @@ impl DocumentCore {
         if let Some(v) = json_i16(props_json, "outerMarginBottom") {
             c.margin.bottom = v;
         }
+        Self::sync_common_obj_attr_known_bits(c);
     }
 
     /// 글상자(Shape) 속성 조회 (네이티브).
@@ -2928,6 +2967,22 @@ impl DocumentCore {
     ) -> Result<String, HwpError> {
         let c = shape.common();
         let common_json = Self::common_obj_attr_to_json(c);
+        let shape_type = if get_textbox_from_shape(shape).is_some() {
+            "TextBox"
+        } else {
+            match shape {
+                crate::model::shape::ShapeObject::Line(_) => "Line",
+                crate::model::shape::ShapeObject::Rectangle(_) => "Rectangle",
+                crate::model::shape::ShapeObject::Ellipse(_) => "Ellipse",
+                crate::model::shape::ShapeObject::Arc(_) => "Arc",
+                crate::model::shape::ShapeObject::Polygon(_) => "Polygon",
+                crate::model::shape::ShapeObject::Curve(_) => "Curve",
+                crate::model::shape::ShapeObject::Group(_) => "Group",
+                crate::model::shape::ShapeObject::Picture(_) => "Picture",
+                crate::model::shape::ShapeObject::Chart(_) => "Chart",
+                crate::model::shape::ShapeObject::Ole(_) => "Ole",
+            }
+        };
 
         // TextBox 속성
         let tb_json = if let Some(tb) = get_textbox_from_shape(shape) {
@@ -3029,8 +3084,8 @@ impl DocumentCore {
         };
 
         Ok(format!(
-            "{{{}{}{}{}{}}}",
-            common_json, tb_json, extra_json, round_json, connector_json
+            "{{\"shapeType\":\"{}\",{}{}{}{}{}}}",
+            shape_type, common_json, tb_json, extra_json, round_json, connector_json
         ))
     }
 

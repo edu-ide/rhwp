@@ -373,6 +373,9 @@ impl DocumentCore {
             affected_sections.sort();
             affected_sections.dedup();
             for sec_idx in affected_sections {
+                if let Some(section) = self.document.sections.get_mut(sec_idx) {
+                    section.raw_stream = None;
+                }
                 self.recompose_section(sec_idx);
             }
         }

@@ -17,6 +17,7 @@ fn is_logical_inline_control(ctrl: &Control) -> bool {
             | Control::Equation(_)
             | Control::Footnote(_)
             | Control::Endnote(_)
+            | Control::Form(_)
     )
 }
 

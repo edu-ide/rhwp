@@ -1,14 +1,31 @@
 //! 표/셀 CRUD + 속성 조회·수정 관련 native 메서드
 
 use super::super::helpers::{border_line_type_to_u8_val, color_ref_to_css, navigate_path_to_table};
+use super::text_editing::apply_replacements_to_copied_paragraph;
 use crate::document_core::DocumentCore;
 use crate::error::HwpError;
 use crate::model::control::Control;
 use crate::model::event::DocumentEvent;
+use crate::model::paragraph::{CharShapeRef, LineSeg, Paragraph};
 use crate::model::path::{path_from_flat, PathSegment};
 use crate::model::shape::common_obj_offsets;
 
 impl DocumentCore {
+    fn json_has_border_fill_properties(json: &str) -> bool {
+        [
+            "\"borderLeft\"",
+            "\"borderRight\"",
+            "\"borderTop\"",
+            "\"borderBottom\"",
+            "\"fillType\"",
+            "\"fillColor\"",
+            "\"patternColor\"",
+            "\"patternType\"",
+        ]
+        .iter()
+        .any(|key| json.contains(key))
+    }
+
     pub(crate) fn get_table_mut(
         &mut self,
         section_idx: usize,
@@ -33,6 +50,260 @@ impl DocumentCore {
         }
         let section = &mut self.document.sections[section_idx];
         navigate_path_to_table(&mut section.paragraphs, path)
+    }
+
+    fn empty_paragraph_after_copied_table(table_para: &Paragraph) -> Paragraph {
+        let mut raw_header_extra = vec![0u8; 10];
+        raw_header_extra[0..2].copy_from_slice(&1u16.to_le_bytes());
+        raw_header_extra[4..6].copy_from_slice(&1u16.to_le_bytes());
+        let mut line_seg = table_para.line_segs.first().cloned().unwrap_or(LineSeg {
+            text_start: 0,
+            line_height: 1000,
+            text_height: 1000,
+            baseline_distance: 850,
+            line_spacing: 600,
+            segment_width: 0,
+            tag: LineSeg::TAG_SINGLE_SEGMENT_LINE,
+            ..Default::default()
+        });
+        line_seg.text_start = 0;
+        Paragraph {
+            text: String::new(),
+            char_count: 1,
+            char_count_msb: false,
+            control_mask: 0,
+            para_shape_id: table_para.para_shape_id,
+            style_id: table_para.style_id,
+            char_shapes: vec![table_para
+                .char_shapes
+                .first()
+                .cloned()
+                .unwrap_or(CharShapeRef {
+                    start_pos: 0,
+                    char_shape_id: 0,
+                })],
+            line_segs: vec![line_seg],
+            has_para_text: false,
+            raw_header_extra,
+            ..Default::default()
+        }
+    }
+
+    /// 표 전체를 내용과 서식까지 복제하여 앞/뒤에 삽입한다.
+    pub fn copy_table_native(
+        &mut self,
+        section_idx: usize,
+        parent_para_idx: usize,
+        control_idx: usize,
+        after: bool,
+    ) -> Result<String, HwpError> {
+        self.copy_table_with_replacements_native(
+            section_idx,
+            parent_para_idx,
+            control_idx,
+            after,
+            &[],
+        )
+    }
+
+    /// 표 전체를 복제한 뒤 복제본 표 안의 텍스트만 치환한다.
+    pub fn copy_table_with_replacements_native(
+        &mut self,
+        section_idx: usize,
+        parent_para_idx: usize,
+        control_idx: usize,
+        after: bool,
+        replacements: &[(String, String)],
+    ) -> Result<String, HwpError> {
+        if section_idx >= self.document.sections.len() {
+            return Err(HwpError::RenderError(format!(
+                "구역 인덱스 {} 범위 초과",
+                section_idx
+            )));
+        }
+        if let Some((old, _)) = replacements.iter().find(|(old, _)| old.is_empty()) {
+            return Err(HwpError::RenderError(format!(
+                "치환 검색어는 비어 있을 수 없습니다: {:?}",
+                old
+            )));
+        }
+
+        let section = &mut self.document.sections[section_idx];
+        let (mut table_para, row_count, col_count, replacement_count) = {
+            let source_para = section.paragraphs.get(parent_para_idx).ok_or_else(|| {
+                HwpError::RenderError(format!("문단 인덱스 {} 범위 초과", parent_para_idx))
+            })?;
+            let table = match source_para.controls.get(control_idx) {
+                Some(Control::Table(table)) => table,
+                Some(_) => {
+                    return Err(HwpError::RenderError(
+                        "지정된 컨트롤이 표가 아닙니다".to_string(),
+                    ));
+                }
+                None => {
+                    return Err(HwpError::RenderError(format!(
+                        "컨트롤 인덱스 {} 범위 초과",
+                        control_idx
+                    )));
+                }
+            };
+
+            let mut copied_table = (**table).clone();
+            copied_table.prepare_as_copied_table();
+            let replacement_count = {
+                let mut count = 0;
+                for cell in &mut copied_table.cells {
+                    for cell_para in &mut cell.paragraphs {
+                        count += apply_replacements_to_copied_paragraph(cell_para, replacements);
+                    }
+                }
+                if let Some(caption) = &mut copied_table.caption {
+                    for caption_para in &mut caption.paragraphs {
+                        count += apply_replacements_to_copied_paragraph(caption_para, replacements);
+                    }
+                }
+                count
+            };
+            copied_table.dirty = true;
+            copied_table.rebuild_grid();
+            let row_count = copied_table.row_count;
+            let col_count = copied_table.col_count;
+
+            let mut table_para = source_para.clone();
+            table_para.text.clear();
+            table_para.char_count = 9;
+            table_para.control_mask = 0x00000800;
+            table_para.char_offsets.clear();
+            table_para.field_ranges.clear();
+            table_para.range_tags.clear();
+            table_para.tab_extended.clear();
+            table_para.controls = vec![Control::Table(Box::new(copied_table))];
+            table_para.ctrl_data_records = vec![None];
+            table_para.has_para_text = true;
+            table_para.char_count_msb = false;
+            if table_para.raw_header_extra.len() < 10 {
+                let mut raw_header_extra = vec![0u8; 10];
+                raw_header_extra[0..2].copy_from_slice(&1u16.to_le_bytes());
+                raw_header_extra[4..6].copy_from_slice(&1u16.to_le_bytes());
+                table_para.raw_header_extra = raw_header_extra;
+            }
+            if table_para.line_segs.is_empty() {
+                table_para.line_segs = vec![LineSeg {
+                    text_start: 0,
+                    line_height: 1000,
+                    text_height: 1000,
+                    baseline_distance: 850,
+                    line_spacing: 600,
+                    segment_width: 0,
+                    tag: LineSeg::TAG_SINGLE_SEGMENT_LINE,
+                    ..Default::default()
+                }];
+            }
+            for line_seg in &mut table_para.line_segs {
+                line_seg.text_start = 0;
+            }
+            if table_para.char_shapes.is_empty() {
+                table_para.char_shapes = vec![CharShapeRef {
+                    start_pos: 0,
+                    char_shape_id: 0,
+                }];
+            }
+
+            (table_para, row_count, col_count, replacement_count)
+        };
+
+        let target_para_idx = if after {
+            parent_para_idx + 1
+        } else {
+            parent_para_idx
+        };
+        let empty_para = Self::empty_paragraph_after_copied_table(&table_para);
+        section.paragraphs.insert(target_para_idx, table_para);
+        section.paragraphs.insert(target_para_idx + 1, empty_para);
+        section.raw_stream = None;
+
+        self.rebuild_section(section_idx);
+        self.paginate_if_needed();
+        self.event_log.push(DocumentEvent::ContentPasted {
+            section: section_idx,
+            para: target_para_idx,
+        });
+
+        Ok(super::super::helpers::json_ok_with(&format!(
+            "\"sourceParaIdx\":{},\"sourceControlIdx\":{},\"targetParaIdx\":{},\"controlIdx\":0,\"rowCount\":{},\"colCount\":{},\"replacementCount\":{}",
+            parent_para_idx, control_idx, target_para_idx, row_count, col_count, replacement_count
+        )))
+    }
+
+    /// 독립 표 문단을 삭제하고, 바로 뒤 빈 문단이 있으면 함께 제거한다.
+    pub fn delete_table_native(
+        &mut self,
+        section_idx: usize,
+        parent_para_idx: usize,
+        control_idx: usize,
+    ) -> Result<String, HwpError> {
+        if section_idx >= self.document.sections.len() {
+            return Err(HwpError::RenderError(format!(
+                "구역 인덱스 {} 범위 초과",
+                section_idx
+            )));
+        }
+
+        let section = &mut self.document.sections[section_idx];
+        let source_para = section.paragraphs.get(parent_para_idx).ok_or_else(|| {
+            HwpError::RenderError(format!("문단 인덱스 {} 범위 초과", parent_para_idx))
+        })?;
+        match source_para.controls.get(control_idx) {
+            Some(Control::Table(_)) => {}
+            Some(_) => {
+                return Err(HwpError::RenderError(
+                    "지정된 컨트롤이 표가 아닙니다".to_string(),
+                ));
+            }
+            None => {
+                return Err(HwpError::RenderError(format!(
+                    "컨트롤 인덱스 {} 범위 초과",
+                    control_idx
+                )));
+            }
+        }
+        if !source_para.text.is_empty() || source_para.controls.len() != 1 || control_idx != 0 {
+            return Err(HwpError::RenderError(
+                "표 전체 삭제는 표만 담긴 독립 문단에서만 지원합니다".to_string(),
+            ));
+        }
+
+        section.paragraphs.remove(parent_para_idx);
+        let removed_following_empty = if section
+            .paragraphs
+            .get(parent_para_idx)
+            .map(|para| para.text.is_empty() && para.controls.is_empty())
+            .unwrap_or(false)
+        {
+            section.paragraphs.remove(parent_para_idx);
+            true
+        } else {
+            false
+        };
+        if section.paragraphs.is_empty() {
+            section.paragraphs.push(Paragraph::new_empty());
+        }
+        section.raw_stream = None;
+
+        self.rebuild_section(section_idx);
+        self.paginate_if_needed();
+        self.event_log.push(DocumentEvent::ParagraphDeleted {
+            section: section_idx,
+            para: parent_para_idx,
+        });
+
+        Ok(super::super::helpers::json_ok_with(&format!(
+            "\"deletedParaIdx\":{},\"controlIdx\":{},\"removedFollowingEmptyParagraph\":{},\"paragraphCount\":{}",
+            parent_para_idx,
+            control_idx,
+            removed_following_empty,
+            self.document.sections[section_idx].paragraphs.len()
+        )))
     }
 
     /// 표에 행을 삽입한다 (네이티브).
@@ -67,6 +338,75 @@ impl DocumentCore {
         )))
     }
 
+    /// 표 행을 내용과 서식까지 복제하여 삽입한다.
+    pub fn copy_table_row_native(
+        &mut self,
+        section_idx: usize,
+        parent_para_idx: usize,
+        control_idx: usize,
+        row_idx: u16,
+        below: bool,
+    ) -> Result<String, HwpError> {
+        self.copy_table_row_with_replacements_native(
+            section_idx,
+            parent_para_idx,
+            control_idx,
+            row_idx,
+            below,
+            &[],
+        )
+    }
+
+    /// 표 행을 복제한 뒤 복제된 행의 텍스트만 치환한다.
+    pub fn copy_table_row_with_replacements_native(
+        &mut self,
+        section_idx: usize,
+        parent_para_idx: usize,
+        control_idx: usize,
+        row_idx: u16,
+        below: bool,
+        replacements: &[(String, String)],
+    ) -> Result<String, HwpError> {
+        if let Some((old, _)) = replacements.iter().find(|(old, _)| old.is_empty()) {
+            return Err(HwpError::RenderError(format!(
+                "치환 검색어는 비어 있을 수 없습니다: {:?}",
+                old
+            )));
+        }
+        let table = self.get_table_mut(section_idx, parent_para_idx, control_idx)?;
+        let target_row = table
+            .copy_row(row_idx, below)
+            .map_err(HwpError::RenderError)?;
+        let replacement_count = table
+            .cells
+            .iter_mut()
+            .filter(|cell| cell.row == target_row)
+            .map(|cell| {
+                cell.paragraphs
+                    .iter_mut()
+                    .map(|para| apply_replacements_to_copied_paragraph(para, replacements))
+                    .sum::<usize>()
+            })
+            .sum::<usize>();
+        table.dirty = true;
+        let row_count = table.row_count;
+        let col_count = table.col_count;
+
+        self.document.sections[section_idx].raw_stream = None;
+        self.recompose_section(section_idx);
+        self.paginate_if_needed();
+
+        self.event_log.push(DocumentEvent::TableRowInserted {
+            section: section_idx,
+            para: parent_para_idx,
+            ctrl: control_idx,
+        });
+        Ok(super::super::helpers::json_ok_with(&format!(
+            "\"sourceRow\":{},\"targetRow\":{},\"rowCount\":{},\"colCount\":{},\"replacementCount\":{}",
+            row_idx, target_row, row_count, col_count, replacement_count
+        )))
+    }
+
     /// 표에 열을 삽입한다 (네이티브).
     pub fn insert_table_column_native(
         &mut self,
@@ -96,6 +436,75 @@ impl DocumentCore {
         Ok(super::super::helpers::json_ok_with(&format!(
             "\"rowCount\":{},\"colCount\":{}",
             row_count, col_count
+        )))
+    }
+
+    /// 표 열을 내용과 서식까지 복제하여 삽입한다.
+    pub fn copy_table_column_native(
+        &mut self,
+        section_idx: usize,
+        parent_para_idx: usize,
+        control_idx: usize,
+        col_idx: u16,
+        right: bool,
+    ) -> Result<String, HwpError> {
+        self.copy_table_column_with_replacements_native(
+            section_idx,
+            parent_para_idx,
+            control_idx,
+            col_idx,
+            right,
+            &[],
+        )
+    }
+
+    /// 표 열을 복제한 뒤 복제된 열의 텍스트만 치환한다.
+    pub fn copy_table_column_with_replacements_native(
+        &mut self,
+        section_idx: usize,
+        parent_para_idx: usize,
+        control_idx: usize,
+        col_idx: u16,
+        right: bool,
+        replacements: &[(String, String)],
+    ) -> Result<String, HwpError> {
+        if let Some((old, _)) = replacements.iter().find(|(old, _)| old.is_empty()) {
+            return Err(HwpError::RenderError(format!(
+                "치환 검색어는 비어 있을 수 없습니다: {:?}",
+                old
+            )));
+        }
+        let table = self.get_table_mut(section_idx, parent_para_idx, control_idx)?;
+        let target_col = table
+            .copy_column(col_idx, right)
+            .map_err(HwpError::RenderError)?;
+        let replacement_count = table
+            .cells
+            .iter_mut()
+            .filter(|cell| cell.col == target_col)
+            .map(|cell| {
+                cell.paragraphs
+                    .iter_mut()
+                    .map(|para| apply_replacements_to_copied_paragraph(para, replacements))
+                    .sum::<usize>()
+            })
+            .sum::<usize>();
+        table.dirty = true;
+        let row_count = table.row_count;
+        let col_count = table.col_count;
+
+        self.document.sections[section_idx].raw_stream = None;
+        self.recompose_section(section_idx);
+        self.paginate_if_needed();
+
+        self.event_log.push(DocumentEvent::TableColumnInserted {
+            section: section_idx,
+            para: parent_para_idx,
+            ctrl: control_idx,
+        });
+        Ok(super::super::helpers::json_ok_with(&format!(
+            "\"sourceCol\":{},\"targetCol\":{},\"rowCount\":{},\"colCount\":{},\"replacementCount\":{}",
+            col_idx, target_col, row_count, col_count, replacement_count
         )))
     }
 
@@ -303,7 +712,7 @@ impl DocumentCore {
         )))
     }
 
-    pub(crate) fn get_table_dimensions_native(
+    pub fn get_table_dimensions_native(
         &self,
         section_idx: usize,
         parent_para_idx: usize,
@@ -338,7 +747,7 @@ impl DocumentCore {
     }
 
     /// 표 셀의 행/열/병합 정보를 반환한다 (네이티브).
-    pub(crate) fn get_cell_info_native(
+    pub fn get_cell_info_native(
         &self,
         section_idx: usize,
         parent_para_idx: usize,
@@ -438,7 +847,7 @@ impl DocumentCore {
         }
     }
 
-    pub(crate) fn get_cell_properties_native(
+    pub fn get_cell_properties_native(
         &self,
         section_idx: usize,
         parent_para_idx: usize,
@@ -490,8 +899,62 @@ impl DocumentCore {
         ))
     }
 
+    /// 표 grid 좌표(row, col)에 해당하는 실제 cell index를 반환한다.
+    pub fn get_table_cell_index_native(
+        &self,
+        section_idx: usize,
+        parent_para_idx: usize,
+        control_idx: usize,
+        row: u16,
+        col: u16,
+    ) -> Result<usize, HwpError> {
+        let para = self
+            .document
+            .sections
+            .get(section_idx)
+            .ok_or_else(|| HwpError::RenderError(format!("구역 인덱스 {} 범위 초과", section_idx)))?
+            .paragraphs
+            .get(parent_para_idx)
+            .ok_or_else(|| {
+                HwpError::RenderError(format!("문단 인덱스 {} 범위 초과", parent_para_idx))
+            })?;
+        let table = match para.controls.get(control_idx) {
+            Some(Control::Table(t)) => t,
+            _ => {
+                return Err(HwpError::RenderError(
+                    "지정된 컨트롤이 표가 아닙니다".to_string(),
+                ))
+            }
+        };
+        if row >= table.row_count || col >= table.col_count {
+            return Err(HwpError::RenderError(format!(
+                "셀 좌표 ({}, {})가 표 크기 {}x{}를 초과합니다.",
+                row, col, table.row_count, table.col_count
+            )));
+        }
+        table
+            .cells
+            .iter()
+            .enumerate()
+            .find_map(|(idx, cell)| {
+                let in_row = row >= cell.row && row < cell.row.saturating_add(cell.row_span);
+                let in_col = col >= cell.col && col < cell.col.saturating_add(cell.col_span);
+                if in_row && in_col {
+                    Some(idx)
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| {
+                HwpError::RenderError(format!(
+                    "셀 좌표 ({}, {})에 해당하는 셀이 없습니다.",
+                    row, col
+                ))
+            })
+    }
+
     /// 셀 속성을 수정한다 (네이티브).
-    pub(crate) fn set_cell_properties_native(
+    pub fn set_cell_properties_native(
         &mut self,
         section_idx: usize,
         parent_para_idx: usize,
@@ -551,9 +1014,8 @@ impl DocumentCore {
             }
         }
 
-        // BorderFill 변경: borderLeft 등이 포함된 경우 create_border_fill_from_json으로 처리
-        let has_border = json.contains("\"borderLeft\"");
-        if has_border {
+        // BorderFill 변경: 테두리나 채우기 값이 포함되면 create_border_fill_from_json으로 처리
+        if Self::json_has_border_fill_properties(json) {
             let new_bf_id = self.create_border_fill_from_json(json);
 
             // 새 BorderFill의 테두리 데이터 복사 (이웃 셀 갱신용)
@@ -602,6 +1064,76 @@ impl DocumentCore {
         self.paginate_if_needed();
 
         Ok("{\"ok\":true}".to_string())
+    }
+
+    /// 셀을 이름 있는 양식 필드로 지정하거나 해제한다.
+    pub fn set_cell_field_name_native(
+        &mut self,
+        section_idx: usize,
+        parent_para_idx: usize,
+        control_idx: usize,
+        cell_idx: usize,
+        name: Option<&str>,
+    ) -> Result<String, HwpError> {
+        let name = name.map(str::trim).filter(|n| !n.is_empty());
+        let current_name = self
+            .document
+            .sections
+            .get(section_idx)
+            .and_then(|s| s.paragraphs.get(parent_para_idx))
+            .and_then(|p| p.controls.get(control_idx))
+            .and_then(|ctrl| match ctrl {
+                Control::Table(table) => table.cells.get(cell_idx),
+                _ => None,
+            })
+            .and_then(|cell| cell.field_name.clone());
+
+        if let Some(new_name) = name {
+            if new_name.chars().count() > u16::MAX as usize {
+                return Err(HwpError::RenderError("셀 필드명이 너무 깁니다.".into()));
+            }
+            if current_name.as_deref() != Some(new_name)
+                && self.collect_all_fields().iter().any(|field| {
+                    field
+                        .field
+                        .field_name()
+                        .map(|existing| existing == new_name)
+                        .unwrap_or(false)
+                })
+            {
+                return Err(HwpError::RenderError(format!(
+                    "필드 이름 '{}' 이미 있음",
+                    new_name
+                )));
+            }
+        }
+
+        {
+            let table = self.get_table_mut(section_idx, parent_para_idx, control_idx)?;
+            let cell = table.cells.get_mut(cell_idx).ok_or_else(|| {
+                HwpError::RenderError(format!("셀 인덱스 {} 범위 초과", cell_idx))
+            })?;
+            apply_cell_field_name_to_raw_list_extra(cell, name)?;
+            table.dirty = true;
+        }
+
+        self.document.sections[section_idx].raw_stream = None;
+        self.recompose_section(section_idx);
+        self.paginate_if_needed();
+
+        let operation = if name.is_some() {
+            "set-cell-field"
+        } else {
+            "clear-cell-field"
+        };
+        Ok(format!(
+            "{{\"ok\":true,\"operation\":\"{}\",\"tableParagraph\":{},\"control\":{},\"cell\":{},\"name\":{}}}",
+            operation,
+            parent_para_idx,
+            control_idx,
+            cell_idx,
+            json_escape(name.unwrap_or("")),
+        ))
     }
 
     /// 셀 테두리 변경 시 이웃 셀의 공유 엣지 테두리를 동기화한다.
@@ -721,7 +1253,7 @@ impl DocumentCore {
     /// 여러 셀의 width/height를 한 번에 조절한다 (네이티브).
     ///
     /// json 형식: `[{"cellIdx":0,"widthDelta":150},{"cellIdx":2,"heightDelta":-100}]`
-    pub(crate) fn resize_table_cells_native(
+    pub fn resize_table_cells_native(
         &mut self,
         section_idx: usize,
         parent_para_idx: usize,
@@ -954,7 +1486,7 @@ impl DocumentCore {
     }
 
     /// 표 속성을 조회한다 (네이티브).
-    pub(crate) fn get_table_properties_native(
+    pub fn get_table_properties_native(
         &self,
         section_idx: usize,
         parent_para_idx: usize,
@@ -1119,7 +1651,7 @@ impl DocumentCore {
     }
 
     /// 표 속성을 수정한다 (네이티브).
-    pub(crate) fn set_table_properties_native(
+    pub fn set_table_properties_native(
         &mut self,
         section_idx: usize,
         parent_para_idx: usize,
@@ -1161,59 +1693,60 @@ impl DocumentCore {
             } else {
                 table.attr &= !0x01;
             }
+            table.common.treat_as_char = v;
         }
 
         // 위치 속성: attr 비트 필드
         if let Some(v) = json_str(json, "textWrap") {
-            let bits: u32 = match v.as_str() {
-                "Square" => 0,
-                "TopAndBottom" => 1,
-                "BehindText" => 2,
-                "InFrontOfText" => 3,
-                _ => 0,
+            let (bits, common) = match v.as_str() {
+                "TopAndBottom" => (1, crate::model::shape::TextWrap::TopAndBottom),
+                "BehindText" => (2, crate::model::shape::TextWrap::BehindText),
+                "InFrontOfText" => (3, crate::model::shape::TextWrap::InFrontOfText),
+                _ => (0, crate::model::shape::TextWrap::Square),
             };
             table.attr = (table.attr & !(0x07 << 21)) | (bits << 21);
+            table.common.text_wrap = common;
         }
         if let Some(v) = json_str(json, "vertRelTo") {
-            let bits: u32 = match v.as_str() {
-                "Paper" => 0,
-                "Page" => 1,
-                "Para" => 2,
-                _ => 0,
+            let (bits, common) = match v.as_str() {
+                "Page" => (1, crate::model::shape::VertRelTo::Page),
+                "Para" => (2, crate::model::shape::VertRelTo::Para),
+                _ => (0, crate::model::shape::VertRelTo::Paper),
             };
             table.attr = (table.attr & !(0x03 << 3)) | (bits << 3);
+            table.common.vert_rel_to = common;
         }
         if let Some(v) = json_str(json, "vertAlign") {
-            let bits: u32 = match v.as_str() {
-                "Top" => 0,
-                "Center" => 1,
-                "Bottom" => 2,
-                "Inside" => 3,
-                "Outside" => 4,
-                _ => 0,
+            let (bits, common) = match v.as_str() {
+                "Center" => (1, crate::model::shape::VertAlign::Center),
+                "Bottom" => (2, crate::model::shape::VertAlign::Bottom),
+                "Inside" => (3, crate::model::shape::VertAlign::Inside),
+                "Outside" => (4, crate::model::shape::VertAlign::Outside),
+                _ => (0, crate::model::shape::VertAlign::Top),
             };
             table.attr = (table.attr & !(0x07 << 5)) | (bits << 5);
+            table.common.vert_align = common;
         }
         if let Some(v) = json_str(json, "horzRelTo") {
-            let bits: u32 = match v.as_str() {
-                "Paper" => 0,
-                "Page" => 1,
-                "Column" => 2,
-                "Para" => 3,
-                _ => 0,
+            let (bits, common) = match v.as_str() {
+                "Page" => (1, crate::model::shape::HorzRelTo::Page),
+                "Column" => (2, crate::model::shape::HorzRelTo::Column),
+                "Para" => (3, crate::model::shape::HorzRelTo::Para),
+                _ => (0, crate::model::shape::HorzRelTo::Paper),
             };
             table.attr = (table.attr & !(0x03 << 8)) | (bits << 8);
+            table.common.horz_rel_to = common;
         }
         if let Some(v) = json_str(json, "horzAlign") {
-            let bits: u32 = match v.as_str() {
-                "Left" => 0,
-                "Center" => 1,
-                "Right" => 2,
-                "Inside" => 3,
-                "Outside" => 4,
-                _ => 0,
+            let (bits, common) = match v.as_str() {
+                "Center" => (1, crate::model::shape::HorzAlign::Center),
+                "Right" => (2, crate::model::shape::HorzAlign::Right),
+                "Inside" => (3, crate::model::shape::HorzAlign::Inside),
+                "Outside" => (4, crate::model::shape::HorzAlign::Outside),
+                _ => (0, crate::model::shape::HorzAlign::Left),
             };
             table.attr = (table.attr & !(0x07 << 10)) | (bits << 10);
+            table.common.horz_align = common;
         }
         // 위치 오프셋: CommonObjAttr [0..4]=flags, [4..8]=v_offset, [8..12]=h_offset
         while table.raw_ctrl_data.len() < common_obj_offsets::H_OFFSET.end {
@@ -1221,9 +1754,11 @@ impl DocumentCore {
         }
         if let Some(v) = json_i32(json, "vertOffset") {
             table.raw_ctrl_data[common_obj_offsets::V_OFFSET].copy_from_slice(&v.to_le_bytes());
+            table.common.vertical_offset = v as u32;
         }
         if let Some(v) = json_i32(json, "horzOffset") {
             table.raw_ctrl_data[common_obj_offsets::H_OFFSET].copy_from_slice(&v.to_le_bytes());
+            table.common.horizontal_offset = v as u32;
         }
         // restrictInPage → attr bit 13
         if let Some(v) = json_bool(json, "restrictInPage") {
@@ -1232,6 +1767,7 @@ impl DocumentCore {
             } else {
                 table.attr &= !(1 << 13);
             }
+            table.common.flow_with_text = v;
         }
         // allowOverlap → attr bit 14
         if let Some(v) = json_bool(json, "allowOverlap") {
@@ -1240,6 +1776,7 @@ impl DocumentCore {
             } else {
                 table.attr &= !(1 << 14);
             }
+            table.common.allow_overlap = v;
         }
         // keepWithAnchor → prevent_page_break
         // CommonObjAttr::PREVENT_PAGE_BREAK (parse_common_obj_attr 정합)
@@ -1250,6 +1787,7 @@ impl DocumentCore {
             let val: i32 = if v { 1 } else { 0 };
             table.raw_ctrl_data[common_obj_offsets::PREVENT_PAGE_BREAK]
                 .copy_from_slice(&val.to_le_bytes());
+            table.common.prevent_page_break = val;
         }
 
         // 바깥 여백 (CommonObjAttr margin ranges, parse_common_obj_attr 정합)
@@ -1257,20 +1795,56 @@ impl DocumentCore {
             if let Some(v) = json_i16(json, "outerLeft") {
                 table.raw_ctrl_data[common_obj_offsets::MARGIN_LEFT]
                     .copy_from_slice(&v.to_le_bytes());
+                table.common.margin.left = v;
             }
             if let Some(v) = json_i16(json, "outerRight") {
                 table.raw_ctrl_data[common_obj_offsets::MARGIN_RIGHT]
                     .copy_from_slice(&v.to_le_bytes());
+                table.common.margin.right = v;
             }
             if let Some(v) = json_i16(json, "outerTop") {
                 table.raw_ctrl_data[common_obj_offsets::MARGIN_TOP]
                     .copy_from_slice(&v.to_le_bytes());
+                table.common.margin.top = v;
             }
             if let Some(v) = json_i16(json, "outerBottom") {
                 table.raw_ctrl_data[common_obj_offsets::MARGIN_BOTTOM]
                     .copy_from_slice(&v.to_le_bytes());
+                table.common.margin.bottom = v;
             }
         }
+
+        // serialize_table() writes raw_ctrl_data as-is. Keep CommonObjAttr flags in sync
+        // with the parsed common cache while preserving unknown raw bits.
+        while table.raw_ctrl_data.len() < common_obj_offsets::FLAGS.end {
+            table.raw_ctrl_data.push(0);
+        }
+        let existing_flags = u32::from_le_bytes(
+            table.raw_ctrl_data[common_obj_offsets::FLAGS]
+                .try_into()
+                .unwrap(),
+        );
+        let known_mask: u32 = 0x01
+            | (0x03 << 3)
+            | (0x07 << 5)
+            | (0x03 << 8)
+            | (0x07 << 10)
+            | (1 << 13)
+            | (1 << 14)
+            | (0x07 << 15)
+            | (0x03 << 18)
+            | (1 << 20)
+            | (0x07 << 21)
+            | (0x03 << 24)
+            | (1 << 26)
+            | (1 << 28);
+        let packed_flags =
+            crate::document_core::converters::common_obj_attr_writer::pack_common_attr_bits(
+                &table.common,
+            );
+        let merged_flags = (existing_flags & !known_mask) | (packed_flags & known_mask);
+        table.common.attr = merged_flags;
+        table.raw_ctrl_data[common_obj_offsets::FLAGS].copy_from_slice(&merged_flags.to_le_bytes());
 
         // 캡션 생성/수정
         let mut caption_created = false;
@@ -1340,10 +1914,9 @@ impl DocumentCore {
             table.dirty = true;
         }
 
-        // BorderFill 변경 — 표 테두리 변경 시 모든 셀에도 동일 적용
+        // BorderFill 변경 — 표 테두리/채우기 변경 시 모든 셀에도 동일 적용
         // (HWP 렌더링은 cell.border_fill_id를 사용, table.border_fill_id는 페이지 분할용)
-        let has_border = json.contains("\"borderLeft\"");
-        if has_border {
+        if Self::json_has_border_fill_properties(json) {
             let new_bf_id = self.create_border_fill_from_json(json);
             let table = self.get_table_mut(section_idx, parent_para_idx, control_idx)?;
             table.border_fill_id = new_bf_id;
@@ -1821,6 +2394,52 @@ fn json_escape(s: &str) -> String {
     }
     r.push('"');
     r
+}
+
+fn apply_cell_field_name_to_raw_list_extra(
+    cell: &mut crate::model::table::Cell,
+    name: Option<&str>,
+) -> Result<(), HwpError> {
+    match name {
+        Some(name) => {
+            let name_chars: Vec<u16> = name.encode_utf16().collect();
+            let name_len = u16::try_from(name_chars.len())
+                .map_err(|_| HwpError::RenderError("셀 필드명이 너무 깁니다.".into()))?;
+            ensure_cell_raw_list_extra_base(cell);
+            if cell.raw_list_extra.len() < 17 {
+                cell.raw_list_extra.resize(17, 0);
+            }
+            cell.raw_list_extra[14] = 1;
+            cell.raw_list_extra[15..17].copy_from_slice(&name_len.to_le_bytes());
+            cell.raw_list_extra.truncate(17);
+            for ch in name_chars {
+                cell.raw_list_extra.extend_from_slice(&ch.to_le_bytes());
+            }
+            cell.field_name = Some(name.to_string());
+        }
+        None => {
+            cell.field_name = None;
+            if cell.raw_list_extra.len() >= 17 {
+                cell.raw_list_extra[14] = 0;
+                cell.raw_list_extra[15] = 0;
+                cell.raw_list_extra[16] = 0;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ensure_cell_raw_list_extra_base(cell: &mut crate::model::table::Cell) {
+    if cell.raw_list_extra.is_empty() {
+        cell.raw_list_extra = vec![0u8; 13];
+        cell.raw_list_extra[0..4].copy_from_slice(&cell.width.to_le_bytes());
+    } else if cell.raw_list_extra.len() < 13 {
+        let before_len = cell.raw_list_extra.len();
+        cell.raw_list_extra.resize(13, 0);
+        if before_len < 4 {
+            cell.raw_list_extra[0..4].copy_from_slice(&cell.width.to_le_bytes());
+        }
+    }
 }
 
 #[cfg(test)]
