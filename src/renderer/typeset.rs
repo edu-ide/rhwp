@@ -9581,7 +9581,19 @@ impl TypesetEngine {
                         .find(|mt| mt.para_index == para_idx && mt.control_index == ctrl_idx);
                     let is_first_placed = first_placed_table == Some(ctrl_idx);
                     let is_last_placed = last_placed_table == Some(ctrl_idx);
-                    if self.is_effective_tac_table(para, table, &fmt) {
+                    let tac_effective = self.is_effective_tac_table(para, table, &fmt);
+                    // 나눔 허용(page_break != None) TAC 표가 빈 페이지보다 크면
+                    // 통짜 배치가 불가능하므로 블록 표 분할 경로로 보낸다
+                    // (한컴 정합: '쪽 경계에서 나눔' 글자취급 표 — 관공서 양식
+                    // 답변 박스처럼 셀 내용이 여러 페이지로 흐르는 케이스).
+                    let tac_oversized_splittable = tac_effective
+                        && table.row_count > 1
+                        && !matches!(
+                            table.page_break,
+                            crate::model::table::TablePageBreak::None
+                        )
+                        && table_measured_h > st.base_available_height();
+                    if tac_effective && !tac_oversized_splittable {
                         self.typeset_tac_table(
                             st,
                             para_idx,
@@ -9594,7 +9606,7 @@ impl TypesetEngine {
                             is_first_placed,
                             is_last_placed,
                         );
-                    } else if self.try_typeset_empty_para_float_table(
+                    } else if !tac_effective && self.try_typeset_empty_para_float_table(
                         st,
                         para_idx,
                         ctrl_idx,

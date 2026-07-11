@@ -50,6 +50,11 @@ pub enum DocumentEvent {
     },
 
     // ── 표 구조 ──
+    TableDeleted {
+        section: usize,
+        para: usize,
+        ctrl: usize,
+    },
     TableRowInserted {
         section: usize,
         para: usize,
@@ -184,6 +189,14 @@ impl DocumentEvent {
             ),
 
             // 표 구조
+            DocumentEvent::TableDeleted {
+                section,
+                para,
+                ctrl,
+            } => format!(
+                r#"{{"type":"TableDeleted","section":{},"para":{},"ctrl":{}}}"#,
+                section, para, ctrl
+            ),
             DocumentEvent::TableRowInserted {
                 section,
                 para,

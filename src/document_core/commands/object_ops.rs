@@ -2441,6 +2441,214 @@ impl DocumentCore {
         )))
     }
 
+    /// 표 셀 문단 안에 '글자처럼 취급(tac)' 그림을 인라인으로 삽입한다 (네이티브).
+    ///
+    /// 셀 floating 정책(#1151, 한컴 클릭-삽입 default)과 달리, 양식 답변 셀을
+    /// 콘텐츠로 채우는 편집 경로는 문단 흐름을 따라 함께 밀려나는 인라인 그림이
+    /// 필요하다. 지정 셀 문단의 char_offset 위치에 tac Picture 컨트롤을 삽입하고,
+    /// 해당 문단 line_seg 와 소유 셀/표/앵커 지오메트리를 grow-only 로 동기화한다.
+    /// cell_path 는 depth 1 의 표 셀( (table_ctrl, cell_idx, cell_para_idx) )만
+    /// 지원한다 — 글상자/중첩 경로는 기존 insert_picture_native 를 사용.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_cell_picture_inline_native(
+        &mut self,
+        section_idx: usize,
+        para_idx: usize,
+        cell_path: &[(usize, usize, usize)],
+        char_offset: usize,
+        image_data: &[u8],
+        width: u32,
+        height: u32,
+        natural_width_px: u32,
+        natural_height_px: u32,
+        extension: &str,
+        description: &str,
+    ) -> Result<String, HwpError> {
+        use crate::model::bin_data::{
+            BinData, BinDataCompression, BinDataContent, BinDataStatus, BinDataType,
+        };
+        use crate::model::image::{CropInfo, ImageAttr, ImageEffect, Picture};
+        use crate::model::shape::{CommonObjAttr, HorzRelTo, ShapeComponentAttr, VertRelTo};
+
+        if section_idx >= self.document.sections.len() {
+            return Err(HwpError::RenderError(format!(
+                "구역 인덱스 {} 범위 초과",
+                section_idx
+            )));
+        }
+        if para_idx >= self.document.sections[section_idx].paragraphs.len() {
+            return Err(HwpError::RenderError(format!(
+                "문단 인덱스 {} 범위 초과",
+                para_idx
+            )));
+        }
+        if image_data.is_empty() {
+            return Err(HwpError::RenderError(
+                "이미지 데이터가 비어 있습니다".to_string(),
+            ));
+        }
+        if cell_path.len() != 1 {
+            return Err(HwpError::RenderError(
+                "인라인 셀 그림은 depth 1 표 셀 경로만 지원합니다".to_string(),
+            ));
+        }
+        {
+            let section = &self.document.sections[section_idx];
+            if Self::cell_path_terminates_at_textbox(section, para_idx, cell_path)? {
+                return Err(HwpError::RenderError(
+                    "글상자 경로는 insert_picture_native 를 사용하세요".to_string(),
+                ));
+            }
+        }
+        self.resolve_cell_by_path(section_idx, para_idx, cell_path)?;
+
+        // BinData 등록 (insert_picture_native 와 동일 패턴)
+        let next_id = self.document.bin_data_content.len() as u16 + 1;
+        self.document.bin_data_content.push(BinDataContent {
+            id: next_id,
+            data: image_data.to_vec(),
+            extension: extension.to_string(),
+        });
+        let bin_attr: u16 = 0x0101;
+        self.document.doc_info.bin_data_list.push(BinData {
+            raw_data: None,
+            attr: bin_attr,
+            data_type: BinDataType::Embedding,
+            compression: BinDataCompression::Default,
+            status: BinDataStatus::Success,
+            abs_path: None,
+            rel_path: None,
+            storage_id: next_id,
+            extension: Some(extension.to_string()),
+        });
+        self.document.doc_info.raw_stream = None;
+
+        let shape_attr = ShapeComponentAttr {
+            original_width: width,
+            original_height: height,
+            current_width: width,
+            current_height: height,
+            local_file_version: 1,
+            render_sx: 1.0,
+            render_sy: 1.0,
+            ..Default::default()
+        };
+        let bx = [0i32, 0, width as i32, 0];
+        let by = [width as i32, height as i32, 0, height as i32];
+        let crop = CropInfo {
+            left: 0,
+            top: 0,
+            right: (natural_width_px * 75) as i32,
+            bottom: (natural_height_px * 75) as i32,
+        };
+        let image_attr = ImageAttr {
+            bin_data_id: next_id,
+            brightness: 0,
+            contrast: 0,
+            effect: ImageEffect::RealPic,
+            transparency: 0,
+            external_path: None,
+        };
+        // tac 인라인: bit0=treat_as_char, width/height 절대 기준
+        let common_attr: u32 = 1 | (4 << 15) | (2 << 18);
+        let common = CommonObjAttr {
+            ctrl_id: 0x67736F20,
+            attr: common_attr,
+            treat_as_char: true,
+            vert_rel_to: VertRelTo::Para,
+            horz_rel_to: HorzRelTo::Para,
+            text_wrap: crate::model::shape::TextWrap::Square,
+            horizontal_offset: 0,
+            vertical_offset: 0,
+            width,
+            height,
+            z_order: 1,
+            description: description.to_string(),
+            ..Default::default()
+        };
+        let pic = Picture {
+            common,
+            shape_attr,
+            border_x: bx,
+            border_y: by,
+            crop,
+            image_attr,
+            ..Default::default()
+        };
+
+        let (table_ctrl_idx, cell_idx, _cell_para_idx) = cell_path[0];
+        let new_ctrl_idx = {
+            let section = &mut self.document.sections[section_idx];
+            section.raw_stream = None;
+            let target_para = Self::resolve_cell_paragraph_mut(section, para_idx, cell_path)?;
+
+            // 컨트롤 push + 확장 제어문자 8 코드유닛 갭 (create-table 인라인 패턴)
+            let new_ctrl_idx = target_para.controls.len();
+            target_para.controls.push(Control::Picture(Box::new(pic)));
+            target_para.ctrl_data_records.push(None);
+            target_para.control_mask |= 0x00000800;
+
+            let insert_utf16_pos = if char_offset < target_para.char_offsets.len() {
+                target_para.char_offsets[char_offset]
+            } else if !target_para.char_offsets.is_empty() {
+                let last_idx = target_para.char_offsets.len() - 1;
+                let last_char_len = target_para
+                    .text
+                    .chars()
+                    .nth(last_idx)
+                    .map(|c| c.len_utf16() as u32)
+                    .unwrap_or(1);
+                target_para.char_offsets[last_idx] + last_char_len
+            } else {
+                0
+            };
+            for offset in target_para.char_offsets.iter_mut() {
+                if *offset >= insert_utf16_pos {
+                    *offset += 8;
+                }
+            }
+            target_para.char_count += 8;
+
+            // 셀 문단 line_seg 에 그림 높이 반영 (grow-only)
+            if target_para.line_segs.is_empty() {
+                target_para.line_segs = vec![crate::model::paragraph::LineSeg {
+                    text_start: 0,
+                    line_height: height as i32,
+                    text_height: height as i32,
+                    baseline_distance: (height as f64 * 0.85) as i32,
+                    line_spacing: 0,
+                    segment_width: 0,
+                    tag: crate::model::paragraph::LineSeg::TAG_SINGLE_SEGMENT_LINE,
+                    ..Default::default()
+                }];
+            } else if let Some(seg) = target_para.line_segs.first_mut() {
+                let new_lh = (height as i32).max(seg.line_height);
+                if new_lh > seg.line_height {
+                    seg.line_height = new_lh;
+                    seg.text_height = new_lh;
+                    seg.baseline_distance = (new_lh as f64 * 0.85) as i32;
+                }
+            }
+            new_ctrl_idx
+        };
+
+        // 셀 → 표 → 앵커 지오메트리 동기화 (텍스트/문단 공통 sync 재사용)
+        self.sync_owner_cell_geometry(section_idx, para_idx, table_ctrl_idx, cell_idx);
+
+        self.mark_section_dirty(section_idx);
+        self.recompose_section(section_idx);
+        self.paginate_if_needed();
+        self.invalidate_page_tree_cache();
+        self.event_log.push(DocumentEvent::PictureInserted {
+            section: section_idx,
+            para: para_idx,
+        });
+        Ok(super::super::helpers::json_ok_with(&format!(
+            "\"paraIdx\":{},\"controlIdx\":{},\"container\":\"cell-inline\",\"tableControl\":{},\"cellIndex\":{}",
+            para_idx, new_ctrl_idx, table_ctrl_idx, cell_idx
+        )))
+    }
+
     /// 커서 위치에 그림을 삽입한다 (네이티브).
     ///
     /// - `cell_path` 가 비어있으면 본문 paragraph 에 inline (treat_as_char=true) 삽입.

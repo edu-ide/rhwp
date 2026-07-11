@@ -268,9 +268,89 @@ impl DocumentCore {
             }
         }
         if !source_para.text.is_empty() || source_para.controls.len() != 1 || control_idx != 0 {
-            return Err(HwpError::RenderError(
-                "표 전체 삭제는 표만 담긴 독립 문단에서만 지원합니다".to_string(),
-            ));
+            // 표만 담긴 독립 문단이 아니면(예: 구역정의·단정의와 공존하는 양식 첫 문단,
+            // 텍스트가 섞인 문단) 문단은 보존하고 표 컨트롤만 제거한다 —
+            // delete_picture_control_native와 동일한 컨트롤 갭 제거 패턴.
+            {
+                let para = &mut section.paragraphs[parent_para_idx];
+
+                let text_chars: Vec<char> = para.text.chars().collect();
+                let mut ci = 0usize;
+                let mut prev_end: u32 = 0;
+                let mut gap_start: Option<u32> = None;
+                'outer: for i in 0..text_chars.len() {
+                    let offset = if i < para.char_offsets.len() {
+                        para.char_offsets[i]
+                    } else {
+                        prev_end
+                    };
+                    while prev_end + 8 <= offset && ci < para.controls.len() {
+                        if ci == control_idx {
+                            gap_start = Some(prev_end);
+                            break 'outer;
+                        }
+                        ci += 1;
+                        prev_end += 8;
+                    }
+                    let char_size: u32 = if text_chars[i] == '\t' {
+                        8
+                    } else if text_chars[i].len_utf16() == 2 {
+                        2
+                    } else {
+                        1
+                    };
+                    prev_end = offset + char_size;
+                }
+                if gap_start.is_none() {
+                    while ci < para.controls.len() {
+                        if ci == control_idx {
+                            gap_start = Some(prev_end);
+                            break;
+                        }
+                        ci += 1;
+                        prev_end += 8;
+                    }
+                }
+                if let Some(gs) = gap_start {
+                    let threshold = gs + 8;
+                    for offset in para.char_offsets.iter_mut() {
+                        if *offset >= threshold {
+                            *offset -= 8;
+                        }
+                    }
+                }
+
+                para.controls.remove(control_idx);
+                if control_idx < para.ctrl_data_records.len() {
+                    para.ctrl_data_records.remove(control_idx);
+                }
+                if para.char_count >= 8 {
+                    para.char_count -= 8;
+                }
+
+                Self::reflow_paragraph_line_segs_after_control_delete(
+                    para,
+                    &self.styles,
+                    self.dpi,
+                );
+
+                section.raw_stream = None;
+            }
+
+            self.recompose_section(section_idx);
+            self.paginate_if_needed();
+            self.event_log.push(DocumentEvent::TableDeleted {
+                section: section_idx,
+                para: parent_para_idx,
+                ctrl: control_idx,
+            });
+
+            return Ok(super::super::helpers::json_ok_with(&format!(
+                "\"deletedParaIdx\":{},\"controlIdx\":{},\"mode\":\"control-only\",\"removedFollowingEmptyParagraph\":false,\"paragraphCount\":{}",
+                parent_para_idx,
+                control_idx,
+                self.document.sections[section_idx].paragraphs.len()
+            )));
         }
 
         section.paragraphs.remove(parent_para_idx);

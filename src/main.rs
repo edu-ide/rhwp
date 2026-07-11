@@ -2482,6 +2482,64 @@ fn delete_hwp_cell_form_object_at_bytes_for_cli(
     Ok(result)
 }
 
+fn hwp_note_paragraphs_json_for_cli(
+    paragraphs: &[rhwp::model::paragraph::Paragraph],
+) -> Vec<serde_json::Value> {
+    paragraphs
+        .iter()
+        .enumerate()
+        .map(|(index, para)| {
+            serde_json::json!({
+                "index": index,
+                "text": para.text,
+                "charCount": para.text.chars().count(),
+                "controlCount": para.controls.len(),
+            })
+        })
+        .collect()
+}
+
+fn hwp_note_control_json_for_cli(
+    control_index: usize,
+    control: &rhwp::model::control::Control,
+) -> Option<serde_json::Value> {
+    match control {
+        rhwp::model::control::Control::Footnote(note) => {
+            let texts: Vec<&str> = note
+                .paragraphs
+                .iter()
+                .map(|para| para.text.as_str())
+                .collect();
+            Some(serde_json::json!({
+                "kind": "footnote",
+                "type": "footnote",
+                "controlIndex": control_index,
+                "number": note.number,
+                "paragraphCount": note.paragraphs.len(),
+                "paragraphs": hwp_note_paragraphs_json_for_cli(&note.paragraphs),
+                "texts": texts,
+            }))
+        }
+        rhwp::model::control::Control::Endnote(note) => {
+            let texts: Vec<&str> = note
+                .paragraphs
+                .iter()
+                .map(|para| para.text.as_str())
+                .collect();
+            Some(serde_json::json!({
+                "kind": "endnote",
+                "type": "endnote",
+                "controlIndex": control_index,
+                "number": note.number,
+                "paragraphCount": note.paragraphs.len(),
+                "paragraphs": hwp_note_paragraphs_json_for_cli(&note.paragraphs),
+                "texts": texts,
+            }))
+        }
+        _ => None,
+    }
+}
+
 fn extract_hwp_structure_json_for_cli(data: &[u8]) -> Result<serde_json::Value, String> {
     let core = rhwp::document_core::DocumentCore::from_bytes(data)
         .map_err(|e| format!("HWP 파싱 실패: {}", e))?;
@@ -2492,11 +2550,20 @@ fn extract_hwp_structure_json_for_cli(data: &[u8]) -> Result<serde_json::Value, 
             .iter()
             .enumerate()
             .map(|(index, para)| {
+                let controls: Vec<serde_json::Value> = para
+                    .controls
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(control_index, control)| {
+                        hwp_note_control_json_for_cli(control_index, control)
+                    })
+                    .collect();
                 serde_json::json!({
                     "index": index,
                     "text": para.text,
                     "charCount": para.text.chars().count(),
                     "controlCount": para.controls.len(),
+                    "controls": controls,
                 })
             })
             .collect();
@@ -5602,6 +5669,88 @@ fn insert_hwp_cell_picture_at_bytes_for_cli(
         );
     }
     Ok(result)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_hwp_cell_picture_inline_bytes_for_cli(
+    data: &[u8],
+    section_idx: usize,
+    para_idx: usize,
+    table_control_idx: usize,
+    row: u16,
+    col: u16,
+    cell_para_idx: usize,
+    char_offset: usize,
+    image_data: &[u8],
+    width: u32,
+    height: u32,
+    natural_width_px: u32,
+    natural_height_px: u32,
+    extension: &str,
+    description: &str,
+) -> Result<HwpTableCliResult, String> {
+    let (cell_path_json, cell_idx) = cell_path_from_row_col_for_cli(
+        data,
+        section_idx,
+        para_idx,
+        table_control_idx,
+        row,
+        col,
+        cell_para_idx,
+    )?;
+    let cell_path = parse_cell_path_for_cli(&cell_path_json)?;
+    let mut core = rhwp::document_core::DocumentCore::from_bytes(data)
+        .map_err(|e| format!("HWP 파싱 실패: {}", e))?;
+    core.convert_to_editable_native()
+        .map_err(|e| format!("편집 가능 변환 실패: {}", e))?;
+    let details_json = core
+        .insert_cell_picture_inline_native(
+            section_idx,
+            para_idx,
+            &cell_path,
+            char_offset,
+            image_data,
+            width,
+            height,
+            natural_width_px,
+            natural_height_px,
+            extension,
+            description,
+        )
+        .map_err(|e| format!("셀 인라인 그림 삽입 실패: {}", e))?;
+    let mut details = parse_json_value(&details_json);
+    if let Some(obj) = details.as_object_mut() {
+        obj.insert("operation".to_string(), serde_json::json!("insert-picture"));
+        obj.insert("inline".to_string(), serde_json::json!(true));
+        obj.insert("row".to_string(), serde_json::json!(row));
+        obj.insert("col".to_string(), serde_json::json!(col));
+        obj.insert("cellIndex".to_string(), serde_json::json!(cell_idx));
+        obj.insert(
+            "cellParaIndex".to_string(),
+            serde_json::json!(cell_para_idx),
+        );
+        obj.insert(
+            "tableControl".to_string(),
+            serde_json::json!(table_control_idx),
+        );
+    }
+    let para_idx_out = details
+        .get("paraIdx")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(para_idx as u64) as usize;
+    let control_idx = details
+        .get("controlIdx")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    let (bytes, page_count_before, page_count_after) = serialize_hwp_verified_for_cli(&mut core)?;
+    Ok(HwpTableCliResult {
+        bytes,
+        para_idx: para_idx_out,
+        control_idx,
+        details,
+        page_count_before,
+        page_count_after,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -11926,11 +12075,15 @@ fn insert_picture_cli(args: &[String]) {
     let mut cell_para: Option<String> = None;
     let mut paper_x: Option<String> = None;
     let mut paper_y: Option<String> = None;
+    let mut inline_in_cell = false;
     let mut output_path: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
+            "--inline" => {
+                inline_in_cell = true;
+            }
             "--section" => {
                 i += 1;
                 if i >= args.len() {
@@ -12101,25 +12254,47 @@ fn insert_picture_cli(args: &[String]) {
     });
 
     let result = if let Some((table_ctrl, row, col, cell_para)) = cell_location {
-        insert_hwp_cell_picture_at_bytes_for_cli(
-            &data,
-            section,
-            para,
-            table_ctrl,
-            row,
-            col,
-            cell_para,
-            offset,
-            &image_data,
-            width,
-            height,
-            natural_width,
-            natural_height,
-            &extension,
-            &description,
-            paper_x,
-            paper_y,
-        )
+        if inline_in_cell {
+            insert_hwp_cell_picture_inline_bytes_for_cli(
+                &data,
+                section,
+                para,
+                table_ctrl,
+                row,
+                col,
+                cell_para,
+                offset,
+                &image_data,
+                width,
+                height,
+                natural_width,
+                natural_height,
+                &extension,
+                &description,
+            )
+        } else {
+            insert_hwp_cell_picture_at_bytes_for_cli(
+                &data,
+                section,
+                para,
+                table_ctrl,
+                row,
+                col,
+                cell_para,
+                offset,
+                &image_data,
+                width,
+                height,
+                natural_width,
+                natural_height,
+                &extension,
+                &description,
+                paper_x,
+                paper_y,
+            )
+        }
+    } else if inline_in_cell {
+        exit_cli_error("--inline은 --table-ctrl/--row/--col 셀 지정과 함께 사용해야 합니다.");
     } else {
         let cell_path = cell_path.unwrap_or_else(|| "[]".to_string());
         insert_hwp_picture_bytes_for_cli(
@@ -20724,6 +20899,21 @@ mod doc_mcp_hwp_write_cli_tests {
         assert!(info["texts"][0]
             .as_str()
             .expect("endnote text")
+            .contains("미주 내용"));
+
+        let structure =
+            extract_hwp_structure_json_for_cli(&endnote.bytes).expect("extract note structure");
+        let controls = structure["sections"][0]["paragraphs"][0]["controls"]
+            .as_array()
+            .expect("paragraph controls");
+        let endnote_control = controls
+            .iter()
+            .find(|control| control["kind"] == "endnote")
+            .expect("endnote control in structure");
+        assert_eq!(endnote_control["controlIndex"], endnote_control_idx);
+        assert!(endnote_control["texts"][0]
+            .as_str()
+            .expect("endnote structure text")
             .contains("미주 내용"));
 
         rhwp::document_core::DocumentCore::from_bytes(&endnote.bytes)

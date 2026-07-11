@@ -928,6 +928,7 @@ impl DocumentCore {
         let final_width = (available_width - margin_left - margin_right).max(0.0);
 
         // 가변 참조로 리플로우 실행
+        let mut owner_table_cell: Option<(usize, usize)> = None;
         match self.document.sections[section_idx].paragraphs[parent_para_idx]
             .controls
             .get_mut(control_idx)
@@ -937,6 +938,7 @@ impl DocumentCore {
                     if let Some(cell_para) = cell.paragraphs.get_mut(cell_para_idx) {
                         cell_para.line_segs.clear();
                         reflow_line_segs(cell_para, final_width, &styles, self.dpi);
+                        owner_table_cell = Some((control_idx, cell_idx));
                     }
                 }
             }
@@ -958,6 +960,101 @@ impl DocumentCore {
             }
             _ => {}
         }
+        if let Some((ctrl, cell)) = owner_table_cell {
+            self.sync_owner_cell_geometry(section_idx, parent_para_idx, ctrl, cell);
+        }
+    }
+
+    /// 셀 콘텐츠(문단 line_seg 합) 기준으로 소유 셀 → 표 → 앵커 line_seg
+    /// 지오메트리를 grow-only로 동기화한다.
+    ///
+    /// 양식 답변 셀 채우기처럼 셀 문단이 늘어나는 편집에서 저장된 셀 높이와
+    /// 앵커 문단 line_seg가 갱신되지 않아 렌더/페이지네이션이 이전 높이로
+    /// 남는 결함을 막는다 — sync_direct_owner_cell_for_picture(그림 전용)의
+    /// 텍스트/문단 대칭 버전. 줄어드는 방향은 건드리지 않아 양식의 최소 높이
+    /// (빈 답변 박스 크기)를 보존한다.
+    pub(crate) fn sync_owner_cell_geometry(
+        &mut self,
+        section_idx: usize,
+        parent_para_idx: usize,
+        control_idx: usize,
+        cell_idx: usize,
+    ) {
+        let Some(section) = self.document.sections.get_mut(section_idx) else {
+            return;
+        };
+        let Some(para) = section.paragraphs.get_mut(parent_para_idx) else {
+            return;
+        };
+        let existing_line_height = para
+            .line_segs
+            .first()
+            .map(|seg| seg.line_height)
+            .unwrap_or(0);
+
+        let (table_tac, new_table_height, line_height_extra) = {
+            let Some(Control::Table(table)) = para.controls.get_mut(control_idx) else {
+                return;
+            };
+            let line_height_extra =
+                (existing_line_height - table.common.height as i32).max(0);
+            let required: i64 = {
+                let Some(cell) = table.cells.get_mut(cell_idx) else {
+                    return;
+                };
+                // 셀 문단 간 vpos 연속성 재배열 — reflow_line_segs는 문단 내부
+                // 상대 vpos(0부터)만 계산하므로, 문단들을 순차 누적 좌표로
+                // 절대화해야 렌더러/측정기가 겹치지 않게 배치한다.
+                let mut running: i64 = 0;
+                for cell_para in &mut cell.paragraphs {
+                    let base = cell_para
+                        .line_segs
+                        .first()
+                        .map(|seg| seg.vertical_pos as i64)
+                        .unwrap_or(0);
+                    for seg in &mut cell_para.line_segs {
+                        let rel = seg.vertical_pos as i64 - base;
+                        seg.vertical_pos =
+                            (running + rel).clamp(0, i32::MAX as i64) as i32;
+                    }
+                    if let Some(last) = cell_para.line_segs.last() {
+                        running = last.vertical_pos as i64
+                            + last.line_height as i64
+                            + last.line_spacing as i64;
+                    }
+                }
+                running
+                    + cell.padding.top.max(0) as i64
+                    + cell.padding.bottom.max(0) as i64
+            };
+            if required > 0 {
+                if let Some(cell) = table.cells.get_mut(cell_idx) {
+                    if (cell.height as i64) < required {
+                        cell.height = required.min(u32::MAX as i64) as u32;
+                    }
+                }
+            }
+            table.update_ctrl_dimensions();
+            table.dirty = true;
+            (
+                table.common.treat_as_char,
+                table.common.height as i32,
+                line_height_extra,
+            )
+        };
+
+        if table_tac {
+            if let Some(seg) = para.line_segs.first_mut() {
+                let line_height = new_table_height.saturating_add(line_height_extra).max(1);
+                if seg.line_height < line_height {
+                    seg.line_height = line_height;
+                    seg.text_height = line_height;
+                    seg.baseline_distance =
+                        ((line_height as i64 * 17 + 10) / 20).min(i32::MAX as i64) as i32;
+                }
+            }
+        }
+        section.raw_stream = None;
     }
 
     // ─── Phase 3 네이티브 구현: 커서 이동 API ─────────────────

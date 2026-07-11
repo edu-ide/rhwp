@@ -1987,8 +1987,15 @@ impl Paginator {
                 effective_height,
                 caption_extra_for_current,
             );
-        } else if is_tac_table {
-            // 글자처럼 취급 표: 페이지에 걸치지 않고 통째로 다음 페이지로 이동
+        } else if is_tac_table
+            && (matches!(
+                table.page_break,
+                crate::model::table::TablePageBreak::None
+            ) || effective_height + host_spacing <= base_available_height + 0.5
+                || measured_table.is_none())
+        {
+            // 글자처럼 취급 표: 빈 페이지에 들어가는 크기(또는 나눔 금지 설정)면
+            // 페이지에 걸치지 않고 통째로 다음 페이지로 이동
             if !st.current_items.is_empty() {
                 st.advance_column_or_new_page();
             }
@@ -2008,7 +2015,10 @@ impl Paginator {
                 caption_extra_for_current,
             );
         } else if let Some(mt) = measured_table {
-            // 비-TAC 표: 행 단위 분할
+            // 행 단위 분할 — 비-TAC 표, 그리고 나눔 허용(page_break != None) TAC
+            // 표가 빈 페이지보다 커서 통짜 이동이 불가능한 경우 (한컴 정합:
+            // '쪽 경계에서 나눔' 글자취급 표(관공서 양식 답변 박스)는 여러
+            // 페이지로 흐른다)
             self.split_table_rows(
                 st,
                 para_idx,
