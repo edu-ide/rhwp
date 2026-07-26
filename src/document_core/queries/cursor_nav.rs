@@ -659,6 +659,115 @@ impl DocumentCore {
         unreachable!()
     }
 
+    /// `resolve_table_by_path` 의 가변 버전.
+    ///
+    /// 중첩 표의 기하(셀 너비/높이)를 고치려면 가변 참조가 필요한데, 한국 관공서
+    /// 양식은 답변 칸이 바깥 표의 셀이고 내용 표가 그 안에 들어가는 구조라
+    /// 최상위 표만 주소지정해서는 손댈 수 없다.
+    pub(crate) fn resolve_table_by_path_mut<'a>(
+        &'a mut self,
+        sec: usize,
+        parent_para: usize,
+        path: &[(usize, usize, usize)],
+    ) -> Result<&'a mut crate::model::table::Table, HwpError> {
+        if path.is_empty() {
+            return Err(HwpError::RenderError("경로가 비어있습니다".to_string()));
+        }
+
+        let mut para = self
+            .document
+            .sections
+            .get_mut(sec)
+            .ok_or_else(|| HwpError::RenderError(format!("구역 {} 범위 초과", sec)))?
+            .paragraphs
+            .get_mut(parent_para)
+            .ok_or_else(|| HwpError::RenderError(format!("문단 {} 범위 초과", parent_para)))?;
+
+        for (i, &(ctrl_idx, cell_idx, cell_para_idx)) in path.iter().enumerate() {
+            // 借用을 한 단계씩 넘긴다: `para` 를 옮겨 담아야 그로부터 파생된
+            // 새 가변 참조를 다시 `para` 에 넣을 수 있다.
+            let current = para;
+            let ctrl_count = current.controls.len();
+            let ctrl = current.controls.get_mut(ctrl_idx).ok_or_else(|| {
+                HwpError::RenderError(format!(
+                    "경로[{}]: controls[{}] 범위 초과 (총 {}개)",
+                    i, ctrl_idx, ctrl_count
+                ))
+            })?;
+
+            if i == path.len() - 1 {
+                return match ctrl {
+                    Control::Table(t) => Ok(t),
+                    _ => Err(HwpError::RenderError(format!(
+                        "경로[{}]: controls[{}]가 표가 아닙니다",
+                        i, ctrl_idx
+                    ))),
+                };
+            }
+
+            para = match ctrl {
+                Control::Table(table) => {
+                    let cell_count = table.cells.len();
+                    let cell = table.cells.get_mut(cell_idx).ok_or_else(|| {
+                        HwpError::RenderError(format!(
+                            "경로[{}]: 셀 {} 범위 초과 (총 {}개)",
+                            i, cell_idx, cell_count
+                        ))
+                    })?;
+                    let para_count = cell.paragraphs.len();
+                    cell.paragraphs.get_mut(cell_para_idx).ok_or_else(|| {
+                        HwpError::RenderError(format!(
+                            "경로[{}]: 셀문단 {} 범위 초과 (총 {}개)",
+                            i, cell_para_idx, para_count
+                        ))
+                    })?
+                }
+                Control::Shape(shape) => {
+                    use crate::model::shape::ShapeObject;
+                    let inner_paras = match shape.as_mut() {
+                        ShapeObject::Rectangle(r) => {
+                            r.drawing.text_box.as_mut().map(|tb| &mut tb.paragraphs)
+                        }
+                        ShapeObject::Ellipse(e) => {
+                            e.drawing.text_box.as_mut().map(|tb| &mut tb.paragraphs)
+                        }
+                        ShapeObject::Polygon(p) => {
+                            p.drawing.text_box.as_mut().map(|tb| &mut tb.paragraphs)
+                        }
+                        ShapeObject::Arc(a) => {
+                            a.drawing.text_box.as_mut().map(|tb| &mut tb.paragraphs)
+                        }
+                        ShapeObject::Curve(c) => {
+                            c.drawing.text_box.as_mut().map(|tb| &mut tb.paragraphs)
+                        }
+                        _ => None,
+                    };
+                    let inner = inner_paras.ok_or_else(|| {
+                        HwpError::RenderError(format!(
+                            "경로[{}]: controls[{}] Shape 에 텍스트박스가 없습니다",
+                            i, ctrl_idx
+                        ))
+                    })?;
+                    let para_count = inner.len();
+                    inner.get_mut(cell_para_idx).ok_or_else(|| {
+                        HwpError::RenderError(format!(
+                            "경로[{}]: 글상자 안 paragraph {} 범위 초과 (총 {}개)",
+                            i, cell_para_idx, para_count
+                        ))
+                    })?
+                }
+                _ => {
+                    return Err(HwpError::RenderError(format!(
+                        "경로[{}]: controls[{}]가 표/글상자가 아닙니다",
+                        i, ctrl_idx
+                    )));
+                }
+            };
+        }
+
+        unreachable!()
+    }
+
     /// 경로 기반으로 셀을 탐색한다 (마지막 엔트리의 cell_index).
     pub(crate) fn resolve_cell_by_path<'a>(
         &'a self,

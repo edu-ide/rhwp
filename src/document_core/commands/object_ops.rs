@@ -4242,6 +4242,20 @@ impl DocumentCore {
                 }
             };
             Self::apply_picture_props_inner(pic, props_json);
+            let inline = pic.common.treat_as_char;
+            let picture_height_hu = pic.common.height as i32;
+
+            // 글자처럼 취급되는 그림은 앵커 문단의 줄 높이가 곧 그림 높이다.
+            // 크기만 바꾸고 줄 높이를 갱신하지 않으면 레이아웃이 옛 높이를 계속
+            // 써서, 그림을 줄여도 쪽 수가 그대로다(축소 후 쪽 수 불변으로 재현).
+            if inline {
+                let baseline = (picture_height_hu as f64 * 0.85).round() as i32;
+                if let Some(seg) = current_para.line_segs.first_mut() {
+                    seg.line_height = picture_height_hu;
+                    seg.text_height = picture_height_hu;
+                    seg.baseline_distance = baseline;
+                }
+            }
         }
         let section = &mut self.document.sections[section_idx];
         Self::clamp_direct_owner_cell_picture_offsets(

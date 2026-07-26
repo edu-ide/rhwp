@@ -1385,6 +1385,27 @@ impl DocumentCore {
         control_idx: usize,
         json: &str,
     ) -> Result<String, HwpError> {
+        // 최상위 표는 길이 1짜리 경로와 같다.
+        self.resize_table_cells_by_path_native(
+            section_idx,
+            parent_para_idx,
+            &[(control_idx, 0, 0)],
+            json,
+        )
+    }
+
+    /// 중첩 표까지 주소지정하는 셀 크기 조절.
+    ///
+    /// `path` 는 `[(control_idx, cell_idx, cell_para_idx), ...]` 이고 마지막
+    /// 항목의 control_idx 가 대상 표를 가리킨다. 한국 관공서 양식처럼 답변 칸
+    /// 안에 내용 표가 들어앉은 구조를 손대려면 이 경로가 필요하다.
+    pub fn resize_table_cells_by_path_native(
+        &mut self,
+        section_idx: usize,
+        parent_para_idx: usize,
+        path: &[(usize, usize, usize)],
+        json: &str,
+    ) -> Result<String, HwpError> {
         const MIN_CELL_SIZE: u32 = 200; // 최소 셀 크기 (HWPUNIT)
 
         // JSON 배열을 수동 파싱: [{"cellIdx":N,"widthDelta":D,"heightDelta":D}, ...]
@@ -1453,7 +1474,7 @@ impl DocumentCore {
         }
 
         // 셀 업데이트 적용
-        let table = self.get_table_mut(section_idx, parent_para_idx, control_idx)?;
+        let table = self.resolve_table_by_path_mut(section_idx, parent_para_idx, path)?;
         let original_width = table.common.width;
         let original_height = table.common.height;
         let original_row_height_sum: u32 = table.get_row_heights().iter().sum();
@@ -1589,29 +1610,38 @@ impl DocumentCore {
 
         // 너비가 변경된 셀의 모든 문단에 대해 line_segs 재계산 (텍스트 리플로우)
         let reflow_cells: Vec<(usize, usize)> = {
-            let para = &self.document.sections[section_idx].paragraphs[parent_para_idx];
-            if let Some(Control::Table(table)) = para.controls.get(control_idx) {
-                updates
+            match self.resolve_table_by_path(section_idx, parent_para_idx, path) {
+                Ok(table) => updates
                     .iter()
                     .filter(|u| u.width_delta != 0)
                     .filter_map(|u| {
                         let pc = table.cells.get(u.cell_idx)?.paragraphs.len();
                         Some((u.cell_idx, pc))
                     })
-                    .collect()
-            } else {
-                Vec::new()
+                    .collect(),
+                Err(_) => Vec::new(),
             }
         };
+        let nested = path.len() > 1;
         for (cell_idx, para_count) in reflow_cells {
             for cell_para_idx in 0..para_count {
-                self.reflow_cell_paragraph(
-                    section_idx,
-                    parent_para_idx,
-                    control_idx,
-                    cell_idx,
-                    cell_para_idx,
-                );
+                if nested {
+                    self.reflow_cell_paragraph_by_path(
+                        section_idx,
+                        parent_para_idx,
+                        path,
+                        cell_idx,
+                        cell_para_idx,
+                    );
+                } else {
+                    self.reflow_cell_paragraph(
+                        section_idx,
+                        parent_para_idx,
+                        path[0].0,
+                        cell_idx,
+                        cell_para_idx,
+                    );
+                }
             }
         }
 
@@ -2836,6 +2866,124 @@ fn ensure_cell_raw_list_extra_base(cell: &mut crate::model::table::Cell) {
         if before_len < 4 {
             cell.raw_list_extra[0..4].copy_from_slice(&cell.width.to_le_bytes());
         }
+    }
+}
+
+#[cfg(test)]
+mod nested_resize_tests {
+    //! 중첩 표(표 안의 표) 셀 크기 조절.
+    //!
+    //! 한국 관공서·대학 양식은 답변 칸이 바깥 표의 셀이고 내용 표가 그 안에
+    //! 들어앉는다. `controls[control_idx]` 한 번으로 닿는 최상위 표만 다루면
+    //! 그런 내용 표의 열 너비를 잡을 수 없다.
+    //!
+    //! `samples/pic-in-table-01.hwp`: 본문 문단 9 → 바깥 표(1행×1열) → 셀 0 →
+    //! 셀문단 4 → 내부표(5행×3열: 번호/품목(분야)/과제명).
+    use crate::document_core::DocumentCore;
+
+    const PARENT_PARA: usize = 9;
+    /// [(control, cell, cell_paragraph), ...] — 마지막 항목의 control 이 대상 표.
+    const NESTED_PATH: [(usize, usize, usize); 2] = [(0, 0, 4), (0, 0, 0)];
+
+    fn load() -> DocumentCore {
+        let bytes =
+            std::fs::read("samples/pic-in-table-01.hwp").expect("read pic-in-table-01.hwp");
+        DocumentCore::from_bytes(&bytes).expect("parse pic-in-table-01.hwp")
+    }
+
+    fn nested_widths(doc: &DocumentCore) -> Vec<u32> {
+        doc.resolve_table_by_path(0, PARENT_PARA, &NESTED_PATH)
+            .expect("중첩 표를 경로로 찾지 못했습니다")
+            .cells
+            .iter()
+            .map(|c| c.width)
+            .collect()
+    }
+
+    #[test]
+    fn resize_by_path_reaches_a_table_nested_inside_a_form_cell() {
+        let mut doc = load();
+        let before = nested_widths(&doc);
+        assert!(before.len() >= 3, "내부표 셀이 3개 이상이어야 합니다: {before:?}");
+
+        // 열 사이에서 너비를 주고받는다 (합은 보존).
+        doc.resize_table_cells_by_path_native(
+            0,
+            PARENT_PARA,
+            &NESTED_PATH,
+            r#"[{"cellIdx":0,"widthDelta":1000},{"cellIdx":1,"widthDelta":-1000}]"#,
+        )
+        .expect("중첩 표 셀 크기 조절 실패");
+
+        let after = nested_widths(&doc);
+        assert_eq!(after[0], before[0] + 1000, "0번 셀이 넓어져야 합니다");
+        assert_eq!(after[1], before[1] - 1000, "1번 셀이 좁아져야 합니다");
+        assert_eq!(after[2], before[2], "손대지 않은 셀은 그대로여야 합니다");
+        assert_eq!(
+            after.iter().sum::<u32>(),
+            before.iter().sum::<u32>(),
+            "표 전체 폭은 보존되어야 합니다"
+        );
+    }
+
+    #[test]
+    fn resize_by_path_rejects_a_path_that_does_not_end_at_a_table() {
+        let mut doc = load();
+        // 셀문단 0 은 본문 텍스트라 표가 없다. 조용히 엉뚱한 표를 고치는 대신
+        // 어느 단계에서 어긋났는지 알려주며 실패해야 한다.
+        let err = doc
+            .resize_table_cells_by_path_native(
+                0,
+                PARENT_PARA,
+                &[(0, 0, 0), (0, 0, 0)],
+                r#"[{"cellIdx":0,"widthDelta":100}]"#,
+            )
+            .expect_err("표가 아닌 경로는 거부되어야 합니다");
+        let message = format!("{err}");
+        assert!(
+            message.contains("경로[1]"),
+            "오류 메시지가 어긋난 경로 단계를 짚어야 합니다: {message}"
+        );
+    }
+
+    #[test]
+    fn resize_by_path_rejects_an_empty_path() {
+        let mut doc = load();
+        let err = doc
+            .resize_table_cells_by_path_native(
+                0,
+                PARENT_PARA,
+                &[],
+                r#"[{"cellIdx":0,"widthDelta":100}]"#,
+            )
+            .expect_err("빈 경로는 거부되어야 합니다");
+        assert!(
+            format!("{err}").contains("경로"),
+            "빈 경로임을 알려야 합니다: {err}"
+        );
+    }
+
+    #[test]
+    fn top_level_resize_still_routes_through_the_single_step_path() {
+        // 최상위 표는 길이 1짜리 경로와 같아야 한다 — 기존 호출자 회귀 방지.
+        let mut doc = load();
+        let widths = |d: &DocumentCore| -> Vec<u32> {
+            d.resolve_table_by_path(0, PARENT_PARA, &[(0, 0, 0)])
+                .expect("바깥 표")
+                .cells
+                .iter()
+                .map(|c| c.width)
+                .collect()
+        };
+        let before = widths(&doc);
+        doc.resize_table_cells_native(
+            0,
+            PARENT_PARA,
+            0,
+            r#"[{"cellIdx":0,"heightDelta":500}]"#,
+        )
+        .expect("최상위 표 크기 조절 실패");
+        assert_eq!(widths(&doc), before, "높이만 바꿨으므로 폭은 그대로");
     }
 }
 

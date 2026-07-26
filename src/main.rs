@@ -473,7 +473,7 @@ fn print_help() {
     println!("  set-table-properties <파일.hwp> --section N --para N --ctrl N --json <속성JSON> -o <출력.hwp>");
     println!("      표 패딩/반복 머리/배치/테두리/채우기 속성을 직접 수정");
     println!();
-    println!("  resize-table-cells <파일.hwp> --section N --para N --ctrl N --json <변경배열JSON> -o <출력.hwp>");
+    println!("  resize-table-cells <파일.hwp> --section N --para N [--cell-path <JSON>|--ctrl N] --json <변경배열JSON> -o <출력.hwp>");
     println!("      여러 표 셀의 폭/높이를 델타 값으로 조절");
     println!();
     println!("  get-char-properties <파일.hwp> --section N --para N --offset N");
@@ -4266,11 +4266,11 @@ fn resize_hwp_table_cells_bytes_for_cli(
     data: &[u8],
     section_idx: usize,
     table_para_idx: usize,
-    control_idx: usize,
+    path: &[(usize, usize, usize)],
     updates_json: &str,
 ) -> Result<HwpEditCliResult, String> {
     edit_hwp_table_structure_bytes_for_cli(data, "resize-table-cells", |core| {
-        core.resize_table_cells_native(section_idx, table_para_idx, control_idx, updates_json)
+        core.resize_table_cells_by_path_native(section_idx, table_para_idx, path, updates_json)
             .map_err(|e| format!("표 셀 크기 조절 실패: {}", e))
     })
 }
@@ -11354,12 +11354,13 @@ fn set_table_properties_cli(args: &[String], is_cell: bool) {
 
 fn resize_table_cells_cli(args: &[String]) {
     if args.is_empty() {
-        exit_cli_error("사용법: rhwp resize-table-cells <파일.hwp> --section N --para N --ctrl N --json <변경배열JSON> -o <출력.hwp>");
+        exit_cli_error("사용법: rhwp resize-table-cells <파일.hwp> --section N --para N [--cell-path <JSON>|--ctrl N] --json <변경배열JSON> -o <출력.hwp>");
     }
     let input = args[0].clone();
     let mut section: Option<String> = None;
     let mut para: Option<String> = None;
     let mut ctrl: Option<String> = None;
+    let mut cell_path: Option<String> = None;
     let mut inline_json: Option<String> = None;
     let mut json_file: Option<String> = None;
     let mut output_path: Option<String> = None;
@@ -11387,6 +11388,13 @@ fn resize_table_cells_cli(args: &[String]) {
                     exit_cli_error("--ctrl 뒤에 값이 필요합니다.");
                 }
                 ctrl = Some(args[i].clone());
+            }
+            "--cell-path" => {
+                i += 1;
+                if i >= args.len() {
+                    exit_cli_error("--cell-path 뒤에 JSON 경로가 필요합니다.");
+                }
+                cell_path = Some(args[i].clone());
             }
             "--json" => {
                 i += 1;
@@ -11416,13 +11424,20 @@ fn resize_table_cells_cli(args: &[String]) {
 
     let section = parse_usize_cli(section, "--section");
     let para = parse_usize_cli(para, "--para");
-    let ctrl = parse_usize_cli(ctrl, "--ctrl");
+    // --cell-path 를 주면 중첩 표를, 안 주면 --ctrl 로 최상위 표를 가리킨다.
+    let path = match &cell_path {
+        Some(json) => parse_cell_path_for_cli(json).unwrap_or_else(|e| exit_cli_error(&e)),
+        None => vec![(parse_usize_cli(ctrl, "--ctrl"), 0, 0)],
+    };
+    if path.is_empty() {
+        exit_cli_error("--cell-path 는 비어 있을 수 없습니다.");
+    }
     let updates_json =
         read_json_argument(inline_json, json_file).unwrap_or_else(|e| exit_cli_error(&e));
     let output = output_path.unwrap_or_else(|| input.clone());
     let data = fs::read(&input)
         .unwrap_or_else(|e| exit_cli_error(&format!("파일 읽기 실패 - {}: {}", input, e)));
-    let result = resize_hwp_table_cells_bytes_for_cli(&data, section, para, ctrl, &updates_json)
+    let result = resize_hwp_table_cells_bytes_for_cli(&data, section, para, &path, &updates_json)
         .unwrap_or_else(|e| exit_cli_error(&e));
 
     write_hwp_cli_output(&output, &result.bytes).unwrap_or_else(|e| exit_cli_error(&e));

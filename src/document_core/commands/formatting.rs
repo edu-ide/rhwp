@@ -1522,31 +1522,21 @@ impl DocumentCore {
             cell_para.para_shape_id = new_id;
         }
 
-        // 줄간격 변경 시 셀 내 문단 LineSeg 재계산
+        // 줄간격 변경 시 셀 내 문단 LineSeg 재계산.
+        //
+        // 셀 안 문단은 페이지 단 폭이 아니라 **셀 폭 - 셀 패딩**으로 줄을 나눠야
+        // 한다. 단 폭으로 계산하면 줄 수가 실제보다 적게 잡혀 셀 높이가 어긋나고,
+        // 그 상태로 쪽나눔이 돌면 문단마다 페이지가 쪼개진다(11p -> 22p 재현).
+        // reflow_cell_paragraph 가 셀 폭·패딩·문단 여백을 올바로 쓰고 소유 셀
+        // 지오메트리 동기화까지 해주므로 그쪽으로 위임한다.
         if mods.line_spacing.is_some() || mods.line_spacing_type.is_some() {
-            let dpi = self.dpi;
-            let styles = resolve_styles(&self.document.doc_info, dpi);
-            let section = &self.document.sections[sec_idx];
-            let page_def = &section.section_def.page_def;
-            let column_def = DocumentCore::find_initial_column_def(&section.paragraphs);
-            let layout = PageLayoutInfo::from_page_def(page_def, &column_def, dpi);
-            let col_width = layout
-                .column_areas
-                .first()
-                .map(|a| a.width)
-                .unwrap_or(layout.body_area.width);
-            let para_style = styles.para_styles.get(new_id as usize);
-            let margin_left = para_style.map(|s| s.margin_left).unwrap_or(0.0);
-            let margin_right = para_style.map(|s| s.margin_right).unwrap_or(0.0);
-            let available_width = (col_width - margin_left - margin_right).max(1.0);
-            let cell_para = self.get_cell_paragraph_mut(
+            self.reflow_cell_paragraph(
                 sec_idx,
                 parent_para_idx,
                 control_idx,
                 cell_idx,
                 cell_para_idx,
-            )?;
-            reflow_line_segs(cell_para, available_width, &styles, dpi);
+            );
         }
 
         // 표 dirty 마킹 — measure_section_incremental이 셀 높이를 재계산하도록
@@ -2224,6 +2214,93 @@ impl DocumentCore {
             }
         }
         Ok("{\"ok\":true,\"exists\":false}".to_string())
+    }
+}
+
+#[cfg(test)]
+mod cell_para_format_reflow_tests {
+    //! 셀 문단 서식 변경 시의 줄 나눔 폭.
+    //!
+    //! 셀 안 문단은 페이지 단 폭이 아니라 셀 폭 - 셀 패딩 - 문단 여백으로 줄을
+    //! 나눠야 한다. 단 폭으로 계산하면 줄 수가 실제보다 적게 잡혀 셀 높이가
+    //! 어긋나고, 그 상태로 쪽나눔이 돌면 문단마다 페이지가 쪼개진다
+    //! (양식 문서에서 11쪽 -> 22쪽으로 부푸는 것을 재현했다).
+    use crate::document_core::DocumentCore;
+
+    // samples/pic-in-table-01.hwp: 5열 표의 좁은 셀 — 셀 폭과 단 폭 차이가 크다.
+    const PARA: usize = 18;
+    const CTRL: usize = 0;
+    const CELL: usize = 15;
+    const CELL_PARA: usize = 0;
+
+    fn load() -> DocumentCore {
+        let bytes =
+            std::fs::read("samples/pic-in-table-01.hwp").expect("read pic-in-table-01.hwp");
+        DocumentCore::from_bytes(&bytes).expect("parse pic-in-table-01.hwp")
+    }
+
+    fn line_count(doc: &DocumentCore) -> usize {
+        doc.get_cell_paragraph_ref(0, PARA, CTRL, CELL, CELL_PARA)
+            .expect("셀 문단")
+            .line_segs
+            .len()
+    }
+
+    fn line_tops(doc: &DocumentCore) -> Vec<i32> {
+        doc.get_cell_paragraph_ref(0, PARA, CTRL, CELL, CELL_PARA)
+            .expect("셀 문단")
+            .line_segs
+            .iter()
+            .map(|s| s.vertical_pos)
+            .collect()
+    }
+
+    #[test]
+    fn line_spacing_change_wraps_at_the_cell_width_not_the_page_width() {
+        let mut doc = load();
+        let before = line_count(&doc);
+        assert!(before > 1, "셀 폭에서 이미 여러 줄이어야 의미 있는 검증이다");
+
+        doc.apply_para_format_in_cell_native(0, PARA, CTRL, CELL, CELL_PARA, r#"{"lineSpacing":130}"#)
+            .expect("셀 문단 서식 변경 실패");
+
+        // 단 폭으로 리플로우하면 줄이 합쳐져 줄 수가 줄어든다. 셀 폭이면 유지된다.
+        assert_eq!(
+            line_count(&doc), before,
+            "줄간격만 바꿨는데 줄 수가 변했다 — 단 폭으로 줄을 나눈 것"
+        );
+    }
+
+    #[test]
+    fn line_spacing_change_leaves_the_paragraph_already_cell_reflowed() {
+        let mut doc = load();
+        doc.apply_para_format_in_cell_native(0, PARA, CTRL, CELL, CELL_PARA, r#"{"lineSpacing":130}"#)
+            .expect("셀 문단 서식 변경 실패");
+        let after_format = line_tops(&doc);
+
+        // 올바른 셀 리플로우를 한 번 더 돌려도 결과가 같아야 한다. 서식 경로가
+        // 다른 폭을 썼다면 여기서 좌표가 달라진다.
+        doc.reflow_cell_paragraph(0, PARA, CTRL, CELL, CELL_PARA);
+        assert_eq!(
+            line_tops(&doc), after_format,
+            "서식 변경이 남긴 줄 좌표가 셀 리플로우 결과와 다르다"
+        );
+    }
+
+    #[test]
+    fn line_spacing_change_actually_widens_the_line_pitch() {
+        let mut doc = load();
+        let before = line_tops(&doc);
+        doc.apply_para_format_in_cell_native(0, PARA, CTRL, CELL, CELL_PARA, r#"{"lineSpacing":200}"#)
+            .expect("셀 문단 서식 변경 실패");
+        let after = line_tops(&doc);
+        assert_eq!(after.len(), before.len(), "줄 수는 그대로");
+        let pitch_before = before[1] - before[0];
+        let pitch_after = after[1] - after[0];
+        assert!(
+            pitch_after > pitch_before,
+            "줄간격을 넓혔는데 줄 좌표 간격이 그대로다: {pitch_before} -> {pitch_after}"
+        );
     }
 }
 
