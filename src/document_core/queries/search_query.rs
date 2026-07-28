@@ -316,6 +316,13 @@ impl DocumentCore {
 
         let count = all_hits.len();
 
+        // 셀 문단은 치환 후 리플로우가 필요하다. 본문은 recompose_section이
+        // 줄배치를 다시 재지만, 셀 문단의 line_segs와 셀 높이는 저장 파일에
+        // 그대로 직렬화된다 — 갱신하지 않으면 뷰어가 옛 줄배치로 그려서
+        // 문장이 칸 밖으로 넘치거나 조용히 잘린다(2026-07-28 사업계획서 실측).
+        // reflow_cell_paragraph 가 줄배치 재계산 + 셀 지오메트리 sync를 모두 한다.
+        let mut cell_reflows: Vec<(usize, usize, usize, usize, usize)> = Vec::new();
+
         for hit in &all_hits {
             if let Some((parent_para, ctrl_idx, cell_idx, cell_para_idx)) = hit.cell_context {
                 // 표 셀 내부 치환
@@ -350,6 +357,7 @@ impl DocumentCore {
                 };
                 cell_para.delete_text_at(hit.char_offset, hit.length);
                 cell_para.insert_text_at(hit.char_offset, new_text);
+                cell_reflows.push((hit.sec, parent_para, ctrl_idx, cell_idx, cell_para_idx));
             } else {
                 // 본문 문단 치환 — delete_text_native + insert_text_native는 recompose를 호출하므로
                 // 성능을 위해 직접 문단 수준 조작 후 마지막에 일괄 recompose
@@ -365,6 +373,15 @@ impl DocumentCore {
                 para.delete_text_at(hit.char_offset, hit.length);
                 para.insert_text_at(hit.char_offset, new_text);
             }
+        }
+
+        // 치환된 셀 문단 리플로우 + 셀 높이 동기화. 같은 문단이 여러 번
+        // 걸렸어도 리플로우는 멱등이라 중복 호출이 해롭지 않지만, 셀 높이
+        // sync 비용을 아끼려고 한 번씩만 돈다.
+        cell_reflows.sort_unstable();
+        cell_reflows.dedup();
+        for (sec, parent_para, ctrl_idx, cell_idx, cell_para_idx) in cell_reflows {
+            self.reflow_cell_paragraph(sec, parent_para, ctrl_idx, cell_idx, cell_para_idx);
         }
 
         // 변경된 섹션들 recompose
