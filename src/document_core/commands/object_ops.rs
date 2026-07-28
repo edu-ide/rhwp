@@ -1903,9 +1903,11 @@ impl DocumentCore {
         // 바이트 레이아웃: flags(4) + v_offset(4) + h_offset(4) + width(4) + height(4)
         //                 + z_order(4) + margin_l(2) + margin_r(2) + margin_t(2) + margin_b(2)
         //                 + instance_id(4) = 36바이트 (+ 여유 2바이트 = 38)
-        // vert=Para(2), horz=Para(3), wrap=TopAndBottom(1)
-        // width_criterion=Absolute(4), height_criterion=Absolute(2)
-        let flags: u32 = (2 << 3) | (3 << 8) | (4 << 15) | (2 << 18) | (1 << 21);
+        // 0x082A2311 = 한컴이 저장하는 tac(글자처럼 취급) 표의 표준 플래그.
+        // 예전 값 (2<<3)|(3<<8)|(4<<15)|(2<<18)|(1<<21) 은 bit0(like_char)이 빠져
+        // 있어서, 셀에 이식한 표를 한컴이 부동 개체로 해석해 통째로 버렸다
+        // (우리 렌더러는 model.treat_as_char 필드만 봐서 자기검증을 통과했다).
+        let flags: u32 = 0x082A2311;
         let outer_margin: i16 = 283; // ~1mm
         let mut raw_ctrl_data = vec![0u8; 38];
         raw_ctrl_data[common_obj_offsets::FLAGS].copy_from_slice(&flags.to_le_bytes());
@@ -1920,20 +1922,47 @@ impl DocumentCore {
             .copy_from_slice(&outer_margin.to_le_bytes());
         // instance_id (해시 기반, 비-0 필수)
         let instance_id: u32 = {
+            // (rows, cols, 크기)만 섞으면 같은 모양 표끼리 id 가 충돌한다 —
+            // 실제로 5×3 표 두 개가 같은 id 를 받아 한컴에서 개체 식별이 꼬였다.
+            // 문서에 이미 존재하는 id 를 수집해 충돌하면 밀어낸다.
+            let mut used: std::collections::HashSet<u32> = std::collections::HashSet::new();
+            let iid_of = |raw: &[u8]| -> Option<u32> {
+                raw.get(common_obj_offsets::INSTANCE_ID)
+                    .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+            };
+            for sec in &self.document.sections {
+                for para in &sec.paragraphs {
+                    for ctrl in &para.controls {
+                        if let Control::Table(t) = ctrl {
+                            used.extend(iid_of(&t.raw_ctrl_data));
+                            for cell in &t.cells {
+                                for cp in &cell.paragraphs {
+                                    for c2 in &cp.controls {
+                                        if let Control::Table(t2) = c2 {
+                                            used.extend(iid_of(&t2.raw_ctrl_data));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             let mut h: u32 = 0x7c150000;
             h = h.wrapping_add(row_count as u32 * 0x1000);
             h = h.wrapping_add(col_count as u32 * 0x100);
             h = h.wrapping_add(total_width);
             h = h.wrapping_add(total_height.wrapping_mul(0x1b));
-            if h == 0 {
-                h = 0x7c154b69;
+            h = h.wrapping_add((para_idx as u32).wrapping_mul(0x9e37_79b9));
+            while h == 0 || used.contains(&h) {
+                h = h.wrapping_add(0x0101_0101).max(1);
             }
             h
         };
         raw_ctrl_data[common_obj_offsets::INSTANCE_ID].copy_from_slice(&instance_id.to_le_bytes());
 
         let mut table = Table {
-            attr: 0x082A2210, // 한컴 기본값 (blank_h_saved.hwp)
+            attr: 0x082A2311, // 한컴 tac 표 표준 플래그 (raw_ctrl_data FLAGS 와 일치)
             row_count,
             col_count,
             cell_spacing: 0,
@@ -2853,6 +2882,82 @@ impl DocumentCore {
         Ok(super::super::helpers::json_ok_with(&format!(
             "\"paraIdx\":{},\"controlIdx\":{},\"container\":\"cell-inline-table\",\"tableControl\":{},\"cellIndex\":{},\"removedScratchParas\":{}",
             dst_para_idx, new_ctrl_idx, dst_table_ctrl_idx, dst_cell_idx, removed_paras
+        )))
+    }
+
+    /// 셀 안 중첩 표들의 컨트롤 플래그를 한컴 표준으로 수리한다.
+    ///
+    /// create_table 이 bit0(글자처럼 취급) 없는 플래그(0x002A0310)로 표를 만들던
+    /// 시기의 산출물은 한컴에서 표가 통째로 무시된다. 셀 안 표는 전부 tac 여야
+    /// 하므로 FLAGS 를 0x082A2311 로 강제하고, instance id 충돌도 재발급한다.
+    pub fn repair_nested_table_attrs_native(&mut self) -> Result<String, HwpError> {
+        use crate::model::shape::common_obj_offsets;
+        const STD_FLAGS: u32 = 0x082A2311;
+
+        let mut used: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut fixed_flags = 0usize;
+        let mut fixed_iids = 0usize;
+
+        for sec in self.document.sections.iter_mut() {
+            for para in sec.paragraphs.iter_mut() {
+                for ctrl in para.controls.iter_mut() {
+                    let Control::Table(outer) = ctrl else { continue };
+                    if outer.raw_ctrl_data.len() >= common_obj_offsets::MIN_LEN {
+                        used.insert(u32::from_le_bytes(
+                            outer.raw_ctrl_data[common_obj_offsets::INSTANCE_ID]
+                                .try_into()
+                                .unwrap(),
+                        ));
+                    }
+                    for cell in outer.cells.iter_mut() {
+                        for cp in cell.paragraphs.iter_mut() {
+                            for c2 in cp.controls.iter_mut() {
+                                let Control::Table(nested) = c2 else { continue };
+                                let raw = &mut nested.raw_ctrl_data;
+                                if raw.len() < common_obj_offsets::MIN_LEN {
+                                    raw.resize(common_obj_offsets::MIN_LEN + 2, 0);
+                                }
+                                let flags = u32::from_le_bytes(
+                                    raw[common_obj_offsets::FLAGS].try_into().unwrap(),
+                                );
+                                if flags & 1 == 0 {
+                                    raw[common_obj_offsets::FLAGS]
+                                        .copy_from_slice(&STD_FLAGS.to_le_bytes());
+                                    nested.attr = STD_FLAGS;
+                                    nested.common.treat_as_char = true;
+                                    nested.common.attr = STD_FLAGS;
+                                    fixed_flags += 1;
+                                }
+                                let mut iid = u32::from_le_bytes(
+                                    raw[common_obj_offsets::INSTANCE_ID].try_into().unwrap(),
+                                );
+                                if iid == 0 || used.contains(&iid) {
+                                    while iid == 0 || used.contains(&iid) {
+                                        iid = iid.wrapping_add(0x0101_0101).max(1);
+                                    }
+                                    raw[common_obj_offsets::INSTANCE_ID]
+                                        .copy_from_slice(&iid.to_le_bytes());
+                                    nested.common.instance_id = iid;
+                                    fixed_iids += 1;
+                                }
+                                used.insert(iid);
+                                nested.dirty = true;
+                            }
+                        }
+                    }
+                    outer.dirty = true;
+                }
+            }
+            sec.raw_stream = None;
+        }
+        for si in 0..self.document.sections.len() {
+            self.rebuild_section(si);
+        }
+        self.paginate_if_needed();
+        self.invalidate_page_tree_cache();
+        Ok(super::super::helpers::json_ok_with(&format!(
+            "\"fixedFlags\":{},\"fixedInstanceIds\":{}",
+            fixed_flags, fixed_iids
         )))
     }
 

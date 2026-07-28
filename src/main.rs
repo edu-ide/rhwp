@@ -63,6 +63,7 @@ fn main() {
         Some("create-table") => create_table_cli(&args[2..]),
         Some("move-table-to-cell") => move_table_to_cell_cli(&args[2..]),
         Some("move-table-from-cell") => move_table_from_cell_cli(&args[2..]),
+        Some("repair-nested-tables") => repair_nested_tables_cli(&args[2..]),
         Some("copy-table") => table_structure_cli(&args[2..], "copy-table"),
         Some("delete-table") => table_structure_cli(&args[2..], "delete-table"),
         Some("set-cell-text") => set_cell_text_cli(&args[2..]),
@@ -7232,6 +7233,53 @@ fn move_table_to_cell_cli(args: &[String]) {
             verification.page_count_before, verification.page_count_after
         ));
     }
+    write_hwp_cli_output(&output, &verification.bytes).unwrap_or_else(|e| exit_cli_error(&e));
+    println!(
+        "{}",
+        serde_json::json!({
+            "ok": true,
+            "path": output,
+            "details": parse_json_value(&details_json),
+            "pageCountBefore": verification.page_count_before,
+            "pageCountAfter": verification.page_count_after,
+        })
+    );
+}
+
+/// 셀 안 중첩 표들의 tac 플래그·instance id 를 한컴 표준으로 수리한다.
+fn repair_nested_tables_cli(args: &[String]) {
+    if args.is_empty() {
+        exit_cli_error("사용법: rhwp repair-nested-tables <파일.hwp> [-o <출력.hwp>]");
+    }
+    let input = args[0].clone();
+    let mut output_path: Option<String> = None;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-o" | "--output" => {
+                i += 1;
+                if i >= args.len() {
+                    exit_cli_error("-o/--output 뒤에 경로가 필요합니다.");
+                }
+                output_path = Some(args[i].clone());
+            }
+            _ => exit_cli_error(&format!("알 수 없는 옵션: {}", args[i])),
+        }
+        i += 1;
+    }
+    let output = output_path.unwrap_or_else(|| input.clone());
+    let data = fs::read(&input)
+        .unwrap_or_else(|e| exit_cli_error(&format!("파일 읽기 실패 - {}: {}", input, e)));
+    let mut core = rhwp::document_core::DocumentCore::from_bytes(&data)
+        .unwrap_or_else(|e| exit_cli_error(&format!("HWP 파싱 실패: {}", e)));
+    core.convert_to_editable_native()
+        .unwrap_or_else(|e| exit_cli_error(&format!("편집 가능 변환 실패: {}", e)));
+    let details_json = core
+        .repair_nested_table_attrs_native()
+        .unwrap_or_else(|e| exit_cli_error(&format!("수리 실패: {}", e)));
+    let verification = core
+        .serialize_hwp_with_verify()
+        .unwrap_or_else(|e| exit_cli_error(&format!("HWP 직렬화/재로드 검증 실패: {}", e)));
     write_hwp_cli_output(&output, &verification.bytes).unwrap_or_else(|e| exit_cli_error(&e));
     println!(
         "{}",
