@@ -1358,6 +1358,11 @@ impl DocumentCore {
                     Some(id) => id,
                     None => {
                         self.document.doc_info.border_fills.push(new_bf);
+                        // 새 BorderFill 을 push 했으면 DocInfo raw stream 을 반드시
+                        // 무효화해야 한다. 안 하면 저장 시 옛 스트림이 그대로 나가
+                        // 셀이 존재하지 않는 BF id 를 가리키고, 재로드에서 0 으로
+                        // 클램프되어 테두리·채움이 통째로 사라진다.
+                        self.document.doc_info.raw_stream_dirty = true;
                         self.document.doc_info.border_fills.len() as u16
                     }
                 }
