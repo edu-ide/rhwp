@@ -2856,6 +2856,124 @@ impl DocumentCore {
         )))
     }
 
+    /// 셀 문단의 '글자처럼 취급' 표를 꺼내 문서 끝 새 본문 문단으로 옮긴다.
+    ///
+    /// move_table_to_cell_native 의 역방향. 중첩 표에는 채움·서식 도구
+    /// (set_cell_text/set_cell_properties/set_cell_para_format …)가 닿지 않으므로,
+    /// 셀 안 표를 고칠 일이 생기면 꺼내서(top-level) 기존 도구로 손보고 다시
+    /// 넣는 왕복이 표준 경로다.
+    ///
+    /// 제약: 대상 표는 셀 문단의 마지막 컨트롤이어야 한다 — to_cell 이 정확히
+    /// 그렇게 넣는다. 반환 JSON 의 paraIdx/controlIdx 가 꺼내진 표의 새 주소다.
+    pub fn move_table_from_cell_native(
+        &mut self,
+        section_idx: usize,
+        src_para_idx: usize,
+        src_cell_path: &[(usize, usize, usize)],
+    ) -> Result<String, HwpError> {
+        if section_idx >= self.document.sections.len() {
+            return Err(HwpError::RenderError(format!(
+                "구역 인덱스 {} 범위 초과",
+                section_idx
+            )));
+        }
+        if src_para_idx >= self.document.sections[section_idx].paragraphs.len() {
+            return Err(HwpError::RenderError(format!(
+                "문단 인덱스 {} 범위 초과",
+                src_para_idx
+            )));
+        }
+        if src_cell_path.len() != 1 {
+            return Err(HwpError::RenderError(
+                "depth 1 표 셀 경로만 지원합니다".to_string(),
+            ));
+        }
+        let (src_table_ctrl_idx, src_cell_idx, src_cell_para_idx) = src_cell_path[0];
+
+        // 1) 셀 문단에서 떼어내기
+        let table_box = {
+            let section = &mut self.document.sections[section_idx];
+            section.raw_stream = None;
+            let cell_para =
+                Self::resolve_cell_paragraph_mut(section, src_para_idx, src_cell_path)?;
+            match cell_para.controls.last() {
+                Some(Control::Table(_)) => {}
+                _ => {
+                    return Err(HwpError::RenderError(
+                        "셀 문단의 마지막 컨트롤이 표가 아닙니다".to_string(),
+                    ))
+                }
+            }
+            if cell_para.char_count < 8 {
+                return Err(HwpError::RenderError(
+                    "셀 문단에 표 제어문자 갭이 없습니다".to_string(),
+                ));
+            }
+            let ctrl = cell_para.controls.pop().expect("검사 후 pop");
+            cell_para.ctrl_data_records.pop();
+            cell_para.char_count -= 8;
+            match ctrl {
+                Control::Table(t) => t,
+                _ => unreachable!("위에서 표임을 확인했다"),
+            }
+        };
+        // 셀 문단 줄배치·소유 셀 높이 원복
+        self.reflow_cell_paragraph(
+            section_idx,
+            src_para_idx,
+            src_table_ctrl_idx,
+            src_cell_idx,
+            src_cell_para_idx,
+        );
+
+        let total_height: i32 = {
+            let mut row_heights: std::collections::BTreeMap<u16, i32> =
+                std::collections::BTreeMap::new();
+            for cell in &table_box.cells {
+                let h = cell.height as i32;
+                let entry = row_heights.entry(cell.row).or_insert(0);
+                if h > *entry {
+                    *entry = h;
+                }
+            }
+            row_heights.values().sum::<i32>().max(1000)
+        };
+
+        // 2) 문서 끝 새 본문 문단에 tac 인라인으로 붙이기
+        let dst_para_idx = {
+            let section = &mut self.document.sections[section_idx];
+            section.raw_stream = None;
+            section
+                .paragraphs
+                .push(crate::model::paragraph::Paragraph::new_empty());
+            let dst_idx = section.paragraphs.len() - 1;
+            let para = &mut section.paragraphs[dst_idx];
+            para.controls.push(Control::Table(table_box));
+            para.ctrl_data_records.push(None);
+            para.char_count += 8;
+            para.line_segs = vec![crate::model::paragraph::LineSeg {
+                text_start: 0,
+                line_height: total_height,
+                text_height: total_height,
+                baseline_distance: (total_height as f64 * 0.85) as i32,
+                line_spacing: 0,
+                segment_width: 0,
+                tag: crate::model::paragraph::LineSeg::TAG_SINGLE_SEGMENT_LINE,
+                ..Default::default()
+            }];
+            dst_idx
+        };
+
+        self.mark_section_dirty(section_idx);
+        self.rebuild_section(section_idx);
+        self.paginate_if_needed();
+        self.invalidate_page_tree_cache();
+        Ok(super::super::helpers::json_ok_with(&format!(
+            "\"paraIdx\":{},\"controlIdx\":0,\"container\":\"body\"",
+            dst_para_idx
+        )))
+    }
+
     /// 커서 위치에 그림을 삽입한다 (네이티브).
     ///
     /// - `cell_path` 가 비어있으면 본문 paragraph 에 inline (treat_as_char=true) 삽입.

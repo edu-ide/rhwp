@@ -62,6 +62,7 @@ fn main() {
         Some("delete-footnote") => note_delete_cli(&args[2..]),
         Some("create-table") => create_table_cli(&args[2..]),
         Some("move-table-to-cell") => move_table_to_cell_cli(&args[2..]),
+        Some("move-table-from-cell") => move_table_from_cell_cli(&args[2..]),
         Some("copy-table") => table_structure_cli(&args[2..], "copy-table"),
         Some("delete-table") => table_structure_cli(&args[2..], "delete-table"),
         Some("set-cell-text") => set_cell_text_cli(&args[2..]),
@@ -7231,6 +7232,78 @@ fn move_table_to_cell_cli(args: &[String]) {
             verification.page_count_before, verification.page_count_after
         ));
     }
+    write_hwp_cli_output(&output, &verification.bytes).unwrap_or_else(|e| exit_cli_error(&e));
+    println!(
+        "{}",
+        serde_json::json!({
+            "ok": true,
+            "path": output,
+            "details": parse_json_value(&details_json),
+            "pageCountBefore": verification.page_count_before,
+            "pageCountAfter": verification.page_count_after,
+        })
+    );
+}
+
+/// 셀 안 표를 본문으로 꺼낸다 — move-table-to-cell 의 역방향 (수선용).
+fn move_table_from_cell_cli(args: &[String]) {
+    if args.is_empty() {
+        exit_cli_error(
+            "사용법: rhwp move-table-from-cell <파일.hwp> --src-para N --src-control N --src-cell N --src-cell-para N -o <출력.hwp>",
+        );
+    }
+    let input = args[0].clone();
+    let mut vals: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let mut output_path: Option<String> = None;
+    let mut i = 1;
+    while i < args.len() {
+        let key = args[i].as_str();
+        match key {
+            "--src-para" | "--src-control" | "--src-cell" | "--src-cell-para" => {
+                i += 1;
+                if i >= args.len() {
+                    exit_cli_error(&format!("{} 뒤에 정수가 필요합니다.", key));
+                }
+                let v: usize = args[i]
+                    .parse()
+                    .unwrap_or_else(|_| exit_cli_error(&format!("{} 값이 정수가 아닙니다.", key)));
+                vals.insert(key, v);
+            }
+            "-o" | "--output" => {
+                i += 1;
+                if i >= args.len() {
+                    exit_cli_error("-o/--output 뒤에 경로가 필요합니다.");
+                }
+                output_path = Some(args[i].clone());
+            }
+            _ => exit_cli_error(&format!("알 수 없는 옵션: {}", args[i])),
+        }
+        i += 1;
+    }
+    let need = |k: &str| -> usize {
+        *vals
+            .get(k)
+            .unwrap_or_else(|| exit_cli_error(&format!("{} 가 필요합니다.", k)))
+    };
+    let src_para = need("--src-para");
+    let src_control = need("--src-control");
+    let src_cell = need("--src-cell");
+    let src_cell_para = need("--src-cell-para");
+    let output = output_path.unwrap_or_else(|| input.clone());
+
+    let data = fs::read(&input)
+        .unwrap_or_else(|e| exit_cli_error(&format!("파일 읽기 실패 - {}: {}", input, e)));
+    let mut core = rhwp::document_core::DocumentCore::from_bytes(&data)
+        .unwrap_or_else(|e| exit_cli_error(&format!("HWP 파싱 실패: {}", e)));
+    core.convert_to_editable_native()
+        .unwrap_or_else(|e| exit_cli_error(&format!("편집 가능 변환 실패: {}", e)));
+    let cell_path = [(src_control, src_cell, src_cell_para)];
+    let details_json = core
+        .move_table_from_cell_native(0, src_para, &cell_path)
+        .unwrap_or_else(|e| exit_cli_error(&format!("표 꺼내기 실패: {}", e)));
+    let verification = core
+        .serialize_hwp_with_verify()
+        .unwrap_or_else(|e| exit_cli_error(&format!("HWP 직렬화/재로드 검증 실패: {}", e)));
     write_hwp_cli_output(&output, &verification.bytes).unwrap_or_else(|e| exit_cli_error(&e));
     println!(
         "{}",
