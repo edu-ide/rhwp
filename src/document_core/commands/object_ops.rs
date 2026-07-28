@@ -2649,6 +2649,213 @@ impl DocumentCore {
         )))
     }
 
+    /// 본문 문단의 표 컨트롤을 지정 셀 문단으로 옮겨 '글자처럼 취급' 인라인 표로 만든다.
+    ///
+    /// 표 생성기(create_table_ex_native)와 셀 채움 도구(set_cell_text 등)는 본문
+    /// 표만 다룬다. 양식 답변 칸(셀) 안에 데이터 표가 필요하면 본문 임시 자리에
+    /// 만들어 완성한 뒤 이 함수로 컨트롤만 옮긴다 — 삽입 장부는 인라인 셀 그림
+    /// (insert_cell_picture_inline_native)과 같은 패턴이다.
+    ///
+    /// 원본 회수 제약: 옮길 표는 원본 문단의 '마지막 컨트롤'이어야 한다. 임시 생성
+    /// 파이프라인(문단 끝 offset 에 create-table-ex)이 정확히 그렇게 만들며, 임의
+    /// 위치 갭 회수는 오프셋 산술이 더 필요해 지원하지 않는다 — 잘못 회수하면
+    /// 문단 좌표 전체가 어긋난다.
+    pub fn move_table_to_cell_native(
+        &mut self,
+        section_idx: usize,
+        src_para_idx: usize,
+        src_control_idx: usize,
+        dst_para_idx: usize,
+        dst_cell_path: &[(usize, usize, usize)],
+        dst_char_offset: usize,
+    ) -> Result<String, HwpError> {
+        if section_idx >= self.document.sections.len() {
+            return Err(HwpError::RenderError(format!(
+                "구역 인덱스 {} 범위 초과",
+                section_idx
+            )));
+        }
+        {
+            let para_len = self.document.sections[section_idx].paragraphs.len();
+            if src_para_idx >= para_len || dst_para_idx >= para_len {
+                return Err(HwpError::RenderError(format!(
+                    "문단 인덱스 범위 초과 (src={}, dst={}, 총 {})",
+                    src_para_idx, dst_para_idx, para_len
+                )));
+            }
+        }
+        if dst_cell_path.len() != 1 {
+            return Err(HwpError::RenderError(
+                "셀 인라인 표는 depth 1 표 셀 경로만 지원합니다".to_string(),
+            ));
+        }
+        {
+            let section = &self.document.sections[section_idx];
+            if Self::cell_path_terminates_at_textbox(section, dst_para_idx, dst_cell_path)? {
+                return Err(HwpError::RenderError(
+                    "글상자 경로에는 표를 옮길 수 없습니다".to_string(),
+                ));
+            }
+        }
+        self.resolve_cell_by_path(section_idx, dst_para_idx, dst_cell_path)?;
+
+        // ── 1) 원본에서 떼어내기 ──
+        let table_box = {
+            let section = &mut self.document.sections[section_idx];
+            section.raw_stream = None;
+            let para = &mut section.paragraphs[src_para_idx];
+            if para.controls.len() != src_control_idx + 1 {
+                return Err(HwpError::RenderError(format!(
+                    "원본 표는 문단의 마지막 컨트롤이어야 합니다 (control={}, 총 {})",
+                    src_control_idx,
+                    para.controls.len()
+                )));
+            }
+            match para.controls.last() {
+                Some(Control::Table(_)) => {}
+                _ => {
+                    return Err(HwpError::RenderError(
+                        "원본 컨트롤이 표가 아닙니다".to_string(),
+                    ))
+                }
+            }
+            if para.char_count < 8 {
+                return Err(HwpError::RenderError(
+                    "원본 문단에 표 제어문자 갭이 없습니다".to_string(),
+                ));
+            }
+            let ctrl = para.controls.pop().expect("검사 후 pop");
+            para.ctrl_data_records.pop();
+            para.char_count -= 8;
+            match ctrl {
+                Control::Table(t) => t,
+                _ => unreachable!("위에서 표임을 확인했다"),
+            }
+        };
+
+        // 원본 호스트가 표 전용 문단이었다면(텍스트·컨트롤 없음) 스크래치 흔적을
+        // 걷는다 — create-table 이 만든 host 와 그 아래 빈 문단. 남기면 문서 끝의
+        // 보이지 않는 문단이 페이지를 하나 만든다(실측: 10쪽 양식이 11쪽이 됐다).
+        // delete_table_native 의 standalone 분기와 같은 방식이다.
+        let mut removed_paras = 0usize;
+        {
+            let section = &mut self.document.sections[section_idx];
+            let host_empty = section
+                .paragraphs
+                .get(src_para_idx)
+                .map(|p| p.text.is_empty() && p.controls.is_empty())
+                .unwrap_or(false);
+            if host_empty {
+                section.paragraphs.remove(src_para_idx);
+                removed_paras += 1;
+                let next_empty = section
+                    .paragraphs
+                    .get(src_para_idx)
+                    .map(|p| p.text.is_empty() && p.controls.is_empty())
+                    .unwrap_or(false);
+                if next_empty {
+                    section.paragraphs.remove(src_para_idx);
+                    removed_paras += 1;
+                }
+                if section.paragraphs.is_empty() {
+                    section
+                        .paragraphs
+                        .push(crate::model::paragraph::Paragraph::new_empty());
+                }
+                section.raw_stream = None;
+            }
+        }
+        let dst_para_idx = if dst_para_idx > src_para_idx {
+            dst_para_idx - removed_paras.min(dst_para_idx - src_para_idx)
+        } else {
+            dst_para_idx
+        };
+
+        // 셀 문단 줄높이에 반영할 표 전체 높이: 행별 최대 셀 높이의 합
+        let total_height: i32 = {
+            let mut row_heights: std::collections::BTreeMap<u16, i32> =
+                std::collections::BTreeMap::new();
+            for cell in &table_box.cells {
+                let h = cell.height as i32;
+                let entry = row_heights.entry(cell.row).or_insert(0);
+                if h > *entry {
+                    *entry = h;
+                }
+            }
+            row_heights.values().sum::<i32>().max(1000)
+        };
+
+        // ── 2) 셀 문단에 붙이기 (인라인 셀 그림과 같은 장부) ──
+        let (dst_table_ctrl_idx, dst_cell_idx, _dst_cell_para_idx) = dst_cell_path[0];
+        let new_ctrl_idx = {
+            let section = &mut self.document.sections[section_idx];
+            section.raw_stream = None;
+            let target_para =
+                Self::resolve_cell_paragraph_mut(section, dst_para_idx, dst_cell_path)?;
+
+            let new_ctrl_idx = target_para.controls.len();
+            target_para.controls.push(Control::Table(table_box));
+            target_para.ctrl_data_records.push(None);
+
+            let insert_utf16_pos = if dst_char_offset < target_para.char_offsets.len() {
+                target_para.char_offsets[dst_char_offset]
+            } else if !target_para.char_offsets.is_empty() {
+                let last_idx = target_para.char_offsets.len() - 1;
+                let last_char_len = target_para
+                    .text
+                    .chars()
+                    .nth(last_idx)
+                    .map(|c| c.len_utf16() as u32)
+                    .unwrap_or(1);
+                target_para.char_offsets[last_idx] + last_char_len
+            } else {
+                0
+            };
+            for offset in target_para.char_offsets.iter_mut() {
+                if *offset >= insert_utf16_pos {
+                    *offset += 8;
+                }
+            }
+            target_para.char_count += 8;
+
+            if target_para.line_segs.is_empty() {
+                target_para.line_segs = vec![crate::model::paragraph::LineSeg {
+                    text_start: 0,
+                    line_height: total_height,
+                    text_height: total_height,
+                    baseline_distance: (total_height as f64 * 0.85) as i32,
+                    line_spacing: 0,
+                    segment_width: 0,
+                    tag: crate::model::paragraph::LineSeg::TAG_SINGLE_SEGMENT_LINE,
+                    ..Default::default()
+                }];
+            } else if let Some(seg) = target_para.line_segs.first_mut() {
+                let new_lh = total_height.max(seg.line_height);
+                if new_lh > seg.line_height {
+                    seg.line_height = new_lh;
+                    seg.text_height = new_lh;
+                    seg.baseline_distance = (new_lh as f64 * 0.85) as i32;
+                }
+            }
+            new_ctrl_idx
+        };
+
+        self.sync_owner_cell_geometry(section_idx, dst_para_idx, dst_table_ctrl_idx, dst_cell_idx);
+        self.mark_section_dirty(section_idx);
+        if removed_paras > 0 {
+            // 문단이 사라졌으면 composed 배열 길이가 어긋난다 — 전체 재구성.
+            self.rebuild_section(section_idx);
+        } else {
+            self.recompose_section(section_idx);
+        }
+        self.paginate_if_needed();
+        self.invalidate_page_tree_cache();
+        Ok(super::super::helpers::json_ok_with(&format!(
+            "\"paraIdx\":{},\"controlIdx\":{},\"container\":\"cell-inline-table\",\"tableControl\":{},\"cellIndex\":{},\"removedScratchParas\":{}",
+            dst_para_idx, new_ctrl_idx, dst_table_ctrl_idx, dst_cell_idx, removed_paras
+        )))
+    }
+
     /// 커서 위치에 그림을 삽입한다 (네이티브).
     ///
     /// - `cell_path` 가 비어있으면 본문 paragraph 에 inline (treat_as_char=true) 삽입.
