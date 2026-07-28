@@ -325,6 +325,9 @@ impl LayoutEngine {
             vec![vec![None; render_row_count]; col_count + 1];
         let mut grid_row_y = render_row_y.clone();
         grid_row_y.push(partial_table_height);
+        // 마지막 조각에서 셀 클립을 콘텐츠에 맞춰 넓힌 양(아래 셀 루프에서 기록).
+        // 테두리도 같은 만큼 내려야 글자가 상자 밖으로 새어 보이지 않는다.
+        let mut cell_clip_grow: f64 = 0.0;
 
         // ── 4b. 캡션 처리 (첫 번째 파트에서만 렌더링) ──
         let is_first_part = start_row == 0 && !is_continuation && start_cut.is_empty();
@@ -1425,7 +1428,44 @@ impl LayoutEngine {
                 }
             }
 
+            // 마지막 조각의 셀 클립이 콘텐츠보다 짧으면 내용이 소리 없이 사라진다.
+            // 컷 높이(row_cut_content_height)가 실제 배치 높이보다 작게 나오는
+            // 경우가 있어(실측: 답변 칸 마지막 조각에서 179pt 부족, 표 뒤 문단
+            // 여러 줄이 통째로 안 보였다) 클립 상자만 콘텐츠에 맞춰 넓힌다.
+            // 테두리는 render_rows 좌표로 따로 수집하므로 영향받지 않고,
+            // end_cut 이 있는 중간 조각은 다음 쪽 몫을 가려야 하므로 제외한다.
+            if end_cut.is_empty()
+                && matches!(cell_node.node_type, RenderNodeType::TableCell(ref tc) if tc.clip)
+            {
+                fn deepest_bottom(node: &RenderNode, acc: &mut f64) {
+                    let bottom = node.bbox.y + node.bbox.height;
+                    if bottom > *acc {
+                        *acc = bottom;
+                    }
+                    for child in &node.children {
+                        deepest_bottom(child, acc);
+                    }
+                }
+                let mut content_bottom = cell_node.bbox.y;
+                for child in &cell_node.children {
+                    deepest_bottom(child, &mut content_bottom);
+                }
+                let needed = content_bottom - cell_node.bbox.y;
+                if needed > cell_node.bbox.height {
+                    cell_clip_grow = cell_clip_grow.max(needed - cell_node.bbox.height);
+                    cell_node.bbox.height = needed;
+                }
+            }
+
             table_node.children.push(cell_node);
+        }
+
+        // 셀 클립을 넓혔다면 표 하단 경계도 같이 내린다 (테두리와 내용 정합).
+        if cell_clip_grow > 0.0 {
+            if let Some(last) = grid_row_y.last_mut() {
+                *last += cell_clip_grow;
+            }
+            table_node.bbox.height += cell_clip_grow;
         }
 
         // 엣지 기반 테두리 렌더링
