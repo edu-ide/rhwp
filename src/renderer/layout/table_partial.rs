@@ -1434,9 +1434,7 @@ impl LayoutEngine {
             // 여러 줄이 통째로 안 보였다) 클립 상자만 콘텐츠에 맞춰 넓힌다.
             // 테두리는 render_rows 좌표로 따로 수집하므로 영향받지 않고,
             // end_cut 이 있는 중간 조각은 다음 쪽 몫을 가려야 하므로 제외한다.
-            if end_cut.is_empty()
-                && matches!(cell_node.node_type, RenderNodeType::TableCell(ref tc) if tc.clip)
-            {
+            if matches!(cell_node.node_type, RenderNodeType::TableCell(ref tc) if tc.clip) {
                 fn deepest_bottom(node: &RenderNode, acc: &mut f64) {
                     let bottom = node.bbox.y + node.bbox.height;
                     if bottom > *acc {
@@ -1450,7 +1448,12 @@ impl LayoutEngine {
                 for child in &cell_node.children {
                     deepest_bottom(child, &mut content_bottom);
                 }
-                let needed = content_bottom - cell_node.bbox.y;
+                // 본문 영역 아래로는 넘기지 않는다. 중간 조각에서 콘텐츠 전체
+                // 바닥까지 열어 주면 다음 쪽 몫까지 드러나고(실측: 5쪽 하단
+                // 밖 200px 지점에 6쪽 표가 그려져 있었다), 페이지 밖 그리기는
+                // 잘린 것보다 더 나쁘게 보인다. 본문 바닥이 두 요구의 접점이다.
+                let page_limit = (col_area.y + col_area.height - cell_node.bbox.y).max(0.0);
+                let needed = (content_bottom - cell_node.bbox.y).min(page_limit);
                 if needed > cell_node.bbox.height {
                     cell_clip_grow = cell_clip_grow.max(needed - cell_node.bbox.height);
                     cell_node.bbox.height = needed;
