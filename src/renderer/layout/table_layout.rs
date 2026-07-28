@@ -176,7 +176,7 @@ pub(crate) struct RowCutResult {
 }
 
 /// [Task #993] 한 셀의 콘텐츠 유닛 — 합성 줄 1개 또는 중첩 표 atom 1개.
-struct CellUnit {
+pub(crate) struct CellUnit {
     /// 유닛 높이 (px).
     height: f64,
     /// 이 유닛 앞에 vpos 리셋(셀 내부 페이지 분할)이 있는가.
@@ -4009,7 +4009,7 @@ impl LayoutEngine {
     /// 의 줄 높이 계산과 동일 규칙(줄 h+ls, 셀 마지막 줄 ls 제외, 문단 첫·마지막
     /// 줄에 spacing_before/after). `hard_break_before` = 이 유닛 앞에 HWP vpos
     /// 리셋(셀 내부 페이지 분할, `[Task #697]`)이 있는가.
-    fn cell_units(
+    pub(crate) fn cell_units(
         &self,
         cell: &crate::model::table::Cell,
         table: &crate::model::table::Table,

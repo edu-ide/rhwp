@@ -611,6 +611,17 @@ impl LayoutEngine {
             };
             let line_ranges: Option<Vec<(usize, usize)>> = cut_units
                 .map(|(su, eu)| self.cell_line_ranges_from_cut(cell, table, styles, su, eu));
+            if std::env::var("RHWP_DEBUG_CUT").is_ok() {
+                if let Some((su, eu)) = cut_units {
+                    let units_len = self.cell_units(cell, table, styles).len();
+                    eprintln!(
+                        "CUT pi={} r{}c{} rows[{},{}) cont={} block={} su={} eu={} units={} sc={:?} ec={:?} ranges={:?}",
+                        para_index, cell.row, cell.col, start_row, end_row,
+                        is_continuation, is_block_split, su, eu, units_len,
+                        start_cut, end_cut, line_ranges
+                    );
+                }
+            }
             // [Task #1073] 이 셀이 per-중첩행 분해 대상(단일 문단 + 가시 텍스트 없음 + 단일
             // 중첩 표 2행+)이면 cut 유닛 인덱스가 곧 중첩행 범위 → 렌더 NestedTableSplit 에
             // start_row 로 전달(연속 페이지가 중첩행 0부터 재렌더되는 결함 정정).
@@ -1364,9 +1375,16 @@ impl LayoutEngine {
                 }
 
                 if has_table_ctrl {
-                    // LINE_SEG vpos 기반으로 para_y 보정.
+                    // LINE_SEG vpos 기반으로 para_y 보정 — 단, **첫 조각에서만**.
+                    // vertical_pos 는 셀 전체 기준 절대좌표라 text_y_start(조각
+                    // 상단)와 좌표계가 일치하는 건 su==0 인 첫 조각뿐이다. 연속
+                    // 조각에서 이 보정을 적용하면 para_y 가 페이지 밖으로 점프해
+                    // 표 뒤의 모든 문단·표가 뷰포트 밖에 그려져 통째로 사라진다
+                    // (실측: 사업계획서 p8 예산 표·자금 문단 소실). 연속 조각은
+                    // 렌더 누적 para_y 를 그대로 쓴다.
+                    let in_continuation_fragment = cut_units.map_or(false, |(su, _)| su > 0);
                     let is_last_para = cp_idx + 1 == composed_paras.len();
-                    if !is_last_para {
+                    if !is_last_para && !in_continuation_fragment {
                         if let Some(next_para) = cell.paragraphs.get(cp_idx + 1) {
                             if let Some(next_seg) = next_para.line_segs.first() {
                                 let next_vpos_y =

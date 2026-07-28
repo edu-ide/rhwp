@@ -21798,7 +21798,7 @@ mod doc_mcp_hwp_write_cli_tests {
             &edited.bytes,
             0,
             table.para_idx,
-            0,
+            &[(0, 0, 0)],
             r#"[{"cellIdx":0,"widthDelta":250,"heightDelta":300}]"#,
         )
         .expect("resize table cells");
