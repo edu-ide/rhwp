@@ -64,6 +64,7 @@ fn main() {
         Some("move-table-to-cell") => move_table_to_cell_cli(&args[2..]),
         Some("move-table-from-cell") => move_table_from_cell_cli(&args[2..]),
         Some("repair-nested-tables") => repair_nested_tables_cli(&args[2..]),
+        Some("lint") => lint_cli(&args[2..]),
         Some("copy-table") => table_structure_cli(&args[2..], "copy-table"),
         Some("delete-table") => table_structure_cli(&args[2..], "delete-table"),
         Some("set-cell-text") => set_cell_text_cli(&args[2..]),
@@ -7244,6 +7245,22 @@ fn move_table_to_cell_cli(args: &[String]) {
             "pageCountAfter": verification.page_count_after,
         })
     );
+}
+
+/// 한컴 호환성 lint — 저장은 되는데 한컴에서만 깨지는 결함의 사전 진단.
+fn lint_cli(args: &[String]) {
+    if args.is_empty() {
+        exit_cli_error("사용법: rhwp lint <파일.hwp>");
+    }
+    let input = args[0].clone();
+    let data = fs::read(&input)
+        .unwrap_or_else(|e| exit_cli_error(&format!("파일 읽기 실패 - {}: {}", input, e)));
+    let core = rhwp::document_core::DocumentCore::from_bytes(&data)
+        .unwrap_or_else(|e| exit_cli_error(&format!("HWP 파싱 실패: {}", e)));
+    let report = core
+        .lint_native()
+        .unwrap_or_else(|e| exit_cli_error(&format!("lint 실패: {}", e)));
+    println!("{}", report);
 }
 
 /// 셀 안 중첩 표들의 tac 플래그·instance id 를 한컴 표준으로 수리한다.
