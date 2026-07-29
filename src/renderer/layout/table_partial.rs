@@ -7,6 +7,7 @@ use super::super::render_tree::*;
 use super::super::style_resolver::ResolvedStyleSet;
 use super::super::{hwpunit_to_px, ShapeStyle};
 use super::border_rendering::{
+    create_border_line_nodes,
     build_row_col_x, collect_cell_borders, render_edge_borders, render_transparent_borders,
 };
 use super::table_layout::{calc_nested_split_rows, NestedTableSplit};
@@ -1496,6 +1497,43 @@ impl LayoutEngine {
             table_x,
             table_y,
         ));
+
+        // 쪽이 끊긴 자리를 닫는다.
+        //
+        // 셀의 위/아래 테두리는 **행 경계**를 그리는 값이다. 행이 쪽을 걸치면
+        // 잘린 자리에는 그릴 테두리가 없어서 상자가 아래로 열린 채 끝나고 다음
+        // 쪽이 열린 채 시작한다. 그렇다고 행 테두리를 켜면 쪽 안에 있는 진짜
+        // 행 경계에까지 줄이 생긴다. 두 자리는 성격이 다르므로 여기서 따로
+        // 그린다 — 조각이 잘렸을 때만, 표 폭 전체로.
+        {
+            let cut_top = is_continuation && !start_cut.is_empty();
+            let cut_bottom = !end_cut.is_empty();
+            if cut_top || cut_bottom {
+                let edge = BorderLine {
+                    line_type: crate::model::style::BorderLineType::Solid,
+                    width: 1,
+                    color: 0,
+                };
+                let x1 = table_x + row_col_x.first().and_then(|r| r.first().copied()).unwrap_or(0.0);
+                let x2 = table_x
+                    + row_col_x
+                        .first()
+                        .and_then(|r| r.last().copied())
+                        .unwrap_or(table_node.bbox.width);
+                if cut_top {
+                    let y = table_y + grid_row_y.first().copied().unwrap_or(0.0);
+                    table_node
+                        .children
+                        .extend(create_border_line_nodes(tree, &edge, x1, y, x2, y));
+                }
+                if cut_bottom {
+                    let y = table_y + grid_row_y.last().copied().unwrap_or(0.0);
+                    table_node
+                        .children
+                        .extend(create_border_line_nodes(tree, &edge, x1, y, x2, y));
+                }
+            }
+        }
         if self.show_transparent_borders.get() {
             table_node.children.extend(render_transparent_borders(
                 tree,
