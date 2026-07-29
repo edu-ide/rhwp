@@ -2906,6 +2906,7 @@ impl DocumentCore {
         let mut fixed_flags = 0usize;
         let mut fixed_iids = 0usize;
         let mut fixed_breaks = 0usize;
+        let mut fixed_widths = 0usize;
 
         for sec in self.document.sections.iter_mut() {
             for para in sec.paragraphs.iter_mut() {
@@ -2963,6 +2964,22 @@ impl DocumentCore {
                             }
                         }
                     }
+                    // 셀의 참조 폭(raw_list_extra[0..4])을 실제 폭으로 되돌린다.
+                    // 렌더러가 줄바꿈 폭으로 쓰는 값이라, 편집 중 어긋나면 폭은
+                    // 그대로인데 글자만 좁게 접힌다. 실제로 답변 행을 병합한 뒤
+                    // 머리행 문항 제목이 한 줄에서 두 줄로 접히는 사고가 났다.
+                    for cell in outer.cells.iter_mut() {
+                        if cell.raw_list_extra.len() >= 4 {
+                            let cur = u32::from_le_bytes(
+                                cell.raw_list_extra[0..4].try_into().unwrap(),
+                            );
+                            if cur != cell.width {
+                                cell.raw_list_extra[0..4]
+                                    .copy_from_slice(&cell.width.to_le_bytes());
+                                fixed_widths += 1;
+                            }
+                        }
+                    }
                     outer.dirty = true;
                 }
             }
@@ -2974,8 +2991,8 @@ impl DocumentCore {
         self.paginate_if_needed();
         self.invalidate_page_tree_cache();
         Ok(super::super::helpers::json_ok_with(&format!(
-            "\"fixedFlags\":{},\"fixedInstanceIds\":{},\"fixedPageBreaks\":{}",
-            fixed_flags, fixed_iids, fixed_breaks
+            "\"fixedFlags\":{},\"fixedInstanceIds\":{},\"fixedPageBreaks\":{},\"fixedRefWidths\":{}",
+            fixed_flags, fixed_iids, fixed_breaks, fixed_widths
         )))
     }
 

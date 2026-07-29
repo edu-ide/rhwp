@@ -671,14 +671,18 @@ impl DocumentCore {
         // 셀 폭이 바뀌었으므로 그 셀의 문단을 재배치한다.
         // 이걸 빼면 폭은 늘어나는데 line_segs 는 옛 폭 그대로라
         // 글자가 좁은 폭으로 줄바꿈한 뒤 넓어진 셀 밖으로 흘러 잘린다.
+        //
+        // 대상은 **병합된 주 셀 하나뿐**이다. 예전에는 표의 모든 셀을 다시
+        // 배치했는데, 폭이 그대로인 머리행까지 줄바꿈이 재계산돼 한 줄이던
+        // 문항 제목이 두 줄로 접혔다(양식과 눈에 띄게 달라짐).
         let reflow: Vec<(usize, usize)> = {
             let para = &self.document.sections[section_idx].paragraphs[parent_para_idx];
             if let Some(Control::Table(t)) = para.controls.get(control_idx) {
                 t.cells
                     .iter()
-                    .enumerate()
-                    .map(|(i, c)| (i, c.paragraphs.len()))
-                    .collect()
+                    .position(|c| c.row == start_row && c.col == start_col)
+                    .map(|i| vec![(i, t.cells[i].paragraphs.len())])
+                    .unwrap_or_default()
             } else {
                 Vec::new()
             }
