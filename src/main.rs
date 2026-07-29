@@ -72,6 +72,7 @@ fn main() {
         Some("delete-cell-text") => cell_text_edit_cli(&args[2..], true),
         Some("insert-cell-paragraph") => cell_paragraph_edit_cli(&args[2..], false),
         Some("delete-cell-paragraph") => cell_paragraph_edit_cli(&args[2..], true),
+        Some("move-cell-paragraphs") => move_cell_paragraphs_cli(&args[2..]),
         Some("split-cell-paragraph") => cell_paragraph_cli(&args[2..], false),
         Some("merge-cell-paragraph") => cell_paragraph_cli(&args[2..], true),
         Some("set-cell-field") => cell_field_cli(&args[2..], false),
@@ -423,6 +424,7 @@ fn print_help() {
     println!("  delete-cell-paragraph <파일.hwp> --para N --ctrl N (--cell N|--row N --col N) --cell-para N -o <출력.hwp>");
     println!("      표 셀 내부 문단을 삭제");
     println!();
+    println!("  move-cell-paragraphs <파일.hwp> --para N --ctrl N --from-row R --from-col C --start N --end N --to-row R --to-col C [--at N] -o <출력.hwp>");
     println!("  split-cell-paragraph <파일.hwp> --para N --ctrl N (--cell N|--row N --col N) [--cell-para N] --offset N -o <출력.hwp>");
     println!("      표 셀 내부 문단을 문자 오프셋에서 분할");
     println!();
@@ -10980,6 +10982,141 @@ fn cell_paragraph_edit_cli(args: &[String], delete: bool) {
             )
         }
     }
+    .unwrap_or_else(|e| exit_cli_error(&e));
+    write_hwp_cli_output(&output, &result.bytes).unwrap_or_else(|e| exit_cli_error(&e));
+    print_hwp_edit_cli_result(output, result);
+}
+
+fn move_hwp_cell_paragraphs_bytes_for_cli(
+    data: &[u8],
+    table_para_idx: usize,
+    control_idx: usize,
+    src: (u16, u16),
+    start: usize,
+    end: usize,
+    dst: (u16, u16),
+    dst_at: usize,
+) -> Result<HwpEditCliResult, String> {
+    edit_hwp_table_structure_bytes_for_cli(data, "move-cell-paragraphs", |core| {
+        let src_idx = core
+            .get_table_cell_index_native(0, table_para_idx, control_idx, src.0, src.1)
+            .map_err(|e| format!("출발 셀 좌표 조회 실패: {}", e))?;
+        let dst_idx = core
+            .get_table_cell_index_native(0, table_para_idx, control_idx, dst.0, dst.1)
+            .map_err(|e| format!("도착 셀 좌표 조회 실패: {}", e))?;
+        core.move_cell_paragraphs_native(
+            0,
+            table_para_idx,
+            control_idx,
+            src_idx,
+            start,
+            end,
+            dst_idx,
+            dst_at,
+        )
+        .map_err(|e| format!("셀 문단 이동 실패: {}", e))
+    })
+}
+
+fn move_cell_paragraphs_cli(args: &[String]) {
+    const USAGE: &str = "사용법: rhwp move-cell-paragraphs <파일.hwp> --para N --ctrl N --from-row R --from-col C --start N --end N --to-row R --to-col C [--at N] -o <출력.hwp>";
+    if args.is_empty() {
+        exit_cli_error(USAGE);
+    }
+    let input = args[0].clone();
+    let mut para: Option<String> = None;
+    let mut ctrl: Option<String> = None;
+    let mut from_row: Option<String> = None;
+    let mut from_col: Option<String> = None;
+    let mut to_row: Option<String> = None;
+    let mut to_col: Option<String> = None;
+    let mut start: Option<String> = None;
+    let mut end: Option<String> = None;
+    let mut at: Option<String> = None;
+    let mut output_path: Option<String> = None;
+
+    let mut i = 1;
+    while i < args.len() {
+        let need = |i: usize, flag: &str| -> String {
+            if i >= args.len() {
+                exit_cli_error(&format!("{} 뒤에 값이 필요합니다.", flag));
+            }
+            args[i].clone()
+        };
+        match args[i].as_str() {
+            "--para" => {
+                i += 1;
+                para = Some(need(i, "--para"));
+            }
+            "--ctrl" => {
+                i += 1;
+                ctrl = Some(need(i, "--ctrl"));
+            }
+            "--from-row" => {
+                i += 1;
+                from_row = Some(need(i, "--from-row"));
+            }
+            "--from-col" => {
+                i += 1;
+                from_col = Some(need(i, "--from-col"));
+            }
+            "--to-row" => {
+                i += 1;
+                to_row = Some(need(i, "--to-row"));
+            }
+            "--to-col" => {
+                i += 1;
+                to_col = Some(need(i, "--to-col"));
+            }
+            "--start" => {
+                i += 1;
+                start = Some(need(i, "--start"));
+            }
+            "--end" => {
+                i += 1;
+                end = Some(need(i, "--end"));
+            }
+            "--at" => {
+                i += 1;
+                at = Some(need(i, "--at"));
+            }
+            "-o" | "--output" => {
+                i += 1;
+                output_path = Some(need(i, "-o/--output"));
+            }
+            _ => exit_cli_error(&format!("알 수 없는 옵션: {}", args[i])),
+        }
+        i += 1;
+    }
+
+    let para = parse_usize_cli(para, "--para");
+    let ctrl = parse_usize_cli(ctrl, "--ctrl");
+    let from_row = parse_u16_cli(from_row, "--from-row");
+    let from_col = parse_u16_cli(from_col, "--from-col");
+    let to_row = parse_u16_cli(to_row, "--to-row");
+    let to_col = parse_u16_cli(to_col, "--to-col");
+    let start = parse_usize_cli(start, "--start");
+    let end = parse_usize_cli(end, "--end");
+    let at = at
+        .map(|v| {
+            v.parse::<usize>()
+                .unwrap_or_else(|_| exit_cli_error("--at 은 0 이상의 정수여야 합니다."))
+        })
+        .unwrap_or(usize::MAX);
+    let output = output_path.unwrap_or_else(|| input.clone());
+    let data = fs::read(&input)
+        .unwrap_or_else(|e| exit_cli_error(&format!("파일 읽기 실패 - {}: {}", input, e)));
+
+    let result = move_hwp_cell_paragraphs_bytes_for_cli(
+        &data,
+        para,
+        ctrl,
+        (from_row, from_col),
+        start,
+        end,
+        (to_row, to_col),
+        at,
+    )
     .unwrap_or_else(|e| exit_cli_error(&e));
     write_hwp_cli_output(&output, &result.bytes).unwrap_or_else(|e| exit_cli_error(&e));
     print_hwp_edit_cli_result(output, result);

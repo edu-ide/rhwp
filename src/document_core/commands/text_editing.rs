@@ -965,6 +965,77 @@ impl DocumentCore {
         }
     }
 
+    /// `reflow_cell_paragraph` 의 경로 기반 버전 (중첩 표 전용).
+    ///
+    /// 표 안의 표는 `controls.get(control_idx)` 한 번으로 닿지 않으므로 셀 폭을
+    /// 읽는 쪽과 리플로우하는 쪽 모두 경로로 탐색해야 한다. 대상은 항상 표이며
+    /// (글상자/그림 캡션은 기존 함수가 처리한다), 리플로우 뒤에는 경로의 첫
+    /// 단계 — 중첩 표를 담고 있는 바깥 셀 — 로 지오메트리를 동기화해 답변 칸이
+    /// 늘어난 내용을 담을 높이를 갖게 한다.
+    pub(crate) fn reflow_cell_paragraph_by_path(
+        &mut self,
+        section_idx: usize,
+        parent_para_idx: usize,
+        path: &[(usize, usize, usize)],
+        cell_idx: usize,
+        cell_para_idx: usize,
+    ) {
+        use crate::renderer::hwpunit_to_px;
+
+        let (cell_width, pad_left, pad_right, para_shape_id) = {
+            let Ok(table) = self.resolve_table_by_path(section_idx, parent_para_idx, path) else {
+                return;
+            };
+            let Some(cell) = table.cells.get(cell_idx) else {
+                return;
+            };
+            let pad_l = if cell.apply_inner_margin {
+                cell.padding.left
+            } else {
+                table.padding.left
+            };
+            let pad_r = if cell.apply_inner_margin {
+                cell.padding.right
+            } else {
+                table.padding.right
+            };
+            let Some(cell_para) = cell.paragraphs.get(cell_para_idx) else {
+                return;
+            };
+            (cell.width, pad_l, pad_r, cell_para.para_shape_id)
+        };
+
+        let styles = resolve_styles(&self.document.doc_info, self.dpi);
+        let cell_width_px = hwpunit_to_px(cell_width as i32, self.dpi);
+        let pad_left_px = hwpunit_to_px(pad_left as i32, self.dpi);
+        let pad_right_px = hwpunit_to_px(pad_right as i32, self.dpi);
+        let available_width = (cell_width_px - pad_left_px - pad_right_px).max(0.0);
+        let para_style = styles.para_styles.get(para_shape_id as usize);
+        let margin_left = para_style.map(|s| s.margin_left).unwrap_or(0.0);
+        let margin_right = para_style.map(|s| s.margin_right).unwrap_or(0.0);
+        let final_width = (available_width - margin_left - margin_right).max(0.0);
+
+        let dpi = self.dpi;
+        {
+            let Ok(table) = self.resolve_table_by_path_mut(section_idx, parent_para_idx, path)
+            else {
+                return;
+            };
+            let Some(cell) = table.cells.get_mut(cell_idx) else {
+                return;
+            };
+            let Some(cell_para) = cell.paragraphs.get_mut(cell_para_idx) else {
+                return;
+            };
+            cell_para.line_segs.clear();
+            reflow_line_segs(cell_para, final_width, &styles, dpi);
+            table.dirty = true;
+        }
+
+        let (outer_ctrl, outer_cell, _) = path[0];
+        self.sync_owner_cell_geometry(section_idx, parent_para_idx, outer_ctrl, outer_cell);
+    }
+
     /// 셀 콘텐츠(문단 line_seg 합) 기준으로 소유 셀 → 표 → 앵커 line_seg
     /// 지오메트리를 grow-only로 동기화한다.
     ///
@@ -2348,6 +2419,133 @@ impl DocumentCore {
         Ok(super::super::helpers::json_ok_with(&format!(
             "\"cellParaIndex\":{},\"removedCharCount\":{},\"newParagraphCount\":{}",
             cell_para_idx, removed_char_count, new_count
+        )))
+    }
+
+    /// 같은 표 안에서 셀 문단 구간을 다른 셀로 통째로 옮긴다.
+    ///
+    /// 문단 구조체를 그대로 이동하므로 글자 서식·중첩 표·그림이 모두 보존된다.
+    /// 한 페이지를 넘는 답변 칸을 행 단위로 쪼개 어느 뷰어에서나 이어지게 만드는
+    /// 데 쓴다 — HWP 표의 '행 단위 나눔'은 모든 구현이 지원하지만, 셀 하나가
+    /// 페이지보다 큰 경우는 데스크톱 한글만 이어 그리기 때문이다.
+    ///
+    /// `end` 는 배타적. `dst_at` 이 대상 셀 문단 수보다 크면 끝에 붙인다.
+    #[allow(clippy::too_many_arguments)]
+    pub fn move_cell_paragraphs_native(
+        &mut self,
+        section_idx: usize,
+        parent_para_idx: usize,
+        control_idx: usize,
+        src_cell_idx: usize,
+        start: usize,
+        end: usize,
+        dst_cell_idx: usize,
+        dst_at: usize,
+    ) -> Result<String, HwpError> {
+        if src_cell_idx == dst_cell_idx {
+            return Err(HwpError::RenderError(
+                "출발 셀과 도착 셀이 같습니다".to_string(),
+            ));
+        }
+        if end <= start {
+            return Err(HwpError::RenderError(
+                "옮길 문단 구간이 비어 있습니다".to_string(),
+            ));
+        }
+        if section_idx >= self.document.sections.len() {
+            return Err(HwpError::RenderError(format!(
+                "구역 인덱스 {} 범위 초과",
+                section_idx
+            )));
+        }
+        if parent_para_idx >= self.document.sections[section_idx].paragraphs.len() {
+            return Err(HwpError::RenderError(format!(
+                "부모 문단 인덱스 {} 범위 초과",
+                parent_para_idx
+            )));
+        }
+
+        let moved_count;
+        let src_remaining;
+        let dst_count;
+        let dst_insert_at;
+        match self.document.sections[section_idx].paragraphs[parent_para_idx]
+            .controls
+            .get_mut(control_idx)
+        {
+            Some(Control::Table(table)) => {
+                let total_cells = table.cells.len();
+                if src_cell_idx >= total_cells || dst_cell_idx >= total_cells {
+                    return Err(HwpError::RenderError(format!(
+                        "셀 인덱스 범위 초과 (총 {}개)",
+                        total_cells
+                    )));
+                }
+                let moved: Vec<_> = {
+                    let src = &mut table.cells[src_cell_idx];
+                    if end > src.paragraphs.len() {
+                        return Err(HwpError::RenderError(format!(
+                            "셀 문단 구간 {}..{} 범위 초과 (총 {}개)",
+                            start,
+                            end,
+                            src.paragraphs.len()
+                        )));
+                    }
+                    // 셀은 문단이 최소 1개 있어야 한다.
+                    if src.paragraphs.len() - (end - start) == 0 {
+                        return Err(HwpError::RenderError(
+                            "출발 셀의 문단을 모두 옮길 수는 없습니다".to_string(),
+                        ));
+                    }
+                    src.paragraphs.drain(start..end).collect()
+                };
+                moved_count = moved.len();
+                src_remaining = table.cells[src_cell_idx].paragraphs.len();
+
+                let dst = &mut table.cells[dst_cell_idx];
+                // 도착 셀이 빈 문단 하나뿐이면 그 자리를 대신한다 — 안 그러면
+                // 옮긴 내용 앞에 빈 줄이 하나 남는다.
+                let dst_placeholder_only = dst.paragraphs.len() == 1
+                    && dst.paragraphs[0].text.is_empty()
+                    && dst.paragraphs[0].controls.is_empty();
+                if dst_placeholder_only {
+                    dst.paragraphs.clear();
+                    dst_insert_at = 0;
+                } else {
+                    dst_insert_at = dst_at.min(dst.paragraphs.len());
+                }
+                for (offset, para) in moved.into_iter().enumerate() {
+                    dst.paragraphs.insert(dst_insert_at + offset, para);
+                }
+                dst_count = dst.paragraphs.len();
+                table.dirty = true;
+            }
+            _ => {
+                return Err(HwpError::RenderError(
+                    "지정된 컨트롤이 표가 아닙니다".to_string(),
+                ));
+            }
+        }
+
+        for i in 0..src_remaining {
+            self.reflow_cell_paragraph(section_idx, parent_para_idx, control_idx, src_cell_idx, i);
+        }
+        for i in 0..dst_count {
+            self.reflow_cell_paragraph(section_idx, parent_para_idx, control_idx, dst_cell_idx, i);
+        }
+        self.document.sections[section_idx].raw_stream = None;
+        self.mark_section_dirty(section_idx);
+        self.paginate_if_needed();
+
+        self.event_log.push(DocumentEvent::CellTextChanged {
+            section: section_idx,
+            para: parent_para_idx,
+            ctrl: control_idx,
+            cell: dst_cell_idx,
+        });
+        Ok(super::super::helpers::json_ok_with(&format!(
+            "\"movedCount\":{},\"srcParagraphCount\":{},\"dstParagraphCount\":{},\"dstInsertAt\":{}",
+            moved_count, src_remaining, dst_count, dst_insert_at
         )))
     }
 
