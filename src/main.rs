@@ -90,6 +90,7 @@ fn main() {
         Some("get-table-properties") => get_table_properties_cli(&args[2..], false),
         Some("set-table-properties") => set_table_properties_cli(&args[2..], false),
         Some("resize-table-cells") => resize_table_cells_cli(&args[2..]),
+        Some("set-table-column-widths") => set_table_column_widths_cli(&args[2..]),
         Some("get-char-properties") => get_format_properties_cli(&args[2..], "char"),
         Some("set-char-format") => set_format_cli(&args[2..], "char"),
         Some("get-para-properties") => get_format_properties_cli(&args[2..], "para"),
@@ -480,6 +481,7 @@ fn print_help() {
     println!("      표 패딩/반복 머리/배치/테두리/채우기 속성을 직접 수정");
     println!();
     println!("  resize-table-cells <파일.hwp> --section N --para N [--cell-path <JSON>|--ctrl N] --json <변경배열JSON> -o <출력.hwp>");
+    println!("  set-table-column-widths <파일.hwp> --section N --para N --ctrl N --widths w1,w2,... -o <출력.hwp>");
     println!("      여러 표 셀의 폭/높이를 델타 값으로 조절");
     println!();
     println!("  get-char-properties <파일.hwp> --section N --para N --offset N");
@@ -4278,6 +4280,19 @@ fn resize_hwp_table_cells_bytes_for_cli(
     edit_hwp_table_structure_bytes_for_cli(data, "resize-table-cells", |core| {
         core.resize_table_cells_by_path_native(section_idx, table_para_idx, path, updates_json)
             .map_err(|e| format!("표 셀 크기 조절 실패: {}", e))
+    })
+}
+
+fn set_hwp_table_column_widths_bytes_for_cli(
+    data: &[u8],
+    section_idx: usize,
+    table_para_idx: usize,
+    control_idx: usize,
+    widths: Vec<u32>,
+) -> Result<HwpEditCliResult, String> {
+    edit_hwp_table_structure_bytes_for_cli(data, "set-table-column-widths", |core| {
+        core.set_table_column_widths_native(section_idx, table_para_idx, control_idx, widths.clone())
+            .map_err(|e| format!("표 열 폭 설정 실패: {}", e))
     })
 }
 
@@ -11799,6 +11814,95 @@ fn resize_table_cells_cli(args: &[String]) {
     let data = fs::read(&input)
         .unwrap_or_else(|e| exit_cli_error(&format!("파일 읽기 실패 - {}: {}", input, e)));
     let result = resize_hwp_table_cells_bytes_for_cli(&data, section, para, &path, &updates_json)
+        .unwrap_or_else(|e| exit_cli_error(&e));
+
+    write_hwp_cli_output(&output, &result.bytes).unwrap_or_else(|e| exit_cli_error(&e));
+    println!(
+        "{}",
+        serde_json::json!({
+            "ok": true,
+            "path": output,
+            "bytes": result.bytes.len(),
+            "details": result.details,
+            "pageCountBefore": result.page_count_before,
+            "pageCountAfter": result.page_count_after,
+        })
+    );
+}
+
+fn set_table_column_widths_cli(args: &[String]) {
+    if args.is_empty() {
+        exit_cli_error("사용법: rhwp set-table-column-widths <파일.hwp> --section N --para N --ctrl N --widths w1,w2,... -o <출력.hwp>");
+    }
+    let input = args[0].clone();
+    let mut section: Option<String> = None;
+    let mut para: Option<String> = None;
+    let mut ctrl: Option<String> = None;
+    let mut widths_arg: Option<String> = None;
+    let mut output_path: Option<String> = None;
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--section" => {
+                i += 1;
+                if i >= args.len() {
+                    exit_cli_error("--section 뒤에 값이 필요합니다.");
+                }
+                section = Some(args[i].clone());
+            }
+            "--para" => {
+                i += 1;
+                if i >= args.len() {
+                    exit_cli_error("--para 뒤에 값이 필요합니다.");
+                }
+                para = Some(args[i].clone());
+            }
+            "--ctrl" => {
+                i += 1;
+                if i >= args.len() {
+                    exit_cli_error("--ctrl 뒤에 값이 필요합니다.");
+                }
+                ctrl = Some(args[i].clone());
+            }
+            "--widths" => {
+                i += 1;
+                if i >= args.len() {
+                    exit_cli_error("--widths 뒤에 쉼표로 구분한 열 폭이 필요합니다.");
+                }
+                widths_arg = Some(args[i].clone());
+            }
+            "-o" | "--output" => {
+                i += 1;
+                if i >= args.len() {
+                    exit_cli_error("-o/--output 뒤에 경로가 필요합니다.");
+                }
+                output_path = Some(args[i].clone());
+            }
+            _ => exit_cli_error(&format!("알 수 없는 옵션: {}", args[i])),
+        }
+        i += 1;
+    }
+
+    let section = parse_usize_cli(section, "--section");
+    let para = parse_usize_cli(para, "--para");
+    let ctrl = parse_usize_cli(ctrl, "--ctrl");
+    let widths: Vec<u32> = widths_arg
+        .unwrap_or_else(|| exit_cli_error("--widths 가 필요합니다."))
+        .split(',')
+        .map(|t| {
+            t.trim()
+                .parse::<u32>()
+                .unwrap_or_else(|_| exit_cli_error("--widths 는 쉼표로 구분한 양의 정수여야 합니다."))
+        })
+        .collect();
+    if widths.is_empty() {
+        exit_cli_error("--widths 가 비어 있습니다.");
+    }
+    let output = output_path.unwrap_or_else(|| input.clone());
+    let data = fs::read(&input)
+        .unwrap_or_else(|e| exit_cli_error(&format!("파일 읽기 실패 - {}: {}", input, e)));
+    let result = set_hwp_table_column_widths_bytes_for_cli(&data, section, para, ctrl, widths)
         .unwrap_or_else(|e| exit_cli_error(&e));
 
     write_hwp_cli_output(&output, &result.bytes).unwrap_or_else(|e| exit_cli_error(&e));
