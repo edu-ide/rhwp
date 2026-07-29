@@ -182,14 +182,14 @@ pub(crate) struct CellUnit {
     /// 이 유닛 앞에 vpos 리셋(셀 내부 페이지 분할)이 있는가.
     hard_break_before: bool,
     /// 이 유닛이 속한 문단 인덱스 (셀 내).
-    para_idx: usize,
+    pub(crate) para_idx: usize,
     /// 이 유닛이 visible 일 때 기여하는 문단 내 줄 범위 `[vis_start, vis_end)`.
     /// 텍스트 줄 유닛 = `(li, li+1)`, 중첩/빈 atom = `(0, line_count.max(1))`.
     vis_start: usize,
     vis_end: usize,
     /// [Task #1073] 이 유닛이 중첩 표의 한 행을 표현하면 그 행 인덱스. 텍스트/일반 유닛은 None.
     /// 분할 행에서 컷 → `NestedTableSplit`(중첩행 범위) 매핑에 사용.
-    nested_row: Option<usize>,
+    pub(crate) nested_row: Option<usize>,
 }
 
 /// 중첩 표 부분 렌더링을 위한 행 범위 정보
@@ -4128,7 +4128,17 @@ impl LayoutEngine {
                         _ => None,
                     })
                     .collect();
-                if nested_tables.len() == 1 && nested_tables[0].row_count >= 2 {
+                // 표 자신이 "쪽 경계에서 나누지 않음"이면 행 단위로 쪼개면 안 된다.
+                // 쪼개면 컷 모델은 바닥에 머리행을 채우고, 렌더/페이지 엔진은
+                // 나눔 금지라 다음 쪽에 표 전체를 다시 그려서 — 바닥에 잘린 조각 +
+                // 다음 쪽에 온전한 표가 함께 나온다(실측). 아래 atom 폴백으로 보내
+                // 표 통째로 다음 쪽에 밀리게 한다.
+                let nested_splittable = nested_tables.len() == 1
+                    && !matches!(
+                        nested_tables[0].page_break,
+                        crate::model::table::TablePageBreak::None
+                    );
+                if nested_splittable && nested_tables[0].row_count >= 2 {
                     let nt = nested_tables[0];
                     let ncol = nt.col_count as usize;
                     let nrow = nt.row_count as usize;
@@ -4342,6 +4352,11 @@ impl LayoutEngine {
                 h += u.height;
                 j += 1;
             }
+            // '다음 문단과 함께'(keepWithNext) 존중 — 소제목만 페이지 끝에 홀로
+            // 남는 고아 제목을 막는다. 마지막으로 소비한 문단이 이 속성을 갖고
+            // 뒤 내용이 다음 조각으로 넘어가면 그 문단 유닛을 통째로 되감아
+            // 함께 넘긴다. start 아래로는 되감지 않는다(진행 보장).
+            Self::rewind_keep_with_next(cell, &units, styles, start, &mut j, &mut h);
             if j < units.len() {
                 fully_consumed = false;
             }
@@ -4355,6 +4370,45 @@ impl LayoutEngine {
             hit_hard_break,
             fully_consumed,
             consumed_height,
+        }
+    }
+
+    /// keepWithNext 문단이 조각 끝에 홀로 남지 않게 되감는다.
+    fn rewind_keep_with_next(
+        cell: &crate::model::table::Cell,
+        units: &[CellUnit],
+        styles: &ResolvedStyleSet,
+        start: usize,
+        j: &mut usize,
+        h: &mut f64,
+    ) {
+        // 남은 내용이 없으면(마지막 조각) 고아가 생기지 않는다.
+        if *j >= units.len() || *j <= start {
+            return;
+        }
+        let last_para = units[*j - 1].para_idx;
+        // 그 문단 자체가 잘리는 중이면 대상이 아니다 — 이미 뒤가 붙어 있다.
+        if units[*j].para_idx == last_para {
+            return;
+        }
+        let keep = cell
+            .paragraphs
+            .get(last_para)
+            .and_then(|p| styles.para_styles.get(p.para_shape_id as usize))
+            .map(|s| s.keep_with_next)
+            .unwrap_or(false);
+        if !keep {
+            return;
+        }
+        let mut k = *j;
+        while k > start && units[k - 1].para_idx == last_para {
+            k -= 1;
+        }
+        if k > start {
+            for u in &units[k..*j] {
+                *h -= u.height;
+            }
+            *j = k;
         }
     }
 
