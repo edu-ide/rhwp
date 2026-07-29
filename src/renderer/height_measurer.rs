@@ -1797,6 +1797,20 @@ impl MeasuredTable {
         }
     }
 
+    /// 블록 `[b_start, b_end)` 안에 `row_span == 1` 셀이 하나도 없는지.
+    ///
+    /// 큰 rowspan 묶음(> BLOCK_UNIT_MAX_ROWS)은 보통 행 단위로 쪼개 페이지 잔여
+    /// 공간을 쓴다. 그런데 한 셀이 그 행들을 전부 덮고 있으면 **자를 행 경계가
+    /// 없다.** 그 상태로 행 단위 분할에 넘기면 페이지 조각마다 그 셀을 처음부터
+    /// 다시 그려 내용이 쪽마다 반복된다. 이런 블록은 크기와 무관하게 블록 컷
+    /// 경로로 보내야 한다.
+    pub fn block_is_fully_spanned(&self, b_start: usize, b_end: usize) -> bool {
+        !self
+            .cells
+            .iter()
+            .any(|c| c.row_span == 1 && c.row >= b_start && c.row < b_end)
+    }
+
     /// [Task #474] 표 정책이 RowBreak 인지 확인. RowBreak 표는 행 경계 분할이
     /// 명시 정책이므로 rowspan 보호 블록 정책 비적용 대상.
     pub fn allows_row_break_split(&self) -> bool {

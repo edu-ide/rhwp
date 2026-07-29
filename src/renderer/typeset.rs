@@ -10431,7 +10431,8 @@ impl TypesetEngine {
         let first_block_size = first_block_end.saturating_sub(first_block_start);
         let first_block_is_single_row = first_block_size == 1;
         let first_block_has_protectable_rowspan = first_block_size >= 2
-            && first_block_size <= crate::renderer::height_measurer::BLOCK_UNIT_MAX_ROWS
+            && (first_block_size <= crate::renderer::height_measurer::BLOCK_UNIT_MAX_ROWS
+                || mt.block_is_fully_spanned(first_block_start, first_block_end))
             && (first_block_start..first_block_end)
                 .any(|r| rowspan_touched.get(r).copied().unwrap_or(false));
         let first_rowbreak_block_has_hard_break =
@@ -10675,8 +10676,12 @@ impl TypesetEngine {
                     // rowspan 보호 블록 — 블록 전체를 분할 없이 한 단위로.
                     let (b_start, b_end, _) = mt.row_block_for(r);
                     let block_size = b_end.saturating_sub(b_start);
+                    // 한 셀이 블록 전체를 덮으면 자를 행 경계가 없다 — 크기 상한을
+                    // 넘어도 블록 컷으로 보낸다. 안 그러면 조각마다 그 셀을 처음부터
+                    // 다시 그려 쪽마다 같은 내용이 반복된다.
                     let block_has_protectable_rowspan = block_size >= 2
-                        && block_size <= crate::renderer::height_measurer::BLOCK_UNIT_MAX_ROWS
+                        && (block_size <= crate::renderer::height_measurer::BLOCK_UNIT_MAX_ROWS
+                            || mt.block_is_fully_spanned(b_start, b_end))
                         && (b_start..b_end)
                             .any(|x| rowspan_touched.get(x).copied().unwrap_or(false));
                     let rowbreak_has_internal_hard_break = if mt.allows_row_break_split()
