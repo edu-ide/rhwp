@@ -4386,25 +4386,31 @@ impl LayoutEngine {
         if *j >= units.len() || *j <= start {
             return;
         }
-        let last_para = units[*j - 1].para_idx;
-        // 그 문단 자체가 잘리는 중이면 대상이 아니다 — 이미 뒤가 붙어 있다.
-        if units[*j].para_idx == last_para {
-            return;
-        }
-        let keep = cell
-            .paragraphs
-            .get(last_para)
-            .and_then(|p| styles.para_styles.get(p.para_shape_id as usize))
-            .map(|s| s.keep_with_next)
-            .unwrap_or(false);
-        if !keep {
-            return;
-        }
-        let mut k = *j;
-        while k > start && units[k - 1].para_idx == last_para {
-            k -= 1;
-        }
-        if k > start {
+        // 한 번만 되감으면 □ 소제목 뒤에 ◦ 라벨이 이어질 때 ◦ 만 넘어가고 □ 가
+        // 새로 끝에 남는다. 한컴은 연쇄를 따라가므로 더 되감을 게 없을 때까지 돈다.
+        loop {
+            let last_para = units[*j - 1].para_idx;
+            // 그 문단 자체가 잘리는 중이면 대상이 아니다 — 이미 뒤가 붙어 있다.
+            if units[*j].para_idx == last_para {
+                return;
+            }
+            let keep = cell
+                .paragraphs
+                .get(last_para)
+                .and_then(|p| styles.para_styles.get(p.para_shape_id as usize))
+                .map(|s| s.keep_with_next)
+                .unwrap_or(false);
+            if !keep {
+                return;
+            }
+            let mut k = *j;
+            while k > start && units[k - 1].para_idx == last_para {
+                k -= 1;
+            }
+            // 되감으면 조각이 비어 버리는 경우에는 멈춘다 — 무한 루프 방지도 겸한다.
+            if k <= start {
+                return;
+            }
             for u in &units[k..*j] {
                 *h -= u.height;
             }
