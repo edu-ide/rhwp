@@ -2757,7 +2757,15 @@ impl DocumentCore {
             para.ctrl_data_records.pop();
             para.char_count -= 8;
             match ctrl {
-                Control::Table(t) => t,
+                Control::Table(t) => {
+                    let mut t = t;
+                    // 셀 안 표는 쪽 경계에서 나누지 않는다 — 한컴(웹)이 중첩 표의
+                    // 행 단위 이월을 못 해 페이지 바닥에서 반쯤 잘리기 때문에,
+                    // 그림처럼 통째로 다음 쪽으로 밀리게 강제한다.
+                    t.raw_table_record_attr &= !0x3;
+                    t.page_break = crate::model::table::TablePageBreak::None;
+                    t
+                }
                 _ => unreachable!("위에서 표임을 확인했다"),
             }
         };
@@ -2897,6 +2905,7 @@ impl DocumentCore {
         let mut used: std::collections::HashSet<u32> = std::collections::HashSet::new();
         let mut fixed_flags = 0usize;
         let mut fixed_iids = 0usize;
+        let mut fixed_breaks = 0usize;
 
         for sec in self.document.sections.iter_mut() {
             for para in sec.paragraphs.iter_mut() {
@@ -2941,6 +2950,15 @@ impl DocumentCore {
                                     fixed_iids += 1;
                                 }
                                 used.insert(iid);
+                                // 쪽 경계에서 나누지 않음 — 한컴(웹)이 중첩 표의
+                                // 행 단위 이월을 못 해 페이지 바닥에서 반쯤 잘리고
+                                // 뒤 내용까지 파묻는다. 그림처럼 통째로 다음 쪽에
+                                // 밀리는 게 답변 칸 데이터 표의 안전한 동작이다.
+                                if nested.raw_table_record_attr & 0x3 != 0 {
+                                    nested.raw_table_record_attr &= !0x3;
+                                    fixed_breaks += 1;
+                                }
+                                nested.page_break = crate::model::table::TablePageBreak::None;
                                 nested.dirty = true;
                             }
                         }
@@ -2956,8 +2974,8 @@ impl DocumentCore {
         self.paginate_if_needed();
         self.invalidate_page_tree_cache();
         Ok(super::super::helpers::json_ok_with(&format!(
-            "\"fixedFlags\":{},\"fixedInstanceIds\":{}",
-            fixed_flags, fixed_iids
+            "\"fixedFlags\":{},\"fixedInstanceIds\":{},\"fixedPageBreaks\":{}",
+            fixed_flags, fixed_iids, fixed_breaks
         )))
     }
 

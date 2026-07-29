@@ -1155,13 +1155,12 @@ impl Table {
 
         primary.col_span = end_col - start_col + 1;
         primary.row_span = end_row - start_row + 1;
-        // raw_list_extra[0..4]에 참조 폭이 저장되어 있으면 갱신
+        // raw_list_extra[0..4] 는 셀의 참조 폭이다. 렌더러가 줄바꿈 폭으로 쓰므로
+        // 병합 뒤에는 무조건 새 폭으로 맞춘다. 예전에는 "병합 전 폭과 같을 때만"
+        // 갱신했는데, 셀 폭을 한 번이라도 조정한 표에서는 조건이 안 맞아 참조 폭이
+        // 옛 값으로 남았고, 글자는 그 넓은 폭으로 흐르다 표 밖에서 잘렸다.
         if primary.raw_list_extra.len() >= 4 {
-            let old_ref_width =
-                u32::from_le_bytes(primary.raw_list_extra[0..4].try_into().unwrap());
-            if old_ref_width == primary.width {
-                primary.raw_list_extra[0..4].copy_from_slice(&new_width.to_le_bytes());
-            }
+            primary.raw_list_extra[0..4].copy_from_slice(&new_width.to_le_bytes());
         }
         primary.width = new_width;
         primary.height = new_height;

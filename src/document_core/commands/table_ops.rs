@@ -668,6 +668,33 @@ impl DocumentCore {
         table.dirty = true;
         let cell_count = table.cells.len();
 
+        // 셀 폭이 바뀌었으므로 그 셀의 문단을 재배치한다.
+        // 이걸 빼면 폭은 늘어나는데 line_segs 는 옛 폭 그대로라
+        // 글자가 좁은 폭으로 줄바꿈한 뒤 넓어진 셀 밖으로 흘러 잘린다.
+        let reflow: Vec<(usize, usize)> = {
+            let para = &self.document.sections[section_idx].paragraphs[parent_para_idx];
+            if let Some(Control::Table(t)) = para.controls.get(control_idx) {
+                t.cells
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| (i, c.paragraphs.len()))
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        };
+        for (cell_idx, para_count) in reflow {
+            for cell_para_idx in 0..para_count {
+                self.reflow_cell_paragraph(
+                    section_idx,
+                    parent_para_idx,
+                    control_idx,
+                    cell_idx,
+                    cell_para_idx,
+                );
+            }
+        }
+
         self.document.sections[section_idx].raw_stream = None;
         self.recompose_section(section_idx);
         self.paginate_if_needed();
@@ -697,6 +724,33 @@ impl DocumentCore {
             .map_err(|e| HwpError::RenderError(e))?;
         table.dirty = true;
         let cell_count = table.cells.len();
+
+        // 셀 폭이 바뀌었으므로 그 셀의 문단을 재배치한다.
+        // 이걸 빼면 폭은 늘어나는데 line_segs 는 옛 폭 그대로라
+        // 글자가 좁은 폭으로 줄바꿈한 뒤 넓어진 셀 밖으로 흘러 잘린다.
+        let reflow: Vec<(usize, usize)> = {
+            let para = &self.document.sections[section_idx].paragraphs[parent_para_idx];
+            if let Some(Control::Table(t)) = para.controls.get(control_idx) {
+                t.cells
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| (i, c.paragraphs.len()))
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        };
+        for (cell_idx, para_count) in reflow {
+            for cell_para_idx in 0..para_count {
+                self.reflow_cell_paragraph(
+                    section_idx,
+                    parent_para_idx,
+                    control_idx,
+                    cell_idx,
+                    cell_para_idx,
+                );
+            }
+        }
 
         self.document.sections[section_idx].raw_stream = None;
         self.recompose_section(section_idx);

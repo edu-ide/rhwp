@@ -628,16 +628,29 @@ impl LayoutEngine {
             // [Task #1073] 이 셀이 per-중첩행 분해 대상(단일 문단 + 가시 텍스트 없음 + 단일
             // 중첩 표 2행+)이면 cut 유닛 인덱스가 곧 중첩행 범위 → 렌더 NestedTableSplit 에
             // start_row 로 전달(연속 페이지가 중첩행 0부터 재렌더되는 결함 정정).
-            let nested_cut_range: Option<(usize, usize)> = cut_units.filter(|_| {
-                cell.paragraphs.len() == 1
-                    && cell.paragraphs[0].text.trim().is_empty()
-                    && cell.paragraphs[0]
-                        .controls
-                        .iter()
-                        .filter(|c| matches!(c, crate::model::control::Control::Table(_)))
-                        .count()
-                        == 1
-            });
+            // 컷 범위 안에 든 유닛에서 **문단별** 중첩행 범위를 뽑는다. 예전 조건은
+            // `cell.paragraphs.len() == 1` 이라 문단이 여럿인 셀(관공서 양식 답변
+            // 칸이 그렇다)에서 컷이 통째로 무시됐고, 그러면 아래 폴백이 available_h
+            // 만 보고 매번 0행부터 계산해 같은 표가 두 쪽에 그대로 두 번 그려졌다.
+            let nested_cut_by_para: std::collections::HashMap<usize, (usize, usize)> =
+                match cut_units {
+                    Some((su, eu)) => {
+                        let units = self.cell_units(cell, table, styles);
+                        let mut m: std::collections::HashMap<usize, (usize, usize)> =
+                            std::collections::HashMap::new();
+                        for (i, u) in units.iter().enumerate() {
+                            if i < su || i >= eu {
+                                continue;
+                            }
+                            let Some(nr) = u.nested_row else { continue };
+                            let e = m.entry(u.para_idx).or_insert((nr, nr + 1));
+                            e.0 = e.0.min(nr);
+                            e.1 = e.1.max(nr + 1);
+                        }
+                        m
+                    }
+                    None => std::collections::HashMap::new(),
+                };
 
             // 셀 내 텍스트 높이 (분할 행이면 줄 범위 내만 계산)
             // spacing_before: 셀 첫 문단 제외, spacing_after: 셀 마지막 문단 제외
@@ -1276,7 +1289,9 @@ impl LayoutEngine {
                                     };
 
                                     // 중첩 표가 가용 공간을 초과하면 NestedTableSplit 적용
-                                    let split_info = if let Some((su, eu)) = nested_cut_range {
+                                    let split_info = if let Some((su, eu)) =
+                                        nested_cut_by_para.get(&cp_idx).copied()
+                                    {
                                         // [Task #1073] 페이지네이션 컷(중첩행 범위)으로 직접
                                         // NestedTableSplit 구성 — 연속 페이지가 start_row 부터
                                         // 렌더(available_h 휴리스틱의 row0 재렌더 결함 정정).

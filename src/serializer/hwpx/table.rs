@@ -133,6 +133,9 @@ fn write_sz<W: Write>(w: &mut Writer<W>, c: &CommonObjAttr) -> Result<(), Serial
 
 fn write_pos<W: Write>(w: &mut Writer<W>, c: &CommonObjAttr) -> Result<(), SerializeError> {
     let treat = bool01(c.treat_as_char);
+    let flow_with_text = bool01(c.flow_with_text);
+    let allow_overlap = bool01(c.allow_overlap);
+    let hold_anchor_and_so = bool01(c.prevent_page_break != 0);
     let vert_offset = c.vertical_offset.to_string();
     let horz_offset = c.horizontal_offset.to_string();
     empty_tag(
@@ -141,9 +144,9 @@ fn write_pos<W: Write>(w: &mut Writer<W>, c: &CommonObjAttr) -> Result<(), Seria
         &[
             ("treatAsChar", treat),
             ("affectLSpacing", "0"),
-            ("flowWithText", "1"),
-            ("allowOverlap", "0"),
-            ("holdAnchorAndSO", "0"),
+            ("flowWithText", flow_with_text),
+            ("allowOverlap", allow_overlap),
+            ("holdAnchorAndSO", hold_anchor_and_so),
             ("vertRelTo", vert_rel_to_str(c.vert_rel_to)),
             ("horzRelTo", horz_rel_to_str(c.horz_rel_to)),
             ("vertAlign", vert_align_str(c.vert_align)),
@@ -539,6 +542,20 @@ mod tests {
         let mut w: Writer<Vec<u8>> = Writer::new(Vec::new());
         write_table(&mut w, table, &mut ctx).expect("write_table");
         String::from_utf8(w.into_inner()).unwrap()
+    }
+
+    #[test]
+    fn table_pos_preserves_flow_overlap_and_anchor_hold() {
+        let mut t = empty_table(1, 1);
+        t.common.flow_with_text = false;
+        t.common.allow_overlap = true;
+        t.common.prevent_page_break = 1;
+
+        let xml = serialize(&t);
+
+        assert!(xml.contains(r#"flowWithText="0""#), "{xml}");
+        assert!(xml.contains(r#"allowOverlap="1""#), "{xml}");
+        assert!(xml.contains(r#"holdAnchorAndSO="1""#), "{xml}");
     }
 
     fn cs(start_pos: u32, char_shape_id: u32) -> crate::model::paragraph::CharShapeRef {
