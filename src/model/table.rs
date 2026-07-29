@@ -1113,22 +1113,12 @@ impl Table {
                 && cell.row <= end_row;
             if in_range {
                 for para in &cell.paragraphs {
-                    if !para.text.is_empty() {
-                        extra_paragraphs.push(Paragraph {
-                            text: para.text.clone(),
-                            char_count: para.char_count,
-                            char_count_msb: para.char_count_msb,
-                            control_mask: para.control_mask,
-                            char_offsets: para.char_offsets.clone(),
-                            char_shapes: para.char_shapes.clone(),
-                            line_segs: para.line_segs.clone(),
-                            range_tags: para.range_tags.clone(),
-                            para_shape_id: para.para_shape_id,
-                            style_id: para.style_id,
-                            raw_header_extra: para.raw_header_extra.clone(),
-                            has_para_text: para.has_para_text,
-                            ..Default::default()
-                        });
+                    // 예전에는 필드를 하나씩 골라 옮기고 나머지를 Default 로 채웠다.
+                    // 그 바람에 controls / ctrl_data_records / field_ranges 가 버려져,
+                    // 셀 안에 표나 그림이 있으면 병합하는 순간 통째로 사라졌다.
+                    // 문단은 통째로 복제한다 — 옮기는 것이지 새로 만드는 게 아니다.
+                    if !para.text.is_empty() || !para.controls.is_empty() {
+                        extra_paragraphs.push(para.clone());
                     }
                 }
             }
