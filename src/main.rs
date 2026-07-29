@@ -744,6 +744,26 @@ struct HwpTableCliResult {
     page_count_after: u32,
 }
 
+/// 재로드 검증이 어긋났을 때 실제로 편집을 막을지 판단한다.
+///
+/// 이 검증은 직렬화 정합성을 보는 장치지만, 중첩 표를 최상위로 꺼내 고치고
+/// 도로 넣는 왕복처럼 **중간 상태에서 쪽수가 늘어나는 것이 정상인** 작업까지
+/// 함께 막는다. `RHWP_ALLOW_PAGE_DELTA` 가 설정돼 있으면 검증은 그대로 돌리되
+/// 실패를 경고로 낮춘다.
+fn page_verify_should_block(before: u32, after: u32) -> bool {
+    let allowed = std::env::var("RHWP_ALLOW_PAGE_DELTA")
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false);
+    if allowed {
+        eprintln!(
+            "경고: 재로드 후 쪽수가 {}→{} 로 달라졌으나 RHWP_ALLOW_PAGE_DELTA 로 통과시킴",
+            before, after
+        );
+        return false;
+    }
+    true
+}
+
 fn parse_json_value(s: &str) -> serde_json::Value {
     serde_json::from_str(s).unwrap_or_else(|_| serde_json::json!({"raw": s}))
 }
@@ -754,7 +774,9 @@ fn serialize_hwp_verified_for_cli(
     let verification = core
         .serialize_hwp_with_verify()
         .map_err(|e| format!("HWP 직렬화/재로드 검증 실패: {}", e))?;
-    if !verification.recovered {
+    if !verification.recovered
+        && page_verify_should_block(verification.page_count_before, verification.page_count_after)
+    {
         return Err(format!(
             "HWP 재로드 검증 실패: page_count_before={}, page_count_after={}",
             verification.page_count_before, verification.page_count_after
