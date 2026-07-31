@@ -1,5 +1,6 @@
 import type { WasmBridge } from '@/core/wasm-bridge';
 import type { DocumentPosition, CharProperties, ParaProperties, CellPathLike } from '@/core/types';
+import type { RhwpRealtimeOperationDraft } from './realtime-operation';
 
 /** 편집 명령 공통 인터페이스 */
 export interface EditCommand {
@@ -57,6 +58,8 @@ export interface OperationMetadata {
   dirtyScope?: DirtyScope;
   /** selection/caret 복원 정책. 현재는 문서화용 metadata로만 사용한다. */
   selection?: SelectionPolicy;
+  /** snapshot 작업을 공동편집으로 중계하기 위한 구조화 operation. */
+  realtimeOperation?: RhwpRealtimeOperationDraft;
 }
 
 /**
