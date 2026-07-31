@@ -86,6 +86,13 @@ export class WasmBridge {
     console.log(`[WasmBridge] WASM 초기화 완료 (rhwp ${version()})`);
   }
 
+  private getOptionalDocMethod(name: string): ((...args: unknown[]) => unknown) | null {
+    if (!this.doc) return null;
+    const method = (this.doc as unknown as Record<string, unknown>)[name];
+    if (typeof method !== 'function') return null;
+    return method.bind(this.doc) as (...args: unknown[]) => unknown;
+  }
+
   /** WASM 렌더러가 호출하는 텍스트 폭 측정 함수를 등록한다 */
   private installMeasureTextWidth(): void {
     if ((globalThis as Record<string, unknown>).measureTextWidth) return;
@@ -1649,24 +1656,28 @@ export class WasmBridge {
 
   setShowParagraphMarks(enabled: boolean): void {
     if (!this.doc) throw new Error('문서가 로드되지 않았습니다');
-    this.doc.setShowParagraphMarks(enabled);
+    const set = this.getOptionalDocMethod('setShowParagraphMarks');
+    set?.(enabled);
   }
 
   /** 문단부호 표시 여부 반환 */
   getShowParagraphMarks(): boolean {
     if (!this.doc) return false;
-    return (this.doc as any).getShowParagraphMarks();
+    const get = this.getOptionalDocMethod('getShowParagraphMarks');
+    return get ? Boolean(get()) : false;
   }
 
   /** 조판부호 표시 여부 반환 */
   getShowControlCodes(): boolean {
     if (!this.doc) return false;
-    return (this.doc as any).getShowControlCodes();
+    const get = this.getOptionalDocMethod('getShowControlCodes');
+    return get ? Boolean(get()) : false;
   }
 
   setShowControlCodes(enabled: boolean): void {
     if (!this.doc) throw new Error('문서가 로드되지 않았습니다');
-    this.doc.setShowControlCodes(enabled);
+    const set = this.getOptionalDocMethod('setShowControlCodes');
+    set?.(enabled);
   }
 
   getShowTransparentBorders(): boolean {
