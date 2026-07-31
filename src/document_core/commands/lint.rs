@@ -184,6 +184,8 @@ impl DocumentCore {
             }
         }
 
+        self.lint_layout(&mut findings);
+
         let errors = findings.iter().filter(|f| f.level == "error").count();
         let warns = findings.iter().filter(|f| f.level == "warn").count();
         let body: Vec<String> = findings.iter().map(|f| f.json()).collect();
@@ -193,6 +195,107 @@ impl DocumentCore {
             warns,
             body.join(",")
         ))
+    }
+
+    /// 레이아웃을 실제로 돌려야만 보이는 결함을 검사한다.
+    ///
+    /// 모델만 봐서는 절대 안 보인다 — 2026-07-31 실측: 답변 칸 글자를 몇 자
+    /// 줄였더니 그 행이 쪽 바닥에 7px 못 미치는 데서 끝났고, 옆 테두리가
+    /// 허공에서 끊긴 채 다음 쪽에서 상자가 다시 열렸다. 저장·추출·쪽수·
+    /// 클리핑 검사와 기존 lint 를 전부 통과했고 `errors 0` 이 떴다.
+    fn lint_layout(&self, findings: &mut Vec<Finding>) {
+        use crate::renderer::render_tree::{RenderNode, RenderNodeType};
+
+        /// 쪽 바닥에 닿았다고 볼 여유(px). 사업계획서 정상 쪽의 실측 오차가
+        /// 0.5px 라 그보다 크고, 눈에 띄는 최소 어긋남(7px)보다 작게 잡는다.
+        const SLACK_PX: f64 = 2.0;
+
+        type Key = (usize, usize, usize);
+
+        fn collect(
+            node: &RenderNode,
+            body_bottom: &mut Option<f64>,
+            tables: &mut std::collections::HashMap<Key, f64>,
+            inside_table: bool,
+        ) {
+            match node.node_type {
+                RenderNodeType::Body { ref clip_rect } => {
+                    if let Some(r) = clip_rect {
+                        *body_bottom = Some(r.y + r.height);
+                    }
+                }
+                RenderNodeType::Table(ref t) if !inside_table => {
+                    // 최상위 표만 본다. 답변 칸 안의 중첩 표는 쪽 중간에서
+                    // 끝나는 게 정상이라 대상이 아니다.
+                    if let (Some(s), Some(p), Some(c)) =
+                        (t.section_index, t.para_index, t.control_index)
+                    {
+                        let bottom = node.bbox.y + node.bbox.height;
+                        tables
+                            .entry((s, p, c))
+                            .and_modify(|b| {
+                                if bottom > *b {
+                                    *b = bottom
+                                }
+                            })
+                            .or_insert(bottom);
+                    }
+                    for ch in &node.children {
+                        collect(ch, body_bottom, tables, true);
+                    }
+                    return;
+                }
+                _ => {}
+            }
+            for ch in &node.children {
+                collect(ch, body_bottom, tables, inside_table);
+            }
+        }
+
+        let pages = self.page_count() as usize;
+        if pages < 2 {
+            return;
+        }
+        let mut per_page: Vec<(Option<f64>, std::collections::HashMap<Key, f64>)> =
+            Vec::with_capacity(pages);
+        for p in 0..pages {
+            let tree = match self.build_page_tree_cached(p as u32) {
+                Ok(t) => t,
+                Err(_) => return, // 레이아웃을 못 돌리면 이 검사만 건너뛴다
+            };
+            let mut bottom = None;
+            let mut tables = std::collections::HashMap::new();
+            collect(&tree.root, &mut bottom, &mut tables, false);
+            per_page.push((bottom, tables));
+        }
+
+        for p in 0..pages - 1 {
+            let (body_bottom, ref cur) = per_page[p];
+            let Some(body_bottom) = body_bottom else {
+                continue;
+            };
+            for (key, &frag_bottom) in cur {
+                // 다음 쪽으로 이어지는 표만 대상이다. 그 쪽에서 끝나는 표는
+                // 내용이 끝난 자리에서 닫히는 게 정상이다.
+                if !per_page[p + 1].1.contains_key(key) {
+                    continue;
+                }
+                let gap = body_bottom - frag_bottom;
+                if gap > SLACK_PX {
+                    findings.push(Finding {
+                        level: "error",
+                        code: "table-fragment-unclosed",
+                        location: format!("sec{} para{} ctrl{} p{}", key.0, key.1, key.2, p + 1),
+                        message: format!(
+                            "다음 쪽으로 이어지는 표 조각이 쪽 바닥보다 {:.1}px 위에서 끝난다 \
+                             — 옆 테두리가 허공에서 끊겨 상자가 안 닫힌 채로 보인다. \
+                             그 행 높이를 쪽 경계에 맞춰 채워라(첫 행 예산 = 쪽내지-머리행, 이후 행 = 쪽내지)",
+                            gap
+                        ),
+                    });
+                }
+            }
+        }
     }
 
     fn lint_table_common(
