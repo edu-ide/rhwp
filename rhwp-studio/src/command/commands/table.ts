@@ -72,6 +72,25 @@ function blockCalcCommand(id: string, label: string, func: string, shortcut: str
         const cellInfo = services.wasm.getCellInfo(pos.sectionIndex, pos.parentParaIndex, pos.controlIndex, pos.cellIndex);
         const row = cellInfo.row;
         const col = cellInfo.col;
+        const cellParaIndex = pos.cellParaIndex ?? 0;
+        const oldLen = services.wasm.getCellParagraphLength(
+          pos.sectionIndex,
+          pos.parentParaIndex,
+          pos.controlIndex,
+          pos.cellIndex,
+          cellParaIndex,
+        );
+        const oldText = oldLen > 0
+          ? services.wasm.getTextInCell(
+            pos.sectionIndex,
+            pos.parentParaIndex,
+            pos.controlIndex,
+            pos.cellIndex,
+            cellParaIndex,
+            0,
+            oldLen,
+          )
+          : '';
         const formula = `=${func}(above)`;
         const result = services.wasm.evaluateTableFormula(
           pos.sectionIndex, pos.parentParaIndex, pos.controlIndex,
@@ -79,7 +98,17 @@ function blockCalcCommand(id: string, label: string, func: string, shortcut: str
         );
         const parsed = JSON.parse(result);
         if (parsed.ok) {
-          services.eventBus.emit('document-changed');
+          emitFormulaResultRealtimeOperations(
+            ih,
+            services,
+            pos.sectionIndex,
+            pos.parentParaIndex,
+            pos.controlIndex,
+            pos.cellIndex,
+            cellParaIndex,
+            oldText,
+            parsed.result,
+          );
         }
       } catch (err) {
         console.warn(`[${id}] 블록 계산 실패:`, err);
@@ -99,6 +128,7 @@ function openFormulaDialog(services: Parameters<CommandDef['execute']>[0]): void
     ci: pos.controlIndex,
     cellIndex: pos.cellIndex,
   });
+  dialog.onRealtimeOperation = (draft) => ih.emitRealtimeOperationDraftPublic(draft);
   dialog.show();
 }
 
@@ -119,6 +149,251 @@ function currentTableCellContext(services: CommandServices): TableCellCommandCon
 function restoreEditorFocus(ih: TableCellCommandContext['ih']): void {
   const textarea = (ih as unknown as { textarea?: HTMLTextAreaElement }).textarea;
   textarea?.focus();
+}
+
+function tableAnchorPosition(pos: TableCellCommandContext['pos']): { sectionIndex: number; paragraphIndex: number; charOffset: number } {
+  return {
+    sectionIndex: pos.sectionIndex,
+    paragraphIndex: pos.parentParaIndex!,
+    charOffset: 0,
+  };
+}
+
+function tableInsertRealtimeOperation(
+  pos: TableCellCommandContext['pos'],
+  cellInfo: TableCellCommandContext['cellInfo'],
+  mode: TableInsertRowColumnMode,
+  count = 1,
+) {
+  const common = {
+    position: tableAnchorPosition(pos),
+    sec: pos.sectionIndex,
+    ppi: pos.parentParaIndex!,
+    ci: pos.controlIndex!,
+    tableCount: count,
+  };
+  switch (mode) {
+    case 'row-above':
+      return { ...common, kind: 'insertTableRow' as const, rowIndex: cellInfo.row, insertAfter: false };
+    case 'row-below':
+      return { ...common, kind: 'insertTableRow' as const, rowIndex: cellInfo.row, insertAfter: true };
+    case 'col-left':
+      return { ...common, kind: 'insertTableColumn' as const, colIndex: cellInfo.col, insertAfter: false };
+    case 'col-right':
+      return { ...common, kind: 'insertTableColumn' as const, colIndex: cellInfo.col, insertAfter: true };
+  }
+}
+
+function tableDeleteRealtimeOperation(
+  pos: TableCellCommandContext['pos'],
+  cellInfo: TableCellCommandContext['cellInfo'],
+  mode: TableDeleteRowColumnMode,
+) {
+  const common = {
+    position: tableAnchorPosition(pos),
+    sec: pos.sectionIndex,
+    ppi: pos.parentParaIndex!,
+    ci: pos.controlIndex!,
+    tableCount: 1,
+  };
+  return mode === 'row'
+    ? { ...common, kind: 'deleteTableRow' as const, rowIndex: cellInfo.row }
+    : { ...common, kind: 'deleteTableColumn' as const, colIndex: cellInfo.col };
+}
+
+function tableContextAnchorPosition(tableCtx: { sec: number; ppi: number }): { sectionIndex: number; paragraphIndex: number; charOffset: number } {
+  return {
+    sectionIndex: tableCtx.sec,
+    paragraphIndex: tableCtx.ppi,
+    charOffset: 0,
+  };
+}
+
+function tableRangeRealtimeOperation(
+  tableCtx: { sec: number; ppi: number; ci: number },
+  range: CellRange,
+) {
+  return {
+    position: tableContextAnchorPosition(tableCtx),
+    sec: tableCtx.sec,
+    ppi: tableCtx.ppi,
+    ci: tableCtx.ci,
+    startRow: range.startRow,
+    startCol: range.startCol,
+    endRow: range.endRow,
+    endCol: range.endCol,
+  };
+}
+
+function mergeTableCellsRealtimeOperation(
+  tableCtx: { sec: number; ppi: number; ci: number },
+  range: CellRange,
+) {
+  return {
+    ...tableRangeRealtimeOperation(tableCtx, range),
+    kind: 'mergeTableCells' as const,
+  };
+}
+
+function splitTableCellRealtimeOperation(
+  pos: TableCellCommandContext['pos'],
+  cellInfo: TableCellCommandContext['cellInfo'],
+  splitRows: number,
+  splitCols: number,
+  equalRowHeight: boolean,
+  mergeFirst: boolean,
+) {
+  return {
+    position: tableAnchorPosition(pos),
+    kind: 'splitTableCell' as const,
+    sec: pos.sectionIndex,
+    ppi: pos.parentParaIndex!,
+    ci: pos.controlIndex!,
+    rowIndex: cellInfo.row,
+    colIndex: cellInfo.col,
+    splitRows,
+    splitCols,
+    equalRowHeight,
+    mergeFirst,
+  };
+}
+
+function splitTableCellsInRangeRealtimeOperation(
+  tableCtx: { sec: number; ppi: number; ci: number },
+  range: CellRange,
+  splitRows: number,
+  splitCols: number,
+  equalRowHeight: boolean,
+) {
+  return {
+    ...tableRangeRealtimeOperation(tableCtx, range),
+    kind: 'splitTableCellsInRange' as const,
+    splitRows,
+    splitCols,
+    equalRowHeight,
+  };
+}
+
+function createTableRealtimeOperation(
+  pos: { sectionIndex: number; paragraphIndex: number; charOffset: number },
+  rows: number,
+  cols: number,
+  options?: TableCreateOptions,
+) {
+  return {
+    position: { ...pos },
+    kind: 'createTable' as const,
+    rowCount: rows,
+    colCount: cols,
+    tableOptions: options ? { ...options } : undefined,
+  };
+}
+
+function deleteTableRealtimeOperation(ref: { sec: number; ppi: number; ci: number }) {
+  return {
+    position: tableContextAnchorPosition(ref),
+    kind: 'deleteTable' as const,
+    sec: ref.sec,
+    ppi: ref.ppi,
+    ci: ref.ci,
+  };
+}
+
+function setTablePropertiesRealtimeOperation(
+  ref: { sec: number; ppi: number; ci: number },
+  tableProps: Record<string, unknown>,
+) {
+  return {
+    position: tableContextAnchorPosition(ref),
+    kind: 'setTableProperties' as const,
+    sec: ref.sec,
+    ppi: ref.ppi,
+    ci: ref.ci,
+    tableProps: JSON.parse(JSON.stringify(tableProps)) as Record<string, unknown>,
+  };
+}
+
+function resizeTableCellsRealtimeOperation(
+  ref: { sec: number; ppi: number; ci: number },
+  cellUpdates: Parameters<CommandServices['wasm']['resizeTableCells']>[3],
+) {
+  return {
+    position: tableContextAnchorPosition(ref),
+    kind: 'resizeTableCells' as const,
+    sec: ref.sec,
+    ppi: ref.ppi,
+    ci: ref.ci,
+    cellUpdates: cellUpdates.map((update) => ({ ...update })),
+  };
+}
+
+function emitCellTextReplacementRealtimeOperations(
+  ih: NonNullable<ReturnType<CommandServices['getInputHandler']>>,
+  sec: number,
+  ppi: number,
+  ci: number,
+  cellIndex: number,
+  cellParaIndex: number,
+  oldText: string,
+  newText: string,
+): void {
+  const position = {
+    sectionIndex: sec,
+    paragraphIndex: cellParaIndex,
+    parentParaIndex: ppi,
+    controlIndex: ci,
+    cellIndex,
+    cellParaIndex,
+    charOffset: 0,
+  };
+  if (oldText.length > 0) {
+    ih.emitRealtimeOperationDraftPublic({
+      kind: 'deleteText',
+      position,
+      count: oldText.length,
+      direction: 'forward',
+      deletedText: oldText,
+    });
+  }
+  if (newText.length > 0) {
+    ih.emitRealtimeOperationDraftPublic({
+      kind: 'insertText',
+      position,
+      text: newText,
+    });
+  }
+}
+
+function formulaResultText(value: unknown): string {
+  const n = typeof value === 'number' ? value : Number(value);
+  if (Number.isFinite(n) && n === Math.trunc(n) && Math.abs(n) < 1e15) {
+    return String(Math.trunc(n));
+  }
+  return String(value);
+}
+
+function emitFormulaResultRealtimeOperations(
+  ih: NonNullable<ReturnType<CommandServices['getInputHandler']>>,
+  services: Parameters<CommandDef['execute']>[0],
+  sec: number,
+  ppi: number,
+  ci: number,
+  cellIndex: number,
+  cellParaIndex: number,
+  oldText: string,
+  parsedResult: unknown,
+): void {
+  emitCellTextReplacementRealtimeOperations(
+    ih,
+    sec,
+    ppi,
+    ci,
+    cellIndex,
+    cellParaIndex,
+    oldText,
+    formulaResultText(parsedResult),
+  );
+  services.eventBus.emit('document-changed');
 }
 
 function applyTableInsertRowColumn(
@@ -150,6 +425,11 @@ function applyTableInsertRowColumn(
         }
       }
       return pos;
+    },
+    meta: {
+      domain: 'table',
+      dirtyScope: 'table',
+      realtimeOperation: tableInsertRealtimeOperation(pos, cellInfo, mode, count),
     },
   }), '줄/칸 추가');
   restoreEditorFocus(ih);
@@ -211,6 +491,11 @@ function applyTableDeleteRowColumn(
       }
       return { ...pos, charOffset: 0, ...corrected };
     },
+    meta: {
+      domain: 'table',
+      dirtyScope: 'table',
+      realtimeOperation: tableDeleteRealtimeOperation(pos, cellInfo, mode),
+    },
   }), '줄/칸 지우기');
   restoreEditorFocus(ih);
 }
@@ -254,6 +539,11 @@ export const tableCommands: CommandDef[] = [
             }
             return pos;
           },
+          meta: {
+            domain: 'table',
+            dirtyScope: 'table',
+            realtimeOperation: createTableRealtimeOperation(pos, rows, cols, options),
+          },
         }), '표 만들기');
         // 대화상자 닫힘 후 편집 포커스 복원 — textarea 에 keydown 이 바인딩되어
         // 있어, 복원하지 않으면 직후 F5 등이 브라우저 기본동작으로 빠진다 (#1140)
@@ -274,6 +564,7 @@ export const tableCommands: CommandDef[] = [
         if (!ref) return;
         const tableCtx = { sec: ref.sec, ppi: ref.ppi, ci: ref.ci };
         const dialog = new TableCellPropsDialog(services.wasm, services.eventBus, tableCtx, 0, 'table');
+        dialog.onRealtimeOperation = (draft) => ih.emitRealtimeOperationDraftPublic(draft);
         dialog.show();
         return;
       }
@@ -282,6 +573,7 @@ export const tableCommands: CommandDef[] = [
       if (pos.parentParaIndex === undefined || pos.controlIndex === undefined || pos.cellIndex === undefined) return;
       const tableCtx = { sec: pos.sectionIndex, ppi: pos.parentParaIndex, ci: pos.controlIndex };
       const dialog = new TableCellPropsDialog(services.wasm, services.eventBus, tableCtx, pos.cellIndex, 'cell');
+      dialog.onRealtimeOperation = (draft) => ih.emitRealtimeOperationDraftPublic(draft);
       dialog.show();
     },
   },
@@ -296,6 +588,7 @@ export const tableCommands: CommandDef[] = [
       if (pos.parentParaIndex === undefined || pos.controlIndex === undefined || pos.cellIndex === undefined) return;
       const tableCtx = { sec: pos.sectionIndex, ppi: pos.parentParaIndex, ci: pos.controlIndex };
       const dialog = new CellBorderBgDialog(services.wasm, services.eventBus, tableCtx, pos.cellIndex, 'each');
+      dialog.onRealtimeOperation = (draft) => ih.emitRealtimeOperationDraftPublic(draft);
       dialog.show();
     },
   },
@@ -310,6 +603,7 @@ export const tableCommands: CommandDef[] = [
       if (pos.parentParaIndex === undefined || pos.controlIndex === undefined || pos.cellIndex === undefined) return;
       const tableCtx = { sec: pos.sectionIndex, ppi: pos.parentParaIndex, ci: pos.controlIndex };
       const dialog = new CellBorderBgDialog(services.wasm, services.eventBus, tableCtx, pos.cellIndex, 'asOne');
+      dialog.onRealtimeOperation = (draft) => ih.emitRealtimeOperationDraftPublic(draft);
       dialog.show();
     },
   },
@@ -358,6 +652,11 @@ export const tableCommands: CommandDef[] = [
           wasm.insertTableRow(pos.sectionIndex, pos.parentParaIndex!, pos.controlIndex!, cellInfo.row, false);
           return pos;
         },
+        meta: {
+          domain: 'table',
+          dirtyScope: 'table',
+          realtimeOperation: tableInsertRealtimeOperation(pos, cellInfo, 'row-above'),
+        },
       }), '줄 추가');
     },
   },
@@ -377,6 +676,11 @@ export const tableCommands: CommandDef[] = [
         operation: (wasm) => {
           wasm.insertTableRow(pos.sectionIndex, pos.parentParaIndex!, pos.controlIndex!, cellInfo.row, true);
           return pos;
+        },
+        meta: {
+          domain: 'table',
+          dirtyScope: 'table',
+          realtimeOperation: tableInsertRealtimeOperation(pos, cellInfo, 'row-below'),
         },
       }), '줄 추가');
     },
@@ -398,6 +702,11 @@ export const tableCommands: CommandDef[] = [
           wasm.insertTableColumn(pos.sectionIndex, pos.parentParaIndex!, pos.controlIndex!, cellInfo.col, false);
           return pos;
         },
+        meta: {
+          domain: 'table',
+          dirtyScope: 'table',
+          realtimeOperation: tableInsertRealtimeOperation(pos, cellInfo, 'col-left'),
+        },
       }), '칸 추가');
     },
   },
@@ -417,6 +726,11 @@ export const tableCommands: CommandDef[] = [
         operation: (wasm) => {
           wasm.insertTableColumn(pos.sectionIndex, pos.parentParaIndex!, pos.controlIndex!, cellInfo.col, true);
           return pos;
+        },
+        meta: {
+          domain: 'table',
+          dirtyScope: 'table',
+          realtimeOperation: tableInsertRealtimeOperation(pos, cellInfo, 'col-right'),
         },
       }), '칸 추가');
     },
@@ -438,6 +752,11 @@ export const tableCommands: CommandDef[] = [
           wasm.deleteTableRow(pos.sectionIndex, pos.parentParaIndex!, pos.controlIndex!, cellInfo.row);
           return pos;
         },
+        meta: {
+          domain: 'table',
+          dirtyScope: 'table',
+          realtimeOperation: tableDeleteRealtimeOperation(pos, cellInfo, 'row'),
+        },
       }), '줄 지우기');
     },
   },
@@ -457,6 +776,11 @@ export const tableCommands: CommandDef[] = [
         operation: (wasm) => {
           wasm.deleteTableColumn(pos.sectionIndex, pos.parentParaIndex!, pos.controlIndex!, cellInfo.col);
           return pos;
+        },
+        meta: {
+          domain: 'table',
+          dirtyScope: 'table',
+          realtimeOperation: tableDeleteRealtimeOperation(pos, cellInfo, 'col'),
         },
       }), '칸 지우기');
     },
@@ -504,6 +828,13 @@ export const tableCommands: CommandDef[] = [
             }
             return pos;
           },
+          meta: {
+            domain: 'table',
+            dirtyScope: 'table',
+            realtimeOperation: isMultiCell && range && tableCtx
+              ? splitTableCellsInRangeRealtimeOperation(tableCtx, range, nRows, mCols, equalHeight)
+              : splitTableCellRealtimeOperation(pos, cellInfo, nRows, mCols, equalHeight, mergeFirst),
+          },
         }), '셀 나누기');
         if (isMultiCell) ih2.exitCellSelectionMode?.();
         // 대화상자 닫힘 후 편집 포커스 복원 (#1140 — 표 만들기와 동일 결함)
@@ -531,6 +862,11 @@ export const tableCommands: CommandDef[] = [
           wasm.mergeTableCells(tableCtx.sec, tableCtx.ppi, tableCtx.ci, range.startRow, range.startCol, range.endRow, range.endCol);
           return ih.getCursorPosition();
         },
+        meta: {
+          domain: 'table',
+          dirtyScope: 'table',
+          realtimeOperation: mergeTableCellsRealtimeOperation(tableCtx, range),
+        },
       }), '셀 합치기');
       ih.exitCellSelectionMode();
     },
@@ -551,17 +887,32 @@ export const tableCommands: CommandDef[] = [
             wasm.deleteTableControl(ref.sec, ref.ppi, ref.ci);
             return { sectionIndex: ref.sec, paragraphIndex: ref.ppi, charOffset: 0 };
           },
+          meta: {
+            domain: 'table',
+            dirtyScope: 'table',
+            realtimeOperation: deleteTableRealtimeOperation(ref),
+          },
         }), '표 지우기');
         return;
       }
       const pos = ih.getCursorPosition();
       if (pos.parentParaIndex === undefined || pos.controlIndex === undefined) return;
+      const tableAnchor = {
+        sec: pos.sectionIndex,
+        ppi: pos.parentParaIndex,
+        ci: pos.controlIndex,
+      };
       safeTableOp(() => ih.executeOperation({
         kind: 'snapshot',
         operationType: 'deleteTable',
         operation: (wasm) => {
-          wasm.deleteTableControl(pos.sectionIndex, pos.parentParaIndex!, pos.controlIndex!);
-          return { sectionIndex: pos.sectionIndex, paragraphIndex: pos.parentParaIndex!, charOffset: 0 };
+          wasm.deleteTableControl(tableAnchor.sec, tableAnchor.ppi, tableAnchor.ci);
+          return { sectionIndex: tableAnchor.sec, paragraphIndex: tableAnchor.ppi, charOffset: 0 };
+        },
+        meta: {
+          domain: 'table',
+          dirtyScope: 'table',
+          realtimeOperation: deleteTableRealtimeOperation(tableAnchor),
         },
       }), '표 지우기');
     },
@@ -596,6 +947,11 @@ export const tableCommands: CommandDef[] = [
             const result: any = wasm.setTableProperties(sec, ppi, ci, { hasCaption: true });
             charOffset = result?.captionCharOffset ?? 3;
             return { sectionIndex: sec, paragraphIndex: ppi, charOffset: 0 };
+          },
+          meta: {
+            domain: 'table',
+            dirtyScope: 'table',
+            realtimeOperation: setTablePropertiesRealtimeOperation({ sec, ppi, ci }, { hasCaption: true }),
           },
         }), '캡션 넣기');
       } else {
@@ -660,6 +1016,11 @@ export const tableCommands: CommandDef[] = [
             wasm.resizeTableCells(sec, ppi, ci, updates);
             return pos;
           },
+          meta: {
+            domain: 'table',
+            dirtyScope: 'table',
+            realtimeOperation: resizeTableCellsRealtimeOperation({ sec, ppi, ci }, updates),
+          },
         }), '셀 높이를 같게');
         restoreEditorFocus(ih);
       } catch (err) {
@@ -717,6 +1078,11 @@ export const tableCommands: CommandDef[] = [
             wasm.resizeTableCells(sec, ppi, ci, updates);
             return pos;
           },
+          meta: {
+            domain: 'table',
+            dirtyScope: 'table',
+            realtimeOperation: resizeTableCellsRealtimeOperation({ sec, ppi, ci }, updates),
+          },
         }), '셀 너비를 같게');
         restoreEditorFocus(ih);
       } catch (err) {
@@ -771,6 +1137,7 @@ export const tableCommands: CommandDef[] = [
         if (result === text) return;
         services.wasm.deleteTextInCell(sec, ppi, ci, cei, cpi, 0, len);
         services.wasm.insertTextInCell(sec, ppi, ci, cei, cpi, 0, result);
+        emitCellTextReplacementRealtimeOperations(ih, sec, ppi, ci, cei, cpi, text, result);
         services.eventBus.emit('document-changed');
       } catch (err) {
         console.warn('[table:thousand-sep] 구분 쉼표 변환 실패:', err);
@@ -804,6 +1171,7 @@ export const tableCommands: CommandDef[] = [
         if (result === text) return;
         services.wasm.deleteTextInCell(sec, ppi, ci, cei, cpi, 0, len);
         services.wasm.insertTextInCell(sec, ppi, ci, cei, cpi, 0, result);
+        emitCellTextReplacementRealtimeOperations(ih, sec, ppi, ci, cei, cpi, text, result);
         services.eventBus.emit('document-changed');
       } catch (err) {
         console.warn('[table:decimal-add] 자릿점 넣기 실패:', err);
@@ -837,6 +1205,7 @@ export const tableCommands: CommandDef[] = [
         if (result === text) return;
         services.wasm.deleteTextInCell(sec, ppi, ci, cei, cpi, 0, len);
         services.wasm.insertTextInCell(sec, ppi, ci, cei, cpi, 0, result);
+        emitCellTextReplacementRealtimeOperations(ih, sec, ppi, ci, cei, cpi, text, result);
         services.eventBus.emit('document-changed');
       } catch (err) {
         console.warn('[table:decimal-remove] 자릿점 빼기 실패:', err);

@@ -3,6 +3,7 @@ import { appendSvgMarkup } from './dom-utils';
 import type { WasmBridge } from '@/core/wasm-bridge';
 import type { CellProperties, TableProperties } from '@/core/types';
 import type { EventBus } from '@/core/event-bus';
+import type { RhwpRealtimeOperationDraft } from '@/engine/realtime-operation';
 
 const HWPUNIT_PER_MM = 7200 / 25.4;
 
@@ -44,6 +45,7 @@ export class TableCellPropsDialog extends ModalDialog {
   private cellIdx: number;
   /** 'table' = 표 선택 (6탭), 'cell' = 셀 선택 (4탭: 테두리·배경 제외) */
   private mode: 'table' | 'cell';
+  onRealtimeOperation?: (draft: RhwpRealtimeOperationDraft) => void;
 
   // ─── 탭 UI ───
   private tabs: HTMLButtonElement[] = [];
@@ -1375,6 +1377,15 @@ export class TableCellPropsDialog extends ModalDialog {
     }
 
     this.wasm.setCellProperties(sec, ppi, ci, this.cellIdx, newCellProps as Partial<CellProperties>);
+    this.onRealtimeOperation?.({
+      kind: 'setCellProperties',
+      position: { sectionIndex: sec, paragraphIndex: ppi, charOffset: 0 },
+      sec,
+      ppi,
+      ci,
+      cellIndex: this.cellIdx,
+      cellProps: newCellProps as Partial<CellProperties>,
+    });
 
     // 표 속성 수정
     const pbValue = parseInt(this.tablePageBreakSelect.value, 10);
@@ -1435,6 +1446,14 @@ export class TableCellPropsDialog extends ModalDialog {
     }
 
     this.wasm.setTableProperties(sec, ppi, ci, newTableProps as Partial<TableProperties>);
+    this.onRealtimeOperation?.({
+      kind: 'setTableProperties',
+      position: { sectionIndex: sec, paragraphIndex: ppi, charOffset: 0 },
+      sec,
+      ppi,
+      ci,
+      tableProps: newTableProps as Partial<TableProperties>,
+    });
 
     this.eventBus.emit('document-changed');
   }

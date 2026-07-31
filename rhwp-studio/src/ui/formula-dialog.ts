@@ -11,6 +11,7 @@
 import { ModalDialog } from './dialog';
 import { makeOption } from './dom-utils';
 import type { EventBus } from '@/core/event-bus';
+import type { RhwpRealtimeOperationDraft } from '@/engine/realtime-operation';
 
 interface FormulaContext {
   sec: number;
@@ -63,6 +64,7 @@ export class FormulaDialog extends ModalDialog {
   private wasm: any;
   private eventBus: EventBus;
   private ctx: FormulaContext;
+  onRealtimeOperation?: (draft: RhwpRealtimeOperationDraft) => void;
   private formulaInput!: HTMLInputElement;
   private funcSelect!: HTMLSelectElement;
   private formatSelect!: HTMLSelectElement;
@@ -192,6 +194,10 @@ export class FormulaDialog extends ModalDialog {
       }
       const row = Math.floor(this.ctx.cellIndex / colCount);
       const col = this.ctx.cellIndex % colCount;
+      const oldLen = this.wasm.getCellParagraphLength(this.ctx.sec, this.ctx.ppi, this.ctx.ci, this.ctx.cellIndex, 0);
+      const oldText = oldLen > 0
+        ? this.wasm.getTextInCell(this.ctx.sec, this.ctx.ppi, this.ctx.ci, this.ctx.cellIndex, 0, 0, oldLen)
+        : '';
 
       // 먼저 검증 (write_result=false)
       const validateResult = this.wasm.evaluateTableFormula(
@@ -210,6 +216,7 @@ export class FormulaDialog extends ModalDialog {
         this.ctx.sec, this.ctx.ppi, this.ctx.ci,
         row, col, formula, true,
       );
+      this.emitCellTextReplacementRealtimeOperations(oldText, this.formulaResultText(validated.result));
 
       // 형식 + 쉼표 처리
       let displayValue = validated.result;
@@ -227,6 +234,11 @@ export class FormulaDialog extends ModalDialog {
             this.ctx.sec, this.ctx.ppi, this.ctx.ci,
             this.ctx.cellIndex, 0, 0, formatted,
           );
+          this.onRealtimeOperation?.({
+            kind: 'insertText',
+            position: this.cellStartPosition(),
+            text: formatted,
+          });
         } catch { /* 쉼표 포맷 기록 실패 시 기본값 유지 */ }
       }
 
@@ -249,5 +261,44 @@ export class FormulaDialog extends ModalDialog {
     this.errorMsg.style.display = 'none';
     this.errorMsg.textContent = '';
     this.formulaInput.classList.remove('formula-input-error');
+  }
+
+  private emitCellTextReplacementRealtimeOperations(oldText: string, newText: string): void {
+    if (oldText.length > 0) {
+      this.onRealtimeOperation?.({
+        kind: 'deleteText',
+        position: this.cellStartPosition(),
+        count: oldText.length,
+        direction: 'forward',
+        deletedText: oldText,
+      });
+    }
+    if (newText.length > 0) {
+      this.onRealtimeOperation?.({
+        kind: 'insertText',
+        position: this.cellStartPosition(),
+        text: newText,
+      });
+    }
+  }
+
+  private cellStartPosition() {
+    return {
+      sectionIndex: this.ctx.sec,
+      paragraphIndex: 0,
+      parentParaIndex: this.ctx.ppi,
+      controlIndex: this.ctx.ci,
+      cellIndex: this.ctx.cellIndex,
+      cellParaIndex: 0,
+      charOffset: 0,
+    };
+  }
+
+  private formulaResultText(value: unknown): string {
+    const n = typeof value === 'number' ? value : Number(value);
+    if (Number.isFinite(n) && n === Math.trunc(n) && Math.abs(n) < 1e15) {
+      return String(Math.trunc(n));
+    }
+    return String(value);
   }
 }

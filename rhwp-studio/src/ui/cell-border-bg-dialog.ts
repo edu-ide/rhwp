@@ -2,6 +2,7 @@ import { ModalDialog } from './dialog';
 import type { WasmBridge } from '@/core/wasm-bridge';
 import type { CellProperties } from '@/core/types';
 import type { EventBus } from '@/core/event-bus';
+import type { RhwpRealtimeOperationDraft } from '@/engine/realtime-operation';
 
 const HWPUNIT_PER_MM = 7200 / 25.4;
 
@@ -36,6 +37,7 @@ export class CellBorderBgDialog extends ModalDialog {
   private tableCtx: { sec: number; ppi: number; ci: number };
   private cellIdx: number;
   private applyMode: 'each' | 'asOne';
+  onRealtimeOperation?: (draft: RhwpRealtimeOperationDraft) => void;
 
   // 탭 UI
   private tabs: HTMLButtonElement[] = [];
@@ -618,6 +620,17 @@ export class CellBorderBgDialog extends ModalDialog {
     const { sec, ppi, ci } = this.tableCtx;
 
     const newProps: Record<string, unknown> = {};
+    const emitCellProperties = (cellIndex: number) => {
+      this.onRealtimeOperation?.({
+        kind: 'setCellProperties',
+        position: { sectionIndex: sec, paragraphIndex: ppi, charOffset: 0 },
+        sec,
+        ppi,
+        ci,
+        cellIndex,
+        cellProps: newProps as Partial<CellProperties>,
+      });
+    };
 
     // 테두리
     newProps.borderLeft = this.borderEdits[0];
@@ -641,9 +654,11 @@ export class CellBorderBgDialog extends ModalDialog {
       const dims = this.wasm.getTableDimensions(sec, ppi, ci);
       for (let i = 0; i < dims.cellCount; i++) {
         this.wasm.setCellProperties(sec, ppi, ci, i, newProps as Partial<CellProperties>);
+        emitCellProperties(i);
       }
     } else {
       this.wasm.setCellProperties(sec, ppi, ci, this.cellIdx, newProps as Partial<CellProperties>);
+      emitCellProperties(this.cellIdx);
     }
     this.eventBus.emit('document-changed');
   }

@@ -13,6 +13,7 @@
 import type { PictureProperties, ShapeProperties, CellPathLike } from '@/core/types';
 import type { WasmBridge } from '@/core/wasm-bridge';
 import type { EventBus } from '@/core/event-bus';
+import type { RhwpRealtimeOperationDraft } from '@/engine/realtime-operation';
 import { userSettings } from '@/core/user-settings';
 import { enableDialogDrag } from './dialog-drag';
 
@@ -43,6 +44,25 @@ function hexToColorRef(hex: string): number {
   return (b << 16) | (g << 8) | r;
 }
 
+function clonePlainValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(clonePlainValue);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .map(([key, child]) => [key, clonePlainValue(child)]),
+    );
+  }
+  return value;
+}
+
+function clonePlainRecord(props: Record<string, unknown>): Record<string, unknown> {
+  return clonePlainValue(props) as Record<string, unknown>;
+}
+
+function cloneCellPath(cellPath?: CellPathLike): CellPathLike | undefined {
+  return cellPath?.map((entry) => ({ ...entry }));
+}
+
 /** 탭 이름 — 그림용 */
 const PICTURE_TAB_NAMES = ['기본', '여백/캡션', '선', '그림', '그림자', '반사', '네온', '열은 테두리'];
 /** 탭 이름 — 글상자용 */
@@ -57,6 +77,7 @@ export class PicturePropsDialog {
 
   private wasm: WasmBridge;
   private eventBus: EventBus;
+  onRealtimeOperation?: (draft: RhwpRealtimeOperationDraft) => void;
 
   // 탭
   private tabs: HTMLButtonElement[] = [];
@@ -2212,6 +2233,7 @@ export class PicturePropsDialog {
     }
 
     if (Object.keys(updated).length > 0) {
+      const realtimeBefore = this.getRealtimeBeforeProps();
       // setter 분기:
       // - shape/line/group: cellPath > 외부
       // - picture: headerFooter > cellPath > 외부
@@ -2241,9 +2263,44 @@ export class PicturePropsDialog {
       } else {
         this.wasm.setPictureProperties(this.sec, this.para, this.ci, updated);
       }
+      this.emitRealtimeResizeObject(realtimeBefore, updated);
       this.eventBus.emit('document-changed');
     }
     this.hide();
+  }
+
+  private getRealtimeBeforeProps(): Record<string, unknown> | null {
+    const source = (
+      this.objectType === 'shape' || this.objectType === 'line' || this.objectType === 'group'
+    )
+      ? this.shapeProps
+      : this.props;
+    return source ? clonePlainRecord(source as unknown as Record<string, unknown>) : null;
+  }
+
+  private emitRealtimeResizeObject(
+    before: Record<string, unknown> | null,
+    patch: Record<string, unknown>,
+  ): void {
+    if (!before || this.headerFooter) return;
+    const beforeProps = clonePlainRecord(before);
+    const afterProps = {
+      ...beforeProps,
+      ...clonePlainRecord(patch),
+    };
+    this.onRealtimeOperation?.({
+      kind: 'resizeObject',
+      position: { sectionIndex: this.sec, paragraphIndex: this.para, charOffset: 0 },
+      objectTargets: [{
+        sec: this.sec,
+        ppi: this.para,
+        ci: this.cellPath ? this.innerControlIdx : this.ci,
+        type: this.objectType,
+        cellPath: cloneCellPath(this.cellPath),
+        before: beforeProps,
+        after: afterProps,
+      }],
+    });
   }
 
   // ════════════════════════════════════════════════════════

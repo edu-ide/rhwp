@@ -1,4 +1,4 @@
-import type { CommandDef } from '../types';
+import type { CommandDef, CommandServices } from '../types';
 import { PicturePropsDialog } from '@/ui/picture-props-dialog';
 import { EquationEditorDialog } from '@/ui/equation-editor-dialog';
 import { EquationPropertiesDialog } from '@/ui/equation-props-dialog';
@@ -9,7 +9,8 @@ import { FieldInsertDialog } from '@/ui/field-insert-dialog';
 import { showShapePicker } from '@/ui/shape-picker';
 import { showToast } from '@/ui/toast';
 import type { ShapeType } from '@/ui/shape-picker';
-import type { CellPathLike } from '@/core/types';
+import type { CellPathLike, DocumentPosition } from '@/core/types';
+import type { RhwpRealtimeObjectType, RhwpRealtimeOperationKind, RhwpRealtimeZOrderAction } from '@/engine/realtime-operation';
 
 /** 스텁 커맨드 생성 헬퍼 */
 function stub(id: string, label: string, icon?: string, shortcut?: string): CommandDef {
@@ -153,6 +154,7 @@ export const insertCommands: CommandDef[] = [
           '', defaultFontSize, defaultColor
         );
         if (result.ok) {
+          emitInsertEquationRealtimeOperation(ih, pos, '', defaultFontSize, defaultColor);
           services.eventBus.emit('document-changed');
           if (!equationEditorDialog) {
             equationEditorDialog = new EquationEditorDialog(services.wasm, services.eventBus);
@@ -184,6 +186,7 @@ export const insertCommands: CommandDef[] = [
             props.editable,
           );
           if (result.ok) {
+            emitInsertFieldRealtimeOperation(ih, pos, props);
             const insertedPos = { ...pos, charOffset: result.charOffset ?? pos.charOffset };
             ih.moveCursorTo(insertedPos);
             ih.markCurrentFieldEndOutside();
@@ -221,6 +224,7 @@ export const insertCommands: CommandDef[] = [
       try {
         const result = services.wasm.insertFootnote(pos.sectionIndex, pos.paragraphIndex, pos.charOffset);
         if (result.ok) {
+          emitInsertNoteRealtimeOperation(ih, pos, 'insertFootnote');
           services.eventBus.emit('document-changed');
           enterNoteEditing(services, ih, pos.sectionIndex, result.paraIdx, result.controlIdx);
         }
@@ -241,6 +245,7 @@ export const insertCommands: CommandDef[] = [
       try {
         const result = services.wasm.insertEndnote(pos.sectionIndex, pos.paragraphIndex, pos.charOffset);
         if (result.ok) {
+          emitInsertNoteRealtimeOperation(ih, pos, 'insertEndnote');
           services.eventBus.emit('document-changed');
           enterNoteEditing(services, ih, pos.sectionIndex, result.paraIdx, result.controlIdx);
         }
@@ -322,6 +327,7 @@ export const insertCommands: CommandDef[] = [
       if (!picturePropsDialog) {
         picturePropsDialog = new PicturePropsDialog(services.wasm, services.eventBus);
       }
+      picturePropsDialog.onRealtimeOperation = (draft) => ih.emitRealtimeOperationDraftPublic(draft);
       // [Task #825] 머리말/꼬리말 그림은 ref.headerFooter 동반 — dialog 에 전달.
       // [Task #1138] 표 셀 내 도형(shape/line) 은 cellPath 구성하여 dialog 에 전달
       // → by_path API 사용.
@@ -392,6 +398,7 @@ export const insertCommands: CommandDef[] = [
         };
         let result: any;
         result = setProps(services, ref, captionProps);
+        emitObjectPropertiesRealtimeOperation(ih, ref, props, captionProps);
         // "그림 N " 끝 위치를 Rust가 반환
         charOffset = result?.captionCharOffset ?? 4;
         services.eventBus.emit('document-changed');
@@ -412,12 +419,7 @@ export const insertCommands: CommandDef[] = [
     label: '맨 앞으로',
     canExecute: (ctx) => ctx.inPictureObjectSelection,
     execute(services) {
-      const ih = services.getInputHandler();
-      if (!ih) return;
-      const ref = ih.getSelectedPictureRef();
-      if (!ref || ref.type !== 'shape') return;
-      services.wasm.changeShapeZOrder(ref.sec, ref.ppi, ref.ci, 'front');
-      ih.exitPictureObjectSelectionAndAfterEdit();
+      changeSelectedShapeZOrder(services, 'front');
     },
   },
   {
@@ -425,12 +427,7 @@ export const insertCommands: CommandDef[] = [
     label: '앞으로',
     canExecute: (ctx) => ctx.inPictureObjectSelection,
     execute(services) {
-      const ih = services.getInputHandler();
-      if (!ih) return;
-      const ref = ih.getSelectedPictureRef();
-      if (!ref || ref.type !== 'shape') return;
-      services.wasm.changeShapeZOrder(ref.sec, ref.ppi, ref.ci, 'forward');
-      ih.exitPictureObjectSelectionAndAfterEdit();
+      changeSelectedShapeZOrder(services, 'forward');
     },
   },
   {
@@ -438,12 +435,7 @@ export const insertCommands: CommandDef[] = [
     label: '뒤로',
     canExecute: (ctx) => ctx.inPictureObjectSelection,
     execute(services) {
-      const ih = services.getInputHandler();
-      if (!ih) return;
-      const ref = ih.getSelectedPictureRef();
-      if (!ref || ref.type !== 'shape') return;
-      services.wasm.changeShapeZOrder(ref.sec, ref.ppi, ref.ci, 'backward');
-      ih.exitPictureObjectSelectionAndAfterEdit();
+      changeSelectedShapeZOrder(services, 'backward');
     },
   },
   {
@@ -451,12 +443,7 @@ export const insertCommands: CommandDef[] = [
     label: '맨 뒤로',
     canExecute: (ctx) => ctx.inPictureObjectSelection,
     execute(services) {
-      const ih = services.getInputHandler();
-      if (!ih) return;
-      const ref = ih.getSelectedPictureRef();
-      if (!ref || ref.type !== 'shape') return;
-      services.wasm.changeShapeZOrder(ref.sec, ref.ppi, ref.ci, 'back');
-      ih.exitPictureObjectSelectionAndAfterEdit();
+      changeSelectedShapeZOrder(services, 'back');
     },
   },
   {
@@ -477,6 +464,7 @@ export const insertCommands: CommandDef[] = [
       } else {
         services.wasm.deletePictureControl(ref.sec, ref.ppi, ref.ci);
       }
+      emitObjectDeleteRealtimeOperation(ih, ref);
       ih.exitPictureObjectSelectionAndAfterEdit();
     },
   },
@@ -613,6 +601,167 @@ function setProps(services: import('../types').CommandServices, ref: PictureRef,
   }
 }
 
+type InsertInputHandler = NonNullable<ReturnType<CommandServices['getInputHandler']>>;
+type InsertNoteOperationKind = Extract<RhwpRealtimeOperationKind, 'insertFootnote' | 'insertEndnote'>;
+
+type FieldInsertProps = {
+  guide?: string;
+  memo?: string;
+  name?: string;
+  editable?: boolean;
+};
+
+function clonePlainValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(clonePlainValue);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .map(([key, child]) => [key, clonePlainValue(child)]),
+    );
+  }
+  return value;
+}
+
+function clonePlainRecord(props: Record<string, unknown>): Record<string, unknown> {
+  return clonePlainValue(props) as Record<string, unknown>;
+}
+
+function cloneCellPath(cellPath?: CellPathLike): CellPathLike | undefined {
+  return cellPath?.map((entry) => ({ ...entry }));
+}
+
+function cloneDocumentPosition(position: DocumentPosition): DocumentPosition {
+  const cloned: DocumentPosition = { ...position };
+  if (position.cellPath) cloned.cellPath = position.cellPath.map((entry) => ({ ...entry }));
+  if (position.cursorRect) cloned.cursorRect = { ...position.cursorRect };
+  return cloned;
+}
+
+function emitInsertEquationRealtimeOperation(
+  ih: InsertInputHandler,
+  position: DocumentPosition,
+  equationText: string,
+  fontSize: number,
+  color: number,
+): void {
+  ih.emitRealtimeOperationDraftPublic({
+    kind: 'insertEquation',
+    position: cloneDocumentPosition(position),
+    equationText,
+    fontSize,
+    color,
+  });
+}
+
+function emitInsertFieldRealtimeOperation(
+  ih: InsertInputHandler,
+  position: DocumentPosition,
+  props: FieldInsertProps,
+): void {
+  ih.emitRealtimeOperationDraftPublic({
+    kind: 'insertField',
+    position: cloneDocumentPosition(position),
+    fieldGuide: props.guide ?? '',
+    fieldMemo: props.memo ?? '',
+    fieldName: props.name ?? '',
+    fieldEditable: props.editable ?? true,
+  });
+}
+
+function emitInsertNoteRealtimeOperation(
+  ih: InsertInputHandler,
+  position: DocumentPosition,
+  noteKind: InsertNoteOperationKind,
+): void {
+  ih.emitRealtimeOperationDraftPublic({
+    kind: noteKind,
+    position: cloneDocumentPosition(position),
+  });
+}
+
+function emitObjectZOrderRealtimeOperation(
+  ih: InsertInputHandler,
+  ref: PictureRef,
+  action: RhwpRealtimeZOrderAction,
+): void {
+  if (ref.headerFooter) return;
+  const objectType = toRealtimeObjectType(ref.type);
+  if (!objectType || (objectType !== 'shape' && objectType !== 'line' && objectType !== 'group')) return;
+  ih.emitRealtimeOperationDraftPublic({
+    kind: 'changeShapeZOrder',
+    position: { sectionIndex: ref.sec, paragraphIndex: ref.ppi, charOffset: 0 },
+    sec: ref.sec,
+    ppi: ref.ppi,
+    ci: ref.ci,
+    objectType,
+    cellPath: cloneCellPath(ref.cellPath),
+    zOrderAction: action,
+  });
+}
+
+function toRealtimeObjectType(type: string): RhwpRealtimeObjectType | undefined {
+  if (type === 'image' || type === 'shape' || type === 'equation' || type === 'group' || type === 'line') {
+    return type;
+  }
+  return undefined;
+}
+
+function changeSelectedShapeZOrder(
+  services: CommandServices,
+  action: RhwpRealtimeZOrderAction,
+): void {
+  const ih = services.getInputHandler();
+  if (!ih) return;
+  const ref = ih.getSelectedPictureRef();
+  if (!ref || (ref.type !== 'shape' && ref.type !== 'line' && ref.type !== 'group')) return;
+  services.wasm.changeShapeZOrder(ref.sec, ref.ppi, ref.ci, action);
+  emitObjectZOrderRealtimeOperation(ih, ref, action);
+  ih.exitPictureObjectSelectionAndAfterEdit();
+}
+
+function emitObjectDeleteRealtimeOperation(ih: InsertInputHandler, ref: PictureRef): void {
+  if (ref.headerFooter) return;
+  const objectType = toRealtimeObjectType(ref.type);
+  if (!objectType) return;
+  ih.emitRealtimeOperationDraftPublic({
+    kind: 'deleteObject',
+    position: { sectionIndex: ref.sec, paragraphIndex: ref.ppi, charOffset: 0 },
+    sec: ref.sec,
+    ppi: ref.ppi,
+    ci: ref.ci,
+    objectType,
+    cellPath: cloneCellPath(ref.cellPath),
+  });
+}
+
+function emitObjectPropertiesRealtimeOperation(
+  ih: InsertInputHandler,
+  ref: PictureRef,
+  before: Record<string, unknown>,
+  patch: Record<string, unknown>,
+): void {
+  // Remote ResizeObjectCommand does not yet route header/footer picture setters.
+  if (ref.headerFooter) return;
+  const beforeProps = clonePlainRecord(before);
+  const afterProps = {
+    ...beforeProps,
+    ...clonePlainRecord(patch),
+  };
+  ih.emitRealtimeOperationDraftPublic({
+    kind: 'resizeObject',
+    position: { sectionIndex: ref.sec, paragraphIndex: ref.ppi, charOffset: 0 },
+    objectTargets: [{
+      sec: ref.sec,
+      ppi: ref.ppi,
+      ci: ref.ci,
+      type: ref.type,
+      cellPath: cloneCellPath(ref.cellPath),
+      before: beforeProps,
+      after: afterProps,
+    }],
+  });
+}
+
 /** 현재 회전각에 delta(도)를 더한다 (shape + image 지원). */
 function applyRotationDelta(services: import('../types').CommandServices, delta: number): void {
   const ih = services.getInputHandler();
@@ -627,6 +776,7 @@ function applyRotationDelta(services: import('../types').CommandServices, delta:
   next = ((next % 360) + 360) % 360;
   if (next > 180) next -= 360;
   setProps(services, ref, { rotationAngle: next });
+  emitObjectPropertiesRealtimeOperation(ih, ref, props, { rotationAngle: next });
   services.eventBus.emit('document-changed');
 }
 
@@ -640,5 +790,6 @@ function toggleFlip(services: import('../types').CommandServices, key: 'horzFlip
   if (props.sizeProtect) return;
   const cur = !!props[key];
   setProps(services, ref, { [key]: !cur });
+  emitObjectPropertiesRealtimeOperation(ih, ref, props, { [key]: !cur });
   services.eventBus.emit('document-changed');
 }
