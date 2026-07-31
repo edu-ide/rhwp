@@ -18,6 +18,8 @@ interface FontEntry {
 export interface WebFontLoadOptions {
   /** true면 CDN 등 외부 URL 웹폰트 등록/로드를 건너뛴다. */
   disableExternalWebFonts?: boolean;
+  /** FontFace.load()가 멈출 때 초기화가 막히지 않도록 제한한다. */
+  fontLoadTimeoutMs?: number;
 }
 
 // 함초롬체 CDN (눈누 jsdelivr — 비상업적 사용 허용, 한컴 라이선스)
@@ -134,6 +136,7 @@ let fontFaceRegistrationMode: 'all' | 'local-only' | null = null;
 
 /** 이미 로드 완료된 woff2 파일 (중복 네트워크 요청 방지) */
 const loadedFiles = new Set<string>();
+const DEFAULT_FONT_LOAD_TIMEOUT_MS = 3000;
 
 function isExternalFontFile(file: string): boolean {
   return /^https?:\/\//i.test(file);
@@ -162,6 +165,26 @@ function registerFontFaces(options?: WebFontLoadOptions): void {
     return `@font-face { font-family: "${f.name}"; src: url("${f.file}") format("${fmt}"); font-display: swap;${ur} }`;
   }).join('\n');
   fontFaceRegistrationMode = mode;
+}
+
+async function loadFontFaceWithTimeout(
+  face: FontFace,
+  timeoutMs = DEFAULT_FONT_LOAD_TIMEOUT_MS,
+): Promise<FontFace> {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    return face.load();
+  }
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  try {
+    return await Promise.race([
+      face.load(),
+      new Promise<FontFace>((_, reject) => {
+        timer = setTimeout(() => reject(new Error('font load timeout')), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 /**
@@ -258,6 +281,7 @@ export async function loadWebFonts(
   let loaded = 0;
   let failed = 0;
   const BATCH = 4;
+  const timeoutMs = options?.fontLoadTimeoutMs ?? DEFAULT_FONT_LOAD_TIMEOUT_MS;
 
   for (let i = 0; i < uniqueToLoad.length; i += BATCH) {
     const batch = uniqueToLoad.slice(i, i + BATCH);
@@ -267,12 +291,13 @@ export async function loadWebFonts(
         const fmt = f.format ?? 'woff2';
         for (const name of names) {
           const face = new FontFace(name, `url(${f.file}) format('${fmt}')`);
-          const result = await face.load();
+          const result = await loadFontFaceWithTimeout(face, timeoutMs);
           document.fonts.add(result);
         }
         loadedFiles.add(f.file);
         loaded++;
-      } catch {
+      } catch (error) {
+        console.warn(`[FontLoader] 폰트 로드 실패: ${f.name} (${f.file})`, error);
         failed++;
       }
       onProgress?.(loaded + failed, total);

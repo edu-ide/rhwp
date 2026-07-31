@@ -105,3 +105,76 @@ test('외부 웹폰트 사용 안 함 옵션은 CDN @font-face와 FontFace.load�
     });
   }
 });
+
+test('웹폰트 load가 멈춰도 loadWebFonts는 타임아웃 후 계속 진행한다', async () => {
+  const styles: Array<{ id: string; textContent: string }> = [];
+  let fontFaceCreateCount = 0;
+  const previousDocument = (globalThis as typeof globalThis & { document?: unknown }).document;
+  const previousFontFace = (globalThis as typeof globalThis & { FontFace?: unknown }).FontFace;
+
+  const fakeDocument = {
+    head: {
+      appendChild(element: { id: string; textContent: string }) {
+        styles.push(element);
+      },
+    },
+    createElement(tagName: string) {
+      assert.equal(tagName, 'style');
+      return { id: '', textContent: '' };
+    },
+    getElementById(id: string) {
+      return styles.find(style => style.id === id) ?? null;
+    },
+    fonts: {
+      check() {
+        return false;
+      },
+      add() {
+        throw new Error('timed-out fonts must not be registered');
+      },
+    },
+  };
+
+  class HangingFontFace {
+    family: string;
+    source: string;
+
+    constructor(family: string, source: string) {
+      this.family = family;
+      this.source = source;
+      fontFaceCreateCount++;
+    }
+
+    load(): Promise<HangingFontFace> {
+      return new Promise(() => {});
+    }
+  }
+
+  Object.defineProperty(globalThis, 'document', {
+    configurable: true,
+    value: fakeDocument,
+  });
+  Object.defineProperty(globalThis, 'FontFace', {
+    configurable: true,
+    value: HangingFontFace,
+  });
+
+  try {
+    const result = await Promise.race([
+      loadWebFonts(['Noto Sans KR ExtraLight'], undefined, { fontLoadTimeoutMs: 1 } as any).then(() => 'resolved'),
+      new Promise(resolve => setTimeout(() => resolve('timeout'), 50)),
+    ]);
+
+    assert.ok(fontFaceCreateCount > 0);
+    assert.equal(result, 'resolved');
+  } finally {
+    Object.defineProperty(globalThis, 'document', {
+      configurable: true,
+      value: previousDocument,
+    });
+    Object.defineProperty(globalThis, 'FontFace', {
+      configurable: true,
+      value: previousFontFace,
+    });
+  }
+});
