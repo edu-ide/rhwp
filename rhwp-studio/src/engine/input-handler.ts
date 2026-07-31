@@ -5,8 +5,36 @@ import { CaretRenderer } from './caret-renderer';
 import { FieldMarkerRenderer } from './field-marker-renderer';
 import { SelectionRenderer } from './selection-renderer';
 import { CommandHistory } from './history';
-import { DeleteSelectionCommand, ApplyCharFormatCommand, ApplyParaFormatCommand, SnapshotCommand } from './command';
-import type { OperationDescriptor, ParaFormatTarget, RefreshPolicy } from './command';
+import {
+  DeleteSelectionCommand,
+  ApplyCharFormatCommand,
+  ApplyParaFormatCommand,
+  SnapshotCommand,
+  InsertTextCommand,
+  DeleteTextCommand,
+  SplitParagraphCommand,
+  MergeParagraphCommand,
+  MergeNextParagraphCommand,
+  SplitParagraphInCellCommand,
+  MergeParagraphInCellCommand,
+  MergeNextParagraphInCellCommand,
+  MoveTableCommand,
+  MovePictureCommand,
+  MoveShapeCommand,
+  ResizeObjectCommand,
+} from './command';
+import type { EditCommand, OperationDescriptor, ParaFormatTarget, RefreshPolicy } from './command';
+import {
+  createRealtimeOperationFromCommand,
+  createRealtimeOperationFromDraft,
+  createRealtimeOriginId,
+  isOwnRealtimeOperation,
+  transformRemoteOperationAgainstLocalHistory,
+  transformCursorAfterRemoteOperation,
+  type RhwpRealtimeOperationDraft,
+  type RhwpRealtimeOperation,
+  type RhwpRealtimeObjectType,
+} from './realtime-operation';
 import { VirtualScroll } from '@/view/virtual-scroll';
 import { ViewportManager } from '@/view/viewport-manager';
 import type {
@@ -44,6 +72,20 @@ const DRAG_SCROLL_MIN_STEP_PX = 2;
 const DRAG_SCROLL_MAX_STEP_PX = 20;
 const PX_TO_RAW_2X = 150;
 const PX_TO_HWPUNIT = 75;
+const REALTIME_LOCAL_HISTORY_LIMIT = 512;
+
+type RealtimeObjectRef = {
+  sec: number;
+  ppi: number;
+  ci: number;
+  type: RhwpRealtimeObjectType;
+  cellPath?: CellPathLike;
+  headerFooter?: { kind: 'header' | 'footer'; outerParaIdx: number; outerControlIdx: number };
+};
+
+function cloneCellPathLike(cellPath?: CellPathLike): CellPathLike | undefined {
+  return cellPath?.map((entry) => ({ ...entry }));
+}
 
 type FormatCopyState = {
   charProps: Partial<CharProperties>;
@@ -274,6 +316,10 @@ export class InputHandler {
   private pastedFieldEndOutsidePending = false;
   /** 모양 복사로 기억한 글자/문단 모양 */
   private formatCopyState: FormatCopyState | null = null;
+  private realtimeOriginId = createRealtimeOriginId();
+  private realtimeSequence = 0;
+  private realtimeLocalHistory: RhwpRealtimeOperation[] = [];
+  private seenRealtimeOpIds = new Set<string>();
 
   // 마우스 드래그 선택 상태
   private isDragging = false;
@@ -2148,6 +2194,7 @@ export class InputHandler {
           this.markCurrentFieldStartOutside();
         }
         this.refreshAfterOperation(desc.meta?.refresh, 'auto', desc.command.type, beforePos, newPos);
+        this.emitRealtimeOperation(desc.command);
         break;
       }
       case 'snapshot': {
@@ -2162,15 +2209,517 @@ export class InputHandler {
           this.markCurrentFieldEndOutside();
         }
         this.refreshAfterOperation(desc.meta?.refresh, 'full', desc.operationType, cursorBefore, newPos);
+        if (desc.meta?.realtimeOperation) {
+          this.emitRealtimeOperationDraft(desc.meta.realtimeOperation);
+        }
         break;
       }
       case 'record': {
         const pos = this.cursor.getPosition();
         this.history.recordWithoutExecute(desc.command, this.wasm);
         this.refreshAfterOperation(desc.meta?.refresh, 'none', desc.command.type, pos, pos);
+        this.emitRealtimeOperation(desc.command);
         break;
       }
     }
+  }
+
+  applyRealtimeOperation(op: RhwpRealtimeOperation): { ok: boolean; ignored?: boolean; error?: string; cursorPosition?: DocumentPosition; operation?: RhwpRealtimeOperation } {
+    if (this.seenRealtimeOpIds.has(op.opId) || isOwnRealtimeOperation(op, this.realtimeOriginId)) {
+      return { ok: true, ignored: true, cursorPosition: this.cursor.getPosition() };
+    }
+
+    try {
+      const transformedOp = transformRemoteOperationAgainstLocalHistory(op, this.realtimeLocalHistory);
+      const beforePos = this.cursor.getPosition();
+      const nextCursor = transformCursorAfterRemoteOperation(beforePos, transformedOp);
+      let commandType: string;
+      if (transformedOp.kind === 'insertText') {
+        if (typeof transformedOp.text !== 'string') throw new Error('insertText operation requires text');
+        const command = new InsertTextCommand(transformedOp.position, transformedOp.text, transformedOp.timestamp);
+        command.execute(this.wasm);
+        commandType = command.type;
+      } else if (transformedOp.kind === 'deleteText') {
+        if (typeof transformedOp.count !== 'number' || transformedOp.count <= 0) throw new Error('deleteText operation requires positive count');
+        const command = new DeleteTextCommand(
+          transformedOp.position,
+          transformedOp.count,
+          transformedOp.direction ?? 'forward',
+          transformedOp.deletedText,
+          transformedOp.timestamp,
+        );
+        command.execute(this.wasm);
+        commandType = command.type;
+      } else if (transformedOp.kind === 'deleteTextSpans') {
+        const spans = (transformedOp.spans ?? [])
+          .filter((span) => span.count > 0)
+          .map((span) => ({ ...span, position: { ...span.position } }))
+          .sort((a, b) => b.position.charOffset - a.position.charOffset);
+        if (spans.length === 0) {
+          this.seenRealtimeOpIds.add(op.opId);
+          return { ok: true, ignored: true, cursorPosition: this.cursor.getPosition(), operation: transformedOp };
+        }
+        for (const span of spans) {
+          new DeleteTextCommand(
+            span.position,
+            span.count,
+            'forward',
+            span.deletedText,
+            transformedOp.timestamp,
+          ).execute(this.wasm);
+        }
+        commandType = 'deleteText';
+      } else if (transformedOp.kind === 'applyCharFormat') {
+        if (!transformedOp.start || !transformedOp.end || !transformedOp.props) {
+          throw new Error('applyCharFormat operation requires start, end, and props');
+        }
+        const command = new ApplyCharFormatCommand(
+          transformedOp.start,
+          transformedOp.end,
+          transformedOp.props as Partial<CharProperties>,
+        );
+        command.execute(this.wasm);
+        commandType = command.type;
+      } else if (transformedOp.kind === 'applyParaFormat') {
+        if (!transformedOp.cursorBefore || !transformedOp.targets || !transformedOp.props) {
+          throw new Error('applyParaFormat operation requires cursorBefore, targets, and props');
+        }
+        const command = new ApplyParaFormatCommand(
+          transformedOp.targets,
+          transformedOp.props as Partial<ParaProperties>,
+          transformedOp.cursorBefore,
+        );
+        command.execute(this.wasm);
+        commandType = command.type;
+      } else if (transformedOp.kind === 'splitParagraph') {
+        const command = new SplitParagraphCommand(transformedOp.position);
+        command.execute(this.wasm);
+        commandType = command.type;
+      } else if (transformedOp.kind === 'mergeParagraph') {
+        const command = new MergeParagraphCommand(transformedOp.position);
+        command.execute(this.wasm);
+        commandType = command.type;
+      } else if (transformedOp.kind === 'mergeNextParagraph') {
+        const command = new MergeNextParagraphCommand(transformedOp.position);
+        command.execute(this.wasm);
+        commandType = command.type;
+      } else if (transformedOp.kind === 'splitParagraphInCell') {
+        const command = new SplitParagraphInCellCommand(transformedOp.position);
+        command.execute(this.wasm);
+        commandType = command.type;
+      } else if (transformedOp.kind === 'mergeParagraphInCell') {
+        const command = new MergeParagraphInCellCommand(transformedOp.position);
+        command.execute(this.wasm);
+        commandType = command.type;
+      } else if (transformedOp.kind === 'mergeNextParagraphInCell') {
+        const command = new MergeNextParagraphInCellCommand(transformedOp.position);
+        command.execute(this.wasm);
+        commandType = command.type;
+      } else if (transformedOp.kind === 'moveTable') {
+        if (
+          typeof transformedOp.sec !== 'number'
+          || typeof transformedOp.ppi !== 'number'
+          || typeof transformedOp.ci !== 'number'
+          || typeof transformedOp.deltaH !== 'number'
+          || typeof transformedOp.deltaV !== 'number'
+          || typeof transformedOp.resultPpi !== 'number'
+          || typeof transformedOp.resultCi !== 'number'
+        ) {
+          throw new Error('moveTable operation requires table anchor and delta fields');
+        }
+        const command = new MoveTableCommand(
+          transformedOp.sec,
+          transformedOp.ppi,
+          transformedOp.ci,
+          transformedOp.deltaH,
+          transformedOp.deltaV,
+          transformedOp.resultPpi,
+          transformedOp.resultCi,
+          transformedOp.timestamp,
+        );
+        command.execute(this.wasm);
+        commandType = command.type;
+      } else if (transformedOp.kind === 'movePicture' || transformedOp.kind === 'moveShape') {
+        if (
+          typeof transformedOp.sec !== 'number'
+          || typeof transformedOp.ppi !== 'number'
+          || typeof transformedOp.ci !== 'number'
+          || typeof transformedOp.deltaH !== 'number'
+          || typeof transformedOp.deltaV !== 'number'
+        ) {
+          throw new Error(`${transformedOp.kind} operation requires object anchor and delta fields`);
+        }
+        const Command = transformedOp.kind === 'moveShape' ? MoveShapeCommand : MovePictureCommand;
+        const command = new Command(
+          transformedOp.sec,
+          transformedOp.ppi,
+          transformedOp.ci,
+          transformedOp.deltaH,
+          transformedOp.deltaV,
+          transformedOp.origHorzOffset ?? 0,
+          transformedOp.origVertOffset ?? 0,
+          transformedOp.cellPath,
+          transformedOp.timestamp,
+        );
+        command.execute(this.wasm);
+        commandType = command.type;
+      } else if (transformedOp.kind === 'resizeObject') {
+        if (!transformedOp.objectTargets || transformedOp.objectTargets.length === 0) {
+          throw new Error('resizeObject operation requires objectTargets');
+        }
+        const command = new ResizeObjectCommand(transformedOp.objectTargets, transformedOp.timestamp);
+        command.execute(this.wasm);
+        commandType = command.type;
+      } else if (transformedOp.kind === 'deleteObject') {
+        this.applyRemoteDeleteObject(transformedOp);
+        commandType = transformedOp.kind;
+      } else if (transformedOp.kind === 'insertEquation') {
+        this.applyRemoteInsertEquation(transformedOp);
+        commandType = transformedOp.kind;
+      } else if (transformedOp.kind === 'insertField') {
+        this.applyRemoteInsertField(transformedOp);
+        commandType = transformedOp.kind;
+      } else if (transformedOp.kind === 'insertFootnote') {
+        this.applyRemoteInsertFootnote(transformedOp);
+        commandType = transformedOp.kind;
+      } else if (transformedOp.kind === 'insertEndnote') {
+        this.applyRemoteInsertEndnote(transformedOp);
+        commandType = transformedOp.kind;
+      } else if (transformedOp.kind === 'changeShapeZOrder') {
+        this.applyRemoteChangeShapeZOrder(transformedOp);
+        commandType = transformedOp.kind;
+      } else if (transformedOp.kind === 'insertTableRow') {
+        this.applyRemoteTableRowOperation(transformedOp, 'insert');
+        commandType = transformedOp.kind;
+      } else if (transformedOp.kind === 'insertTableColumn') {
+        this.applyRemoteTableColumnOperation(transformedOp, 'insert');
+        commandType = transformedOp.kind;
+      } else if (transformedOp.kind === 'deleteTableRow') {
+        this.applyRemoteTableRowOperation(transformedOp, 'delete');
+        commandType = transformedOp.kind;
+      } else if (transformedOp.kind === 'deleteTableColumn') {
+        this.applyRemoteTableColumnOperation(transformedOp, 'delete');
+        commandType = transformedOp.kind;
+      } else if (transformedOp.kind === 'mergeTableCells') {
+        this.applyRemoteMergeTableCells(transformedOp);
+        commandType = transformedOp.kind;
+      } else if (transformedOp.kind === 'splitTableCell') {
+        this.applyRemoteSplitTableCell(transformedOp);
+        commandType = transformedOp.kind;
+      } else if (transformedOp.kind === 'splitTableCellsInRange') {
+        this.applyRemoteSplitTableCellsInRange(transformedOp);
+        commandType = transformedOp.kind;
+      } else if (transformedOp.kind === 'createTable') {
+        this.applyRemoteCreateTable(transformedOp);
+        commandType = transformedOp.kind;
+      } else if (transformedOp.kind === 'deleteTable') {
+        this.applyRemoteDeleteTable(transformedOp);
+        commandType = transformedOp.kind;
+      } else if (transformedOp.kind === 'setTableProperties') {
+        this.applyRemoteSetTableProperties(transformedOp);
+        commandType = transformedOp.kind;
+      } else if (transformedOp.kind === 'setCellProperties') {
+        this.applyRemoteSetCellProperties(transformedOp);
+        commandType = transformedOp.kind;
+      } else if (transformedOp.kind === 'resizeTableCells') {
+        this.applyRemoteResizeTableCells(transformedOp);
+        commandType = transformedOp.kind;
+      } else {
+        throw new Error(`Unsupported realtime operation: ${(transformedOp as { kind?: string }).kind}`);
+      }
+
+      this.seenRealtimeOpIds.add(op.opId);
+      this.clearTableResizeRuntimeCache();
+      this.cursor.clearSelection();
+      this.cursor.moveTo(nextCursor);
+      this.cursor.resetPreferredX();
+      this.refreshAfterOperation('auto', 'auto', commandType, beforePos, nextCursor);
+      return { ok: true, cursorPosition: this.cursor.getPosition(), operation: transformedOp };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || String(err), cursorPosition: this.cursor.getPosition() };
+    }
+  }
+
+  private emitRealtimeOperation(command: EditCommand): void {
+    const sequence = this.realtimeSequence + 1;
+    const op = createRealtimeOperationFromCommand(command, {
+      originId: this.realtimeOriginId,
+      sequence,
+    });
+    if (!op) return;
+    this.recordRealtimeOperation(op, sequence);
+  }
+
+  private emitRealtimeOperationDraft(draft: RhwpRealtimeOperationDraft): void {
+    const sequence = this.realtimeSequence + 1;
+    const op = createRealtimeOperationFromDraft(draft, {
+      originId: this.realtimeOriginId,
+      sequence,
+    });
+    this.recordRealtimeOperation(op, sequence);
+  }
+
+  emitRealtimeOperationDraftPublic(draft: RhwpRealtimeOperationDraft): void {
+    this.emitRealtimeOperationDraft(draft);
+  }
+
+  private recordRealtimeOperation(op: RhwpRealtimeOperation, sequence: number): void {
+    this.realtimeSequence = sequence;
+    this.seenRealtimeOpIds.add(op.opId);
+    this.realtimeLocalHistory.push(op);
+    if (this.realtimeLocalHistory.length > REALTIME_LOCAL_HISTORY_LIMIT) {
+      this.realtimeLocalHistory.splice(0, this.realtimeLocalHistory.length - REALTIME_LOCAL_HISTORY_LIMIT);
+    }
+    this.eventBus.emit('realtime-operation', op);
+  }
+
+  private applyRemoteDeleteObject(op: RhwpRealtimeOperation): void {
+    if (
+      typeof op.sec !== 'number'
+      || typeof op.ppi !== 'number'
+      || typeof op.ci !== 'number'
+      || !op.objectType
+    ) {
+      throw new Error('deleteObject operation requires object anchor and objectType');
+    }
+
+    if (op.objectType === 'image') {
+      if (op.cellPath && op.cellPath.length > 0) {
+        this.wasm.deleteCellPictureControlByPath(op.sec, op.ppi, op.cellPath, op.ci);
+        return;
+      }
+      this.wasm.deletePictureControl(op.sec, op.ppi, op.ci);
+      return;
+    }
+    if (op.objectType === 'equation') {
+      this.wasm.deleteEquationControl(op.sec, op.ppi, op.ci);
+      return;
+    }
+    this.wasm.deleteShapeControl(op.sec, op.ppi, op.ci);
+  }
+
+  private applyRemoteInsertEquation(op: RhwpRealtimeOperation): void {
+    this.wasm.insertEquation(
+      op.position.sectionIndex,
+      op.position.paragraphIndex,
+      op.position.charOffset,
+      op.equationText ?? '',
+      op.fontSize ?? 1000,
+      op.color ?? 0x00000000,
+    );
+  }
+
+  private applyRemoteInsertField(op: RhwpRealtimeOperation): void {
+    this.wasm.insertClickHereField(
+      op.position,
+      op.fieldGuide ?? '',
+      op.fieldMemo ?? '',
+      op.fieldName ?? '',
+      op.fieldEditable ?? true,
+    );
+    this.wasm.clearActiveField();
+  }
+
+  private applyRemoteInsertFootnote(op: RhwpRealtimeOperation): void {
+    this.wasm.insertFootnote(
+      op.position.sectionIndex,
+      op.position.paragraphIndex,
+      op.position.charOffset,
+    );
+  }
+
+  private applyRemoteInsertEndnote(op: RhwpRealtimeOperation): void {
+    this.wasm.insertEndnote(
+      op.position.sectionIndex,
+      op.position.paragraphIndex,
+      op.position.charOffset,
+    );
+  }
+
+  private applyRemoteChangeShapeZOrder(op: RhwpRealtimeOperation): void {
+    if (
+      typeof op.sec !== 'number'
+      || typeof op.ppi !== 'number'
+      || typeof op.ci !== 'number'
+      || !op.zOrderAction
+    ) {
+      throw new Error('changeShapeZOrder operation requires shape anchor and zOrderAction');
+    }
+    this.wasm.changeShapeZOrder(op.sec, op.ppi, op.ci, op.zOrderAction);
+  }
+
+  private applyRemoteTableRowOperation(op: RhwpRealtimeOperation, action: 'insert' | 'delete'): void {
+    if (
+      typeof op.sec !== 'number'
+      || typeof op.ppi !== 'number'
+      || typeof op.ci !== 'number'
+      || typeof op.rowIndex !== 'number'
+    ) {
+      throw new Error(`${op.kind} operation requires table row anchor fields`);
+    }
+    const count = Math.max(1, Math.floor(op.tableCount ?? 1));
+    for (let i = 0; i < count; i += 1) {
+      if (action === 'insert') {
+        this.wasm.insertTableRow(op.sec, op.ppi, op.ci, op.rowIndex, op.insertAfter ?? false);
+      } else {
+        this.wasm.deleteTableRow(op.sec, op.ppi, op.ci, op.rowIndex);
+      }
+    }
+  }
+
+  private applyRemoteTableColumnOperation(op: RhwpRealtimeOperation, action: 'insert' | 'delete'): void {
+    if (
+      typeof op.sec !== 'number'
+      || typeof op.ppi !== 'number'
+      || typeof op.ci !== 'number'
+      || typeof op.colIndex !== 'number'
+    ) {
+      throw new Error(`${op.kind} operation requires table column anchor fields`);
+    }
+    const count = Math.max(1, Math.floor(op.tableCount ?? 1));
+    for (let i = 0; i < count; i += 1) {
+      if (action === 'insert') {
+        this.wasm.insertTableColumn(op.sec, op.ppi, op.ci, op.colIndex, op.insertAfter ?? false);
+      } else {
+        this.wasm.deleteTableColumn(op.sec, op.ppi, op.ci, op.colIndex);
+      }
+    }
+  }
+
+  private applyRemoteMergeTableCells(op: RhwpRealtimeOperation): void {
+    if (
+      typeof op.sec !== 'number'
+      || typeof op.ppi !== 'number'
+      || typeof op.ci !== 'number'
+      || typeof op.startRow !== 'number'
+      || typeof op.startCol !== 'number'
+      || typeof op.endRow !== 'number'
+      || typeof op.endCol !== 'number'
+    ) {
+      throw new Error('mergeTableCells operation requires table range fields');
+    }
+    this.wasm.mergeTableCells(op.sec, op.ppi, op.ci, op.startRow, op.startCol, op.endRow, op.endCol);
+  }
+
+  private applyRemoteSplitTableCell(op: RhwpRealtimeOperation): void {
+    if (
+      typeof op.sec !== 'number'
+      || typeof op.ppi !== 'number'
+      || typeof op.ci !== 'number'
+      || typeof op.rowIndex !== 'number'
+      || typeof op.colIndex !== 'number'
+    ) {
+      throw new Error('splitTableCell operation requires table cell fields');
+    }
+    this.wasm.splitTableCellInto(
+      op.sec,
+      op.ppi,
+      op.ci,
+      op.rowIndex,
+      op.colIndex,
+      Math.max(1, Math.floor(op.splitRows ?? 1)),
+      Math.max(1, Math.floor(op.splitCols ?? 1)),
+      op.equalRowHeight ?? false,
+      op.mergeFirst ?? false,
+    );
+  }
+
+  private applyRemoteSplitTableCellsInRange(op: RhwpRealtimeOperation): void {
+    if (
+      typeof op.sec !== 'number'
+      || typeof op.ppi !== 'number'
+      || typeof op.ci !== 'number'
+      || typeof op.startRow !== 'number'
+      || typeof op.startCol !== 'number'
+      || typeof op.endRow !== 'number'
+      || typeof op.endCol !== 'number'
+    ) {
+      throw new Error('splitTableCellsInRange operation requires table range fields');
+    }
+    this.wasm.splitTableCellsInRange(
+      op.sec,
+      op.ppi,
+      op.ci,
+      op.startRow,
+      op.startCol,
+      op.endRow,
+      op.endCol,
+      Math.max(1, Math.floor(op.splitRows ?? 1)),
+      Math.max(1, Math.floor(op.splitCols ?? 1)),
+      op.equalRowHeight ?? false,
+    );
+  }
+
+  private applyRemoteCreateTable(op: RhwpRealtimeOperation): void {
+    if (typeof op.rowCount !== 'number' || typeof op.colCount !== 'number') {
+      throw new Error('createTable operation requires rowCount and colCount');
+    }
+    if (op.tableOptions) {
+      this.wasm.createTableEx({
+        sectionIdx: op.position.sectionIndex,
+        paraIdx: op.position.paragraphIndex,
+        charOffset: op.position.charOffset,
+        rowCount: op.rowCount,
+        colCount: op.colCount,
+        ...op.tableOptions,
+      });
+      return;
+    }
+    this.wasm.createTable(
+      op.position.sectionIndex,
+      op.position.paragraphIndex,
+      op.position.charOffset,
+      op.rowCount,
+      op.colCount,
+    );
+  }
+
+  private applyRemoteDeleteTable(op: RhwpRealtimeOperation): void {
+    if (
+      typeof op.sec !== 'number'
+      || typeof op.ppi !== 'number'
+      || typeof op.ci !== 'number'
+    ) {
+      throw new Error('deleteTable operation requires table anchor fields');
+    }
+    this.wasm.deleteTableControl(op.sec, op.ppi, op.ci);
+  }
+
+  private applyRemoteSetTableProperties(op: RhwpRealtimeOperation): void {
+    if (
+      typeof op.sec !== 'number'
+      || typeof op.ppi !== 'number'
+      || typeof op.ci !== 'number'
+      || !op.tableProps
+    ) {
+      throw new Error('setTableProperties operation requires table anchor and tableProps fields');
+    }
+    this.wasm.setTableProperties(op.sec, op.ppi, op.ci, JSON.parse(JSON.stringify(op.tableProps)));
+  }
+
+  private applyRemoteSetCellProperties(op: RhwpRealtimeOperation): void {
+    if (
+      typeof op.sec !== 'number'
+      || typeof op.ppi !== 'number'
+      || typeof op.ci !== 'number'
+      || typeof op.cellIndex !== 'number'
+      || !op.cellProps
+    ) {
+      throw new Error('setCellProperties operation requires table cell anchor and cellProps fields');
+    }
+    this.wasm.setCellProperties(op.sec, op.ppi, op.ci, op.cellIndex, JSON.parse(JSON.stringify(op.cellProps)));
+  }
+
+  private applyRemoteResizeTableCells(op: RhwpRealtimeOperation): void {
+    if (
+      typeof op.sec !== 'number'
+      || typeof op.ppi !== 'number'
+      || typeof op.ci !== 'number'
+      || !Array.isArray(op.cellUpdates)
+    ) {
+      throw new Error('resizeTableCells operation requires table anchor and cellUpdates fields');
+    }
+    this.wasm.resizeTableCells(op.sec, op.ppi, op.ci, JSON.parse(JSON.stringify(op.cellUpdates)));
   }
 
   /** Backspace 처리 */
@@ -2677,6 +3226,19 @@ export class InputHandler {
   /** 개체를 타입에 따라 삭제한다 (그림/글상자 분기) */
   private deleteObjectControl(ref: { sec: number; ppi: number; ci: number; type: 'image' | 'shape' | 'equation' | 'group' | 'line' }): void {
     _picture.deleteObjectControl.call(this, ref);
+  }
+
+  private buildDeleteObjectRealtimeOperation(ref: RealtimeObjectRef): RhwpRealtimeOperationDraft | undefined {
+    if (ref.headerFooter) return undefined;
+    return {
+      kind: 'deleteObject',
+      position: { sectionIndex: ref.sec, paragraphIndex: ref.ppi, charOffset: 0 },
+      sec: ref.sec,
+      ppi: ref.ppi,
+      ci: ref.ci,
+      objectType: ref.type,
+      cellPath: cloneCellPathLike(ref.cellPath),
+    };
   }
 
   /** 그림 객체 선택 시 외곽선 + 핸들을 렌더링한다 */
@@ -3805,7 +4367,7 @@ export class InputHandler {
             wasm.deleteShapeControl(ref.sec, ref.ppi, ref.ci);
           }
           return this.cursor.getPosition();
-        }});
+        }, meta: { realtimeOperation: this.buildDeleteObjectRealtimeOperation(ref) }});
       }
       return;
     }
@@ -3839,7 +4401,7 @@ export class InputHandler {
         this.executeOperation({ kind: 'snapshot', operationType: 'deleteObject', operation: (wasm: WasmBridge) => {
           this.deleteObjectControl(ref);
           return this.cursor.getPosition();
-        }});
+        }, meta: { realtimeOperation: this.buildDeleteObjectRealtimeOperation(ref) }});
       }
       return;
     }

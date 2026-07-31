@@ -727,7 +727,7 @@ export function onKeyDown(this: any, e: KeyboardEvent): void {
         this.executeOperation({ kind: 'snapshot', operationType: 'deleteObject', operation: (wasm: WasmBridge) => {
           deleteSelectedObject(wasm, ref);
           return this.cursor.getPosition();
-        }});
+        }, meta: { realtimeOperation: this.buildDeleteObjectRealtimeOperation(ref) }});
       }
       return;
     }
@@ -784,7 +784,7 @@ export function onKeyDown(this: any, e: KeyboardEvent): void {
         this.executeOperation({ kind: 'snapshot', operationType: 'cutObject', operation: (wasm: WasmBridge) => {
           deleteSelectedObject(wasm, ref);
           return this.cursor.getPosition();
-        }});
+        }, meta: { realtimeOperation: this.buildDeleteObjectRealtimeOperation(ref) }});
       }
       return;
     }
@@ -1286,14 +1286,23 @@ export function handleCtrlKey(this: any, e: KeyboardEvent): void {
     return;
   }
 
+  const cmdId = matchShortcut(e, defaultShortcuts);
+  if (cmdId === 'edit:undo') {
+    e.preventDefault();
+    this.performUndo?.();
+    return;
+  }
+  if (cmdId === 'edit:redo') {
+    e.preventDefault();
+    this.performRedo?.();
+    return;
+  }
+
   // 커맨드 시스템 경유 단축키 처리
-  if (this.dispatcher) {
-    const cmdId = matchShortcut(e, defaultShortcuts);
-    if (cmdId) {
-      e.preventDefault();
-      this.dispatcher.dispatch(cmdId);
-      return;
-    }
+  if (this.dispatcher && cmdId) {
+    e.preventDefault();
+    this.dispatcher.dispatch(cmdId);
+    return;
   }
 
   // ─── 코드 단축키 1번째 키 (Ctrl+K / Ctrl+M) ───
@@ -1530,7 +1539,7 @@ export function onCut(this: any, e: ClipboardEvent): void {
       this.executeOperation({ kind: 'snapshot', operationType: 'cutObject', operation: (wasm: WasmBridge) => {
         deleteSelectedObject(wasm, ref);
         return this.cursor.getPosition();
-      }});
+      }, meta: { realtimeOperation: this.buildDeleteObjectRealtimeOperation(ref) }});
     }
     return;
   }

@@ -7,6 +7,10 @@ export type AutosaveRecoveryChoice =
   | { action: 'delete-all' }
   | { action: 'later' };
 
+export type AutosaveRecoveryAction = AutosaveRecoveryChoice['action'] | 'recover' | 'delete' | 'discard';
+
+let activeAutosaveRecoveryDialog: AutosaveRecoveryDialog | null = null;
+
 class AutosaveRecoveryDialog extends ModalDialog {
   private resolve!: (choice: AutosaveRecoveryChoice) => void;
   private selectedDraftId: string;
@@ -82,6 +86,55 @@ class AutosaveRecoveryDialog extends ModalDialog {
   override hide(): void {
     this.resolve({ action: 'later' });
     super.hide();
+    if (activeAutosaveRecoveryDialog === this) activeAutosaveRecoveryDialog = null;
+  }
+
+  getState(): Record<string, unknown> {
+    return {
+      open: true,
+      draftCount: this.drafts.length,
+      selectedDraftId: this.selectedDraftId,
+      drafts: this.drafts.map((draft) => ({
+        id: draft.id,
+        fileName: draft.fileName,
+        sourceFormat: draft.sourceFormat,
+        savedAt: draft.savedAt,
+        byteLength: draft.byteLength ?? draft.data.byteLength,
+        description: describeDraft(draft),
+      })),
+      actions: ['restore', 'delete-all', 'later'],
+    };
+  }
+
+  choose(action: AutosaveRecoveryAction, draftId?: string): Record<string, unknown> {
+    const normalizedAction = normalizeAutosaveRecoveryAction(action);
+    if (draftId) {
+      if (!this.drafts.some((draft) => draft.id === draftId)) {
+        return {
+          ok: false,
+          open: true,
+          action: normalizedAction,
+          reason: `unknown draftId: ${draftId}`,
+          state: this.getState(),
+        };
+      }
+      this.selectedDraftId = draftId;
+      const radio = [...this.dialog.querySelectorAll('input[name="autosave-recovery-draft"]')]
+        .find((node): node is HTMLInputElement => node instanceof HTMLInputElement && node.value === draftId);
+      if (radio) radio.checked = true;
+    }
+
+    const choice: AutosaveRecoveryChoice =
+      normalizedAction === 'restore'
+        ? { action: 'restore', draftId: this.selectedDraftId }
+        : normalizedAction === 'delete-all'
+          ? { action: 'delete-all' }
+          : { action: 'later' };
+
+    this.resolve(choice);
+    super.hide();
+    if (activeAutosaveRecoveryDialog === this) activeAutosaveRecoveryDialog = null;
+    return { ok: true, open: false, choice };
   }
 
   showAsync(): Promise<AutosaveRecoveryChoice> {
@@ -90,10 +143,12 @@ class AutosaveRecoveryDialog extends ModalDialog {
       this.resolve = (choice: AutosaveRecoveryChoice) => {
         if (resolved) return;
         resolved = true;
+        if (activeAutosaveRecoveryDialog === this) activeAutosaveRecoveryDialog = null;
         resolve(choice);
       };
 
       super.show();
+      activeAutosaveRecoveryDialog = this;
 
       const footer = this.dialog.querySelector('.dialog-footer');
       const restoreBtn = this.dialog.querySelector('.dialog-btn-primary') as HTMLButtonElement | null;
@@ -118,4 +173,36 @@ class AutosaveRecoveryDialog extends ModalDialog {
 
 export function showAutosaveRecoveryDialog(drafts: AutosaveDraft[]): Promise<AutosaveRecoveryChoice> {
   return new AutosaveRecoveryDialog(drafts).showAsync();
+}
+
+function normalizeAutosaveRecoveryAction(action: AutosaveRecoveryAction): AutosaveRecoveryChoice['action'] {
+  const value = String(action || '').trim().toLowerCase();
+  if (['restore', 'recover', 'recovery', '복구'].includes(value)) return 'restore';
+  if (['delete-all', 'delete', 'discard', 'remove', '삭제', '버리기'].includes(value)) return 'delete-all';
+  if (['later', 'cancel', 'dismiss', '나중에', '나중', '닫기'].includes(value)) return 'later';
+  throw new Error(`Unknown autosave recovery action: ${action}`);
+}
+
+export function getAutosaveRecoveryDialogState(): Record<string, unknown> {
+  return activeAutosaveRecoveryDialog?.getState() ?? {
+    open: false,
+    draftCount: 0,
+    actions: ['restore', 'delete-all', 'later'],
+  };
+}
+
+export function resolveAutosaveRecoveryDialog(
+  action: AutosaveRecoveryAction,
+  draftId?: string,
+): Record<string, unknown> {
+  if (!activeAutosaveRecoveryDialog) {
+    return {
+      ok: false,
+      open: false,
+      action,
+      reason: 'no autosave recovery dialog is open',
+      state: getAutosaveRecoveryDialogState(),
+    };
+  }
+  return activeAutosaveRecoveryDialog.choose(action, draftId);
 }

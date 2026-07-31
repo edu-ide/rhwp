@@ -1939,6 +1939,16 @@ function bringShapeToFront(this: any, picHit: any): void {
   if (picHit.type === 'shape' || picHit.type === 'line' || picHit.type === 'group') {
     try {
       this.wasm.changeShapeZOrder(picHit.sec, picHit.ppi, picHit.ci, 'front');
+      this.emitRealtimeOperationDraftPublic?.({
+        kind: 'changeShapeZOrder',
+        position: { sectionIndex: picHit.sec, paragraphIndex: picHit.ppi, charOffset: 0 },
+        sec: picHit.sec,
+        ppi: picHit.ppi,
+        ci: picHit.ci,
+        objectType: picHit.type,
+        cellPath: picHit.cellPath?.map((entry: any) => ({ ...entry })),
+        zOrderAction: 'front',
+      });
       this.eventBus.emit('document-changed');
     } catch { /* ignore */ }
   }

@@ -34,7 +34,11 @@ import { userSettings } from '@/core/user-settings';
 import { AutosaveManager } from '@/recovery/autosave-manager';
 import { clearAutosaveDrafts, deleteAutosaveDraft, listAutosaveDrafts, type AutosaveDraft } from '@/recovery/autosave-store';
 import { recoveryFileName } from '@/recovery/recovery-format';
-import { showAutosaveRecoveryDialog } from '@/recovery/recovery-ui';
+import {
+  getAutosaveRecoveryDialogState,
+  resolveAutosaveRecoveryDialog,
+  showAutosaveRecoveryDialog,
+} from '@/recovery/recovery-ui';
 import { CellSelectionRenderer } from '@/engine/cell-selection-renderer';
 import { TableObjectRenderer } from '@/engine/table-object-renderer';
 import { TableResizeRenderer } from '@/engine/table-resize-renderer';
@@ -77,6 +81,10 @@ let editMode: EditorEditMode = 'normal';
 let extensionViewerSettings: ExtensionViewerSettings = {
   disableExternalWebFonts: false,
 };
+
+interface LoadBytesOptions {
+  interactivePrompts?: boolean;
+}
 
 
 // ─── 커맨드 시스템 ─────────────────────────────
@@ -633,9 +641,14 @@ function applySavedTextMarkSettings(): void {
   syncTextMarkMenu(view.showControlCodes, view.showParagraphMarks);
 }
 
-async function initializeDocument(docInfo: DocumentInfo, displayName: string): Promise<void> {
+async function initializeDocument(
+  docInfo: DocumentInfo,
+  displayName: string,
+  options: LoadBytesOptions = {},
+): Promise<void> {
   const msg = sbMessage();
   let normalizedDuringLoad = false;
+  const interactivePrompts = options.interactivePrompts !== false;
   try {
     console.log('[initDoc] 1. 폰트 로딩 시작');
     if (docInfo.fontsUsed?.length) {
@@ -665,7 +678,7 @@ async function initializeDocument(docInfo: DocumentInfo, displayName: string): P
     try {
       const report = wasm.getValidationWarnings();
       console.log(`[validation] ${report.count} warnings`, report.summary);
-      if (report.count > 0) {
+      if (report.count > 0 && interactivePrompts) {
         const choice = await showValidationModalIfNeeded(report);
         console.log(`[validation] user choice: ${choice}`);
         if (choice === 'auto-fix') {
@@ -676,12 +689,16 @@ async function initializeDocument(docInfo: DocumentInfo, displayName: string): P
           msg.textContent = `${displayName} (비표준 lineseg ${n}건 자동 보정됨)`;
           normalizedDuringLoad = n > 0;
         }
+      } else if (report.count > 0) {
+        console.warn('[validation] 비대화형 로드: validation modal 생략', report.summary);
       }
     } catch (e) {
       console.warn('[validation] 감지/보정 실패 (치명적이지 않음):', e);
     }
 
-    await promptLocalFontsIfNeeded(docInfo, displayName);
+    if (interactivePrompts) {
+      await promptLocalFontsIfNeeded(docInfo, displayName);
+    }
 
     if (normalizedDuringLoad) {
       documentState.markDirty('validation-auto-fix');
@@ -756,6 +773,7 @@ async function loadBytes(
   fileName: string,
   fileHandle: typeof wasm.currentFileHandle,
   startTime = performance.now(),
+  options: LoadBytesOptions = {},
 ): Promise<void> {
   const docInfo = wasm.loadDocument(data, fileName);
   wasm.currentFileHandle = fileHandle;
@@ -766,7 +784,11 @@ async function loadBytes(
   const elapsed = performance.now() - startTime;
   // initializeDocument 안에서 #177 validation 모달이 표시될 수 있음.
   // HWPX 토스트는 모달과의 이벤트 충돌을 피하기 위해 모달 닫힌 후 표시.
-  await initializeDocument(docInfo, `${fileName} — ${docInfo.pageCount}페이지 (${elapsed.toFixed(1)}ms)`);
+  await initializeDocument(
+    docInfo,
+    `${fileName} — ${docInfo.pageCount}페이지 (${elapsed.toFixed(1)}ms)`,
+    options,
+  );
   notifyHwpxSaveModeIfNeeded();
 }
 
@@ -971,7 +993,9 @@ async function loadFromUrlParam(): Promise<void> {
         if (result.error) throw new Error(result.error);
         const data = new Uint8Array(result.data);
         assertRemoteDocumentBytes(data);
-        await loadBytes(data, fileName, null);
+        await loadBytes(data, fileName, null, performance.now(), {
+          interactivePrompts: false,
+        });
         return;
       }
     } else {
@@ -983,7 +1007,9 @@ async function loadFromUrlParam(): Promise<void> {
     const buffer = await response.arrayBuffer();
     const data = new Uint8Array(buffer);
     assertRemoteDocumentBytes(data, contentType);
-    await loadBytes(data, fileName, null);
+    await loadBytes(data, fileName, null, performance.now(), {
+      interactivePrompts: false,
+    });
   } catch (error) {
     // 로컬 file:// 로드 실패 + "파일 URL 액세스 허용" 미허용 → 전용 안내 (#1131)
     if (fileUrl.startsWith('file:') && typeof chrome !== 'undefined') {
@@ -1066,6 +1092,10 @@ function showLoadError(error: unknown): void {
 
 const initPromise = initialize();
 
+eventBus.on('realtime-operation', (operation) => {
+  window.parent?.postMessage({ type: 'rhwp-event', event: 'operation', operation }, '*');
+});
+
 // ── iframe 연동 API (postMessage) ──
 // 부모 페이지에서 postMessage로 에디터를 제어할 수 있다.
 // 요청: { type: 'rhwp-request', id, method, params }
@@ -1083,7 +1113,9 @@ window.addEventListener('message', async (e) => {
         return;
       }
       const bytes = new Uint8Array(msg.data);
-      await loadBytes(bytes, msg.fileName || 'document.hwp', null);
+      await loadBytes(bytes, msg.fileName || 'document.hwp', null, performance.now(), {
+        interactivePrompts: false,
+      });
       e.source?.postMessage({ type: 'rhwp-response', id: msg.id, result: { pageCount: wasm.pageCount } }, { targetOrigin: '*' });
     } catch (err: any) {
       e.source?.postMessage({ type: 'rhwp-response', id: msg.id, error: err.message || String(err) }, { targetOrigin: '*' });
@@ -1105,6 +1137,38 @@ window.addEventListener('message', async (e) => {
         await initPromise;
         reply(true);
         break;
+      case 'dispatchCommand': {
+        await initPromise;
+        const commandId = String(params?.commandId ?? '');
+        const commandParams = (params?.params && typeof params.params === 'object')
+          ? params.params
+          : {};
+        if (!commandId) {
+          reply(undefined, 'missing commandId');
+          break;
+        }
+        if (!registry.has(commandId)) {
+          reply({ ok: false, commandId, known: false });
+          break;
+        }
+        const ok = dispatcher.dispatch(commandId, commandParams);
+        reply({
+          ok,
+          commandId,
+          known: true,
+          canUndo: inputHandler?.canUndo() ?? false,
+          canRedo: inputHandler?.canRedo() ?? false,
+        });
+        break;
+      }
+      case 'openCommandPalette': {
+        await initPromise;
+        const palette = (inputHandler as any)?.commandPalette;
+        const handled = Boolean(palette?.open);
+        palette?.open?.();
+        reply({ ok: handled });
+        break;
+      }
       case 'loadFile': {
         await initPromise;
         if (!await canReplaceCurrentDocument(Boolean(params?.skipUnsavedGuard))) {
@@ -1112,10 +1176,18 @@ window.addEventListener('message', async (e) => {
           break;
         }
         const bytes = new Uint8Array(params.data);
-        await loadBytes(bytes, params.fileName || 'document.hwp', null);
+        await loadBytes(bytes, params.fileName || 'document.hwp', null, performance.now(), {
+          interactivePrompts: false,
+        });
         reply({ pageCount: wasm.pageCount });
         break;
       }
+      case 'getAutosaveRecoveryState':
+        reply(getAutosaveRecoveryDialogState());
+        break;
+      case 'resolveAutosaveRecovery':
+        reply(resolveAutosaveRecoveryDialog(params?.action, params?.draftId ?? params?.draft_id));
+        break;
       case 'pageCount':
         await initPromise;
         reply(wasm.pageCount);
@@ -1135,6 +1207,95 @@ window.addEventListener('message', async (e) => {
       case 'exportHwpVerify':
         await initPromise;
         reply(JSON.parse(wasm.exportHwpVerify()));
+        break;
+      case 'getCursorPosition':
+        await initPromise;
+        reply(inputHandler?.getCursorPosition() ?? null);
+        break;
+      case 'canUndo':
+        await initPromise;
+        reply(inputHandler?.canUndo() ?? false);
+        break;
+      case 'canRedo':
+        await initPromise;
+        reply(inputHandler?.canRedo() ?? false);
+        break;
+      case 'undo': {
+        await initPromise;
+        const handled = Boolean(inputHandler);
+        inputHandler?.performUndo();
+        reply({
+          ok: handled,
+          canUndo: inputHandler?.canUndo() ?? false,
+          canRedo: inputHandler?.canRedo() ?? false,
+        });
+        break;
+      }
+      case 'redo': {
+        await initPromise;
+        const handled = Boolean(inputHandler);
+        inputHandler?.performRedo();
+        reply({
+          ok: handled,
+          canUndo: inputHandler?.canUndo() ?? false,
+          canRedo: inputHandler?.canRedo() ?? false,
+        });
+        break;
+      }
+      case 'getTextRange': {
+        await initPromise;
+        const position = params?.position ?? {};
+        const sectionIndex = Number(params?.sectionIndex ?? params?.section ?? position.sectionIndex ?? 0);
+        const paragraphIndex = Number(params?.paragraphIndex ?? params?.para ?? position.paragraphIndex ?? 0);
+        const charOffset = Number(params?.charOffset ?? params?.offset ?? position.charOffset ?? 0);
+        const requestedCount = params?.count;
+        const paragraphLength = wasm.getParagraphLength(sectionIndex, paragraphIndex);
+        const count = Number.isFinite(Number(requestedCount))
+          ? Number(requestedCount)
+          : Math.max(0, paragraphLength - charOffset);
+        reply({
+          sectionIndex,
+          paragraphIndex,
+          charOffset,
+          count,
+          text: wasm.getTextRange(sectionIndex, paragraphIndex, charOffset, count),
+        });
+        break;
+      }
+      case 'getCharProperties': {
+        await initPromise;
+        const position = params?.position ?? {};
+        const sectionIndex = Number(params?.sectionIndex ?? params?.section ?? position.sectionIndex ?? 0);
+        const paragraphIndex = Number(params?.paragraphIndex ?? params?.para ?? position.paragraphIndex ?? 0);
+        const charOffset = Number(params?.charOffset ?? params?.offset ?? position.charOffset ?? 0);
+        reply({
+          sectionIndex,
+          paragraphIndex,
+          charOffset,
+          properties: wasm.getCharPropertiesAt(sectionIndex, paragraphIndex, charOffset),
+        });
+        break;
+      }
+      case 'getParagraphInfo': {
+        await initPromise;
+        const position = params?.position ?? {};
+        const sectionIndex = Number(params?.sectionIndex ?? params?.section ?? position.sectionIndex ?? 0);
+        const paragraphIndex = Number(params?.paragraphIndex ?? params?.para ?? position.paragraphIndex ?? 0);
+        reply({
+          sectionIndex,
+          paragraphIndex,
+          paragraphCount: wasm.getParagraphCount(sectionIndex),
+          paragraphLength: wasm.getParagraphLength(sectionIndex, paragraphIndex),
+        });
+        break;
+      }
+      case 'applyOperation':
+        await initPromise;
+        if (!inputHandler) {
+          reply(undefined, 'input handler not ready');
+          break;
+        }
+        reply(inputHandler.applyRealtimeOperation(params?.operation ?? params));
         break;
       default:
         reply(undefined, `Unknown method: ${method}`);
