@@ -91,6 +91,7 @@ fn main() {
         Some("set-table-properties") => set_table_properties_cli(&args[2..], false),
         Some("resize-table-cells") => resize_table_cells_cli(&args[2..]),
         Some("set-table-column-widths") => set_table_column_widths_cli(&args[2..]),
+        Some("apply-table-style") => apply_table_style_cli(&args[2..]),
         Some("get-char-properties") => get_format_properties_cli(&args[2..], "char"),
         Some("set-char-format") => set_format_cli(&args[2..], "char"),
         Some("get-para-properties") => get_format_properties_cli(&args[2..], "para"),
@@ -483,6 +484,9 @@ fn print_help() {
     println!("  resize-table-cells <파일.hwp> --section N --para N [--cell-path <JSON>|--ctrl N] --json <변경배열JSON> -o <출력.hwp>");
     println!("  set-table-column-widths <파일.hwp> --section N --para N --ctrl N --widths w1,w2,... -o <출력.hwp>");
     println!("      여러 표 셀의 폭/높이를 델타 값으로 조절");
+    println!();
+    println!("  apply-table-style <파일.hwp> --section N --para N --ctrl N [--head-fill #d9d9d9] [--font-size 1200] [--head-height 2232] [--body-height 2882] -o <출력.hwp>");
+    println!("      표에 심사 문서용 「집 서식」을 한 번에 적용 (머리행 음영+이중선, 정렬, 12pt, 행 높이)");
     println!();
     println!("  get-char-properties <파일.hwp> --section N --para N --offset N");
     println!("      본문 글자 속성을 JSON으로 조회");
@@ -4315,6 +4319,31 @@ fn set_hwp_table_column_widths_bytes_for_cli(
     edit_hwp_table_structure_bytes_for_cli(data, "set-table-column-widths", |core| {
         core.set_table_column_widths_native(section_idx, table_para_idx, control_idx, widths.clone())
             .map_err(|e| format!("표 열 폭 설정 실패: {}", e))
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_hwp_table_style_bytes_for_cli(
+    data: &[u8],
+    section_idx: usize,
+    table_para_idx: usize,
+    control_idx: usize,
+    head_fill: String,
+    font_size: u32,
+    head_height: i32,
+    body_height: i32,
+) -> Result<HwpEditCliResult, String> {
+    edit_hwp_table_structure_bytes_for_cli(data, "apply-table-style", |core| {
+        core.apply_table_style_native(
+            section_idx,
+            table_para_idx,
+            control_idx,
+            &head_fill,
+            font_size,
+            head_height,
+            body_height,
+        )
+        .map_err(|e| format!("표 서식 적용 실패: {}", e))
     })
 }
 
@@ -11926,6 +11955,129 @@ fn set_table_column_widths_cli(args: &[String]) {
         .unwrap_or_else(|e| exit_cli_error(&format!("파일 읽기 실패 - {}: {}", input, e)));
     let result = set_hwp_table_column_widths_bytes_for_cli(&data, section, para, ctrl, widths)
         .unwrap_or_else(|e| exit_cli_error(&e));
+
+    write_hwp_cli_output(&output, &result.bytes).unwrap_or_else(|e| exit_cli_error(&e));
+    println!(
+        "{}",
+        serde_json::json!({
+            "ok": true,
+            "path": output,
+            "bytes": result.bytes.len(),
+            "details": result.details,
+            "pageCountBefore": result.page_count_before,
+            "pageCountAfter": result.page_count_after,
+        })
+    );
+}
+
+/// 표에 심사 문서용 「집 서식」을 한 번에 입힌다.
+///
+/// 기본값은 배포된 「작성 예시」(중기부 Part2)를 실측해 정한 값이다 —
+/// 머리행 음영 `#d9d9d9`, 12pt, 머리행 높이 2232 / 본문 행 높이 2882 HWPU.
+fn apply_table_style_cli(args: &[String]) {
+    if args.is_empty() {
+        exit_cli_error("사용법: rhwp apply-table-style <파일.hwp> --section N --para N --ctrl N [--head-fill #d9d9d9] [--font-size 1200] [--head-height 2232] [--body-height 2882] -o <출력.hwp>");
+    }
+    let input = args[0].clone();
+    let mut section: Option<String> = None;
+    let mut para: Option<String> = None;
+    let mut ctrl: Option<String> = None;
+    let mut head_fill = "#d9d9d9".to_string();
+    let mut font_size: u32 = 1200;
+    let mut head_height: i32 = 2232;
+    let mut body_height: i32 = 2882;
+    let mut output_path: Option<String> = None;
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--section" => {
+                i += 1;
+                if i >= args.len() {
+                    exit_cli_error("--section 뒤에 값이 필요합니다.");
+                }
+                section = Some(args[i].clone());
+            }
+            "--para" => {
+                i += 1;
+                if i >= args.len() {
+                    exit_cli_error("--para 뒤에 값이 필요합니다.");
+                }
+                para = Some(args[i].clone());
+            }
+            "--ctrl" => {
+                i += 1;
+                if i >= args.len() {
+                    exit_cli_error("--ctrl 뒤에 값이 필요합니다.");
+                }
+                ctrl = Some(args[i].clone());
+            }
+            "--head-fill" => {
+                i += 1;
+                if i >= args.len() {
+                    exit_cli_error("--head-fill 뒤에 색(#rrggbb)이 필요합니다.");
+                }
+                head_fill = args[i].clone();
+            }
+            "--font-size" => {
+                i += 1;
+                if i >= args.len() {
+                    exit_cli_error("--font-size 뒤에 값(HWPUNIT, 12pt=1200)이 필요합니다.");
+                }
+                font_size = args[i]
+                    .trim()
+                    .parse::<u32>()
+                    .unwrap_or_else(|_| exit_cli_error("--font-size 는 양의 정수여야 합니다."));
+            }
+            "--head-height" => {
+                i += 1;
+                if i >= args.len() {
+                    exit_cli_error("--head-height 뒤에 값(HWPUNIT)이 필요합니다.");
+                }
+                head_height = args[i]
+                    .trim()
+                    .parse::<i32>()
+                    .unwrap_or_else(|_| exit_cli_error("--head-height 는 정수여야 합니다."));
+            }
+            "--body-height" => {
+                i += 1;
+                if i >= args.len() {
+                    exit_cli_error("--body-height 뒤에 값(HWPUNIT)이 필요합니다.");
+                }
+                body_height = args[i]
+                    .trim()
+                    .parse::<i32>()
+                    .unwrap_or_else(|_| exit_cli_error("--body-height 는 정수여야 합니다."));
+            }
+            "-o" | "--output" => {
+                i += 1;
+                if i >= args.len() {
+                    exit_cli_error("-o/--output 뒤에 경로가 필요합니다.");
+                }
+                output_path = Some(args[i].clone());
+            }
+            _ => exit_cli_error(&format!("알 수 없는 옵션: {}", args[i])),
+        }
+        i += 1;
+    }
+
+    let section = parse_usize_cli(section, "--section");
+    let para = parse_usize_cli(para, "--para");
+    let ctrl = parse_usize_cli(ctrl, "--ctrl");
+    let output = output_path.unwrap_or_else(|| input.clone());
+    let data = fs::read(&input)
+        .unwrap_or_else(|e| exit_cli_error(&format!("파일 읽기 실패 - {}: {}", input, e)));
+    let result = apply_hwp_table_style_bytes_for_cli(
+        &data,
+        section,
+        para,
+        ctrl,
+        head_fill,
+        font_size,
+        head_height,
+        body_height,
+    )
+    .unwrap_or_else(|e| exit_cli_error(&e));
 
     write_hwp_cli_output(&output, &result.bytes).unwrap_or_else(|e| exit_cli_error(&e));
     println!(

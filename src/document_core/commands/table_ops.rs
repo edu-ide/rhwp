@@ -2858,6 +2858,151 @@ impl DocumentCore {
             json_escape(formula)
         ))
     }
+
+    /// 표에 심사 문서용 「집 서식」을 한 번에 입힌다.
+    ///
+    /// 왜 명령으로 만드나. 이 서식을 손으로 조립하면 셀 하나당 서식 호출이
+    /// 서너 번이라 7행 4열이면 100번을 넘는다. 그 사이에 **순서 함정 세 개**가
+    /// 있고 셋 다 조용히 실패한다:
+    ///
+    /// 1. **머리행을 먼저 쓰면 이중선이 사라진다.** 아래 행의 위쪽 테두리가
+    ///    같은 모서리를 나중에 덮어쓴다(실측 2026-07-31 — 넣은 type 8 이
+    ///    읽어 보면 type 1 이었다). 그래서 본문 칸을 다 쓴 **뒤** 머리행을 쓴다.
+    /// 2. **글자 서식을 문단 서식보다 먼저 걸면 되돌아간다.** 문단 → 글자 순.
+    /// 3. **행 높이는 grow-only** 라 목표보다 큰 칸은 그대로 둬야 한다.
+    ///
+    /// 기본값은 배포된 「작성 예시」(중기부 Part2)를 실측해 정했다 —
+    /// 머리행 음영 `#d9d9d9` + 아래 이중선, 머리행 가운데·본문 왼쪽,
+    /// 세로 가운데, 12pt 검정, 머리행/라벨 열 굵게.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_table_style_native(
+        &mut self,
+        section_idx: usize,
+        parent_para_idx: usize,
+        control_idx: usize,
+        head_fill: &str,
+        font_size: u32,
+        head_height: i32,
+        body_height: i32,
+    ) -> Result<String, HwpError> {
+        let (rows, cols, cell_count) = {
+            let t = self.get_table_mut(section_idx, parent_para_idx, control_idx)?;
+            (t.row_count as usize, t.col_count as usize, t.cells.len())
+        };
+        if rows < 2 || cols < 1 {
+            return Err(HwpError::InvalidField(
+                "머리행과 본문이 있는 표(2행 이상)에만 쓸 수 있습니다".into(),
+            ));
+        }
+        let rc: Vec<(u16, u16)> = {
+            let t = self.get_table_mut(section_idx, parent_para_idx, control_idx)?;
+            t.cells.iter().map(|c| (c.row, c.col)).collect()
+        };
+        let border = r##"{"type":1,"width":1,"color":"#000000"}"##;
+
+        // ① 문단 서식 먼저 — 머리행만 가운데
+        for (i, (r, _c)) in rc.iter().enumerate() {
+            let align = if *r == 0 { "center" } else { "left" };
+            let json = format!(
+                r##"{{"alignment":"{}","marginLeft":0,"indent":0,"lineSpacing":130,"lineSpacingType":"Percent"}}"##,
+                align
+            );
+            let _ = self.apply_para_format_in_cell_native(
+                section_idx,
+                parent_para_idx,
+                control_idx,
+                i,
+                0,
+                &json,
+            );
+        }
+
+        // ② 채움·테두리 — 본문 칸 먼저, 머리행 마지막(이중선이 살아남는 유일한 순서)
+        let body_props = format!(
+            r##"{{"fillType":"solid","fillColor":"#ffffff","verticalAlign":1,"borderTop":{b},"borderBottom":{b},"borderLeft":{b},"borderRight":{b}}}"##,
+            b = border
+        );
+        let head_props = format!(
+            r##"{{"fillType":"solid","fillColor":"{}","verticalAlign":1,"borderTop":{b},"borderBottom":{{"type":8,"width":1,"color":"#000000"}},"borderLeft":{b},"borderRight":{b}}}"##,
+            head_fill,
+            b = border
+        );
+        for (i, (r, _c)) in rc.iter().enumerate() {
+            if *r != 0 {
+                let _ = self.set_cell_properties_native(
+                    section_idx,
+                    parent_para_idx,
+                    control_idx,
+                    i,
+                    &body_props,
+                );
+            }
+        }
+        for (i, (r, _c)) in rc.iter().enumerate() {
+            if *r == 0 {
+                let _ = self.set_cell_properties_native(
+                    section_idx,
+                    parent_para_idx,
+                    control_idx,
+                    i,
+                    &head_props,
+                );
+            }
+        }
+
+        // ③ 글자 서식 — 문단 서식 뒤에 와야 색·크기가 안 되돌아간다
+        for (i, (r, c)) in rc.iter().enumerate() {
+            let bold = *r == 0 || *c == 0;
+            let json = format!(
+                r##"{{"fontSize":{},"textColor":"#000000","bold":{}}}"##,
+                font_size, bold
+            );
+            let _ = self.apply_char_format_in_cell_native(
+                section_idx,
+                parent_para_idx,
+                control_idx,
+                i,
+                0,
+                0,
+                500,
+                &json,
+            );
+        }
+
+        // ④ 행 높이 — grow-only 라 목표보다 이미 큰 칸은 건드리지 않는다
+        let mut ups: Vec<String> = Vec::new();
+        {
+            let t = self.get_table_mut(section_idx, parent_para_idx, control_idx)?;
+            for (i, cell) in t.cells.iter().enumerate() {
+                let target = if cell.row == 0 { head_height } else { body_height };
+                let delta = target - cell.height as i32;
+                if delta > 0 {
+                    ups.push(format!(
+                        "{{\"cellIdx\":{},\"heightDelta\":{}}}",
+                        i, delta
+                    ));
+                }
+            }
+        }
+        if !ups.is_empty() {
+            let _ = self.resize_table_cells_native(
+                section_idx,
+                parent_para_idx,
+                control_idx,
+                &format!("[{}]", ups.join(",")),
+            );
+        }
+
+        Ok(format!(
+            "{{\"ok\":true,\"operation\":\"apply-table-style\",\"rows\":{},\"cols\":{},\"cells\":{},\"headFill\":\"{}\",\"fontSize\":{},\"heightsRaised\":{}}}",
+            rows,
+            cols,
+            cell_count,
+            head_fill,
+            font_size,
+            ups.len()
+        ))
+    }
 }
 
 /// 셀 텍스트에서 숫자를 추출한다 (콤마 제거, 공백 무시).

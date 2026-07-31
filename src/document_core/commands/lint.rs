@@ -34,6 +34,35 @@ impl Finding {
     }
 }
 
+/// 검사가 **실제로 무엇을 봤는지** 세는 계수기.
+///
+/// 왜 필요한가. 2026-07-31 에 클리핑 검사기가 렌더 트리의 키를 잘못 읽어
+/// **한 줄도 안 보고 "0건"** 을 보고한 적이 있다. `findings: []` 만으로는
+/// "결함이 없다"와 "검사기가 죽었다"를 구분할 수 없다. 그래서 lint 응답에
+/// 훑은 대상 수를 항상 함께 실어 계기가 살아 있는지 눈으로 확인하게 한다.
+#[derive(Default)]
+struct LintScan {
+    /// 레이아웃을 돌린 쪽 수 (0 이면 레이아웃 검사가 통째로 건너뛰어졌다)
+    pages: usize,
+    /// 렌더 트리에서 만난 셀 수
+    cells: usize,
+    /// 렌더 트리에서 만난 글자 런 수
+    text_runs: usize,
+    /// 모델에서 훑은 문단 수 (본문 + 셀 + 중첩 셀)
+    paragraphs: usize,
+    /// 모델에서 훑은 글자 수 (공백·제어문자 제외)
+    chars: usize,
+}
+
+impl LintScan {
+    fn json(&self) -> String {
+        format!(
+            "{{\"pages\":{},\"cells\":{},\"textRuns\":{},\"paragraphs\":{},\"chars\":{}}}",
+            self.pages, self.cells, self.text_runs, self.paragraphs, self.chars
+        )
+    }
+}
+
 impl DocumentCore {
     /// 문서 전체를 검사해 한컴 호환성 소견을 JSON 으로 돌려준다.
     pub fn lint_native(&self) -> Result<String, crate::error::HwpError> {
@@ -184,16 +213,19 @@ impl DocumentCore {
             }
         }
 
+        let mut scan = LintScan::default();
         self.lint_table_style(&mut findings);
-        self.lint_layout(&mut findings);
+        self.lint_char_style(&mut findings, &mut scan);
+        self.lint_layout(&mut findings, &mut scan);
 
         let errors = findings.iter().filter(|f| f.level == "error").count();
         let warns = findings.iter().filter(|f| f.level == "warn").count();
         let body: Vec<String> = findings.iter().map(|f| f.json()).collect();
         Ok(format!(
-            "{{\"ok\":true,\"errors\":{},\"warnings\":{},\"findings\":[{}]}}",
+            "{{\"ok\":true,\"errors\":{},\"warnings\":{},\"scanned\":{},\"findings\":[{}]}}",
             errors,
             warns,
+            scan.json(),
             body.join(",")
         ))
     }
@@ -405,6 +437,192 @@ impl DocumentCore {
         }
     }
 
+    /// 본문·셀 문단을 위치와 함께 모두 모은다 (중첩 표 포함).
+    fn collect_paragraphs(&self) -> Vec<(String, &crate::model::paragraph::Paragraph)> {
+        fn walk_table<'a>(
+            t: &'a Table,
+            loc: &str,
+            out: &mut Vec<(String, &'a crate::model::paragraph::Paragraph)>,
+        ) {
+            for cell in &t.cells {
+                let cloc = format!("{} cell(r{}c{})", loc, cell.row, cell.col);
+                for (pi, cp) in cell.paragraphs.iter().enumerate() {
+                    out.push((format!("{} para{}", cloc, pi), cp));
+                    for c2 in &cp.controls {
+                        if let Control::Table(inner) = c2 {
+                            walk_table(inner, &format!("{} 중첩표", cloc), out);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut out = Vec::new();
+        for (si, sec) in self.document.sections.iter().enumerate() {
+            for (pi, para) in sec.paragraphs.iter().enumerate() {
+                out.push((format!("sec{} para{}", si, pi), para));
+                for (ci, ctrl) in para.controls.iter().enumerate() {
+                    if let Control::Table(t) = ctrl {
+                        walk_table(t, &format!("sec{} para{} ctrl{}", si, pi, ci), &mut out);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// 글자모양이 남긴 자국(색·크기)을 검사한다.
+    ///
+    /// 왜 필요한가. 두 결함 다 2026-07-31 산출물에서 사용자 눈에만 걸렸다.
+    ///
+    /// 1. **파란 안내문 글자모양이 본문에 남는다.** 배포 양식의 안내문은
+    ///    파란 12pt 다. 그 문단을 지우고 우리 글을 쓰면 새 글자가 안내문의
+    ///    글자모양을 그대로 물려받는다. 실측: 한 산출물에서 파란 글자
+    ///    1,390자 = 전체 29%. 저장도 되고 렌더도 된다.
+    /// 2. **글자 수를 줄이면 꼬리 몇 자가 옛 크기로 남는다.** 캡션을 81→72자로
+    ///    줄였더니 마지막 3자만 12pt 로 남아 화면에서 크기가 갈렸다.
+    ///
+    /// 둘 다 **비율**로 본다. 강조용으로 몇 자 색을 주거나 문단을 절반씩 두
+    /// 크기로 쓰는 건 정상이고, 결함은 "대부분과 다른 소수"로 나타난다.
+    fn lint_char_style(&self, findings: &mut Vec<Finding>, scan: &mut LintScan) {
+        use crate::document_core::helpers::color_ref_to_css;
+
+        /// 검정 계열로 볼 상한. 순검정(#000000)만 통과시키면 진회색 본문
+        /// (#333333)이 전부 걸린다. 파랑(#0000ff)·빨강은 그대로 걸린다.
+        const BLACKISH: u32 = 0x40;
+        /// 색 글자 비율이 이보다 크면 「물려받은 안내문 서식」으로 본다.
+        /// 강조 몇 군데는 보통 1% 미만이고, 실측 결함은 29% 였다.
+        const COLOR_RATIO: f64 = 0.03;
+        /// 비율을 말할 만한 최소 글자 수 (이보다 짧으면 표본이 못 된다)
+        const MIN_DOC_CHARS: usize = 100;
+        /// 한 문단 안에서 크기가 갈렸다고 볼 소수 쪽 상한
+        const SIZE_MINORITY_RATIO: f64 = 0.20;
+        /// 크기 검사를 할 최소 문단 길이 (짧은 문단은 1~2자가 20%를 넘는다)
+        const MIN_PARA_CHARS: usize = 10;
+
+        let is_blackish = |c: u32| {
+            let (r, g, b) = (c & 0xFF, (c >> 8) & 0xFF, (c >> 16) & 0xFF);
+            r <= BLACKISH && g <= BLACKISH && b <= BLACKISH
+        };
+
+        let paras = self.collect_paragraphs();
+        scan.paragraphs = paras.len();
+
+        let mut total = 0usize;
+        let mut colored = 0usize;
+        let mut by_color: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let mut by_loc: Vec<(String, usize)> = Vec::new();
+
+        for (loc, para) in &paras {
+            let mut sizes: std::collections::HashMap<i32, usize> = std::collections::HashMap::new();
+            let mut para_total = 0usize;
+            let mut para_colored = 0usize;
+
+            for (i, ch) in para.text.chars().enumerate() {
+                // 공백·제어문자는 색도 크기도 눈에 안 보인다 — 세지 않는다
+                if ch.is_whitespace() || ch.is_control() {
+                    continue;
+                }
+                let Some(id) = para.char_shape_id_at(i) else {
+                    continue;
+                };
+                let Some(cs) = self.document.doc_info.char_shapes.get(id as usize) else {
+                    continue;
+                };
+                para_total += 1;
+                if !is_blackish(cs.text_color) {
+                    para_colored += 1;
+                    *by_color.entry(color_ref_to_css(cs.text_color)).or_insert(0) += 1;
+                }
+                *sizes.entry(cs.base_size).or_insert(0) += 1;
+            }
+
+            total += para_total;
+            colored += para_colored;
+            if para_colored > 0 {
+                by_loc.push((loc.clone(), para_colored));
+            }
+
+            // char-size-mixed — 한 문단 안 소수 크기
+            if para_total >= MIN_PARA_CHARS && sizes.len() >= 2 {
+                let (dom_size, dom_n) = sizes
+                    .iter()
+                    .map(|(s, n)| (*s, *n))
+                    .max_by_key(|(s, n)| (*n, *s))
+                    .unwrap();
+                let minority = para_total - dom_n;
+                let ratio = minority as f64 / para_total as f64;
+                if minority > 0 && ratio < SIZE_MINORITY_RATIO {
+                    let mut rest: Vec<(i32, usize)> = sizes
+                        .iter()
+                        .filter(|(s, _)| **s != dom_size)
+                        .map(|(s, n)| (*s, *n))
+                        .collect();
+                    rest.sort_by(|a, b| b.1.cmp(&a.1));
+                    let rest_txt: Vec<String> = rest
+                        .iter()
+                        .map(|(s, n)| {
+                            format!(
+                                "{:.1}pt {}자({:.1}%)",
+                                *s as f64 / 100.0,
+                                n,
+                                *n as f64 * 100.0 / para_total as f64
+                            )
+                        })
+                        .collect();
+                    findings.push(Finding {
+                        level: "warn",
+                        code: "char-size-mixed",
+                        location: loc.clone(),
+                        message: format!(
+                            "문단 {}자 중 대부분은 {:.1}pt({}자)인데 {} 가 섞였다 — 글자 수를 줄일 때 꼬리 몇 자가 옛 크기로 남은 자국이다 (문단 전체에 크기를 다시 걸어라)",
+                            para_total,
+                            dom_size as f64 / 100.0,
+                            dom_n,
+                            rest_txt.join(", ")
+                        ),
+                    });
+                }
+            }
+        }
+
+        scan.chars = total;
+
+        // char-color-placeholder — 문서 전체 색 글자 비율
+        if total >= MIN_DOC_CHARS && colored as f64 / total as f64 >= COLOR_RATIO {
+            by_loc.sort_by(|a, b| b.1.cmp(&a.1));
+            let top_loc: Vec<String> = by_loc.iter().take(3).map(|(l, _)| l.clone()).collect();
+            let mut colors: Vec<(String, usize)> = by_color.into_iter().collect();
+            colors.sort_by(|a, b| b.1.cmp(&a.1));
+            let color_txt: Vec<String> = colors
+                .iter()
+                .take(3)
+                .map(|(c, n)| format!("{} {}자", c, n))
+                .collect();
+            findings.push(Finding {
+                level: "warn",
+                code: "char-color-placeholder",
+                location: format!(
+                    "{}{}",
+                    top_loc.join(", "),
+                    if by_loc.len() > 3 {
+                        format!(" 외 {}곳", by_loc.len() - 3)
+                    } else {
+                        String::new()
+                    }
+                ),
+                message: format!(
+                    "검정이 아닌 글자가 {}자 / 전체 {}자 = {:.1}% ({}) — 배포 양식 안내문(파란 12pt)의 글자모양을 물려받은 본문이 남아 있다 (해당 범위에 검정을 다시 걸어라)",
+                    colored,
+                    total,
+                    colored as f64 * 100.0 / total as f64,
+                    color_txt.join(", ")
+                ),
+            });
+        }
+    }
+
     /// 레이아웃을 실제로 돌려야만 보이는 결함을 검사한다.
     ///
     /// 모델만 봐서는 절대 안 보인다 — 2026-07-31 실측: 답변 칸 글자를 몇 자
@@ -416,7 +634,7 @@ impl DocumentCore {
     /// 가로 테두리가 그려져 있으면 바닥보다 위에서 끝나도 상자는 닫혀 있다
     /// — 그건 아래 여백이 조금 넓어 보일 뿐 결함이 아니다. 반대로 테두리가
     /// 없으면 세로선만 허공에서 끊긴다. 그래서 두 조건을 함께 본다.
-    fn lint_layout(&self, findings: &mut Vec<Finding>) {
+    fn lint_layout(&self, findings: &mut Vec<Finding>, scan: &mut LintScan) {
         use crate::renderer::render_tree::{RenderNode, RenderNodeType};
 
         /// 쪽 바닥에 닿았다고 볼 여유(px).
@@ -470,11 +688,12 @@ impl DocumentCore {
         }
 
         let pages = self.page_count() as usize;
-        if pages < 2 {
+        if pages == 0 {
             return;
         }
         let mut per_page: Vec<(Option<f64>, std::collections::HashMap<Key, f64>)> =
             Vec::with_capacity(pages);
+        let mut seen_overflow: std::collections::HashSet<String> = std::collections::HashSet::new();
         for p in 0..pages {
             let tree = match self.build_page_tree_cached(p as u32) {
                 Ok(t) => t,
@@ -483,7 +702,21 @@ impl DocumentCore {
             let mut bottom = None;
             let mut tables = std::collections::HashMap::new();
             collect(&tree.root, &mut bottom, &mut tables, false);
+            Self::lint_cell_overflow(
+                &tree.root,
+                p,
+                "표",
+                None,
+                None,
+                findings,
+                &mut seen_overflow,
+                scan,
+            );
+            scan.pages += 1;
             per_page.push((bottom, tables));
+        }
+        if pages < 2 {
+            return;
         }
 
         for p in 0..pages - 1 {
@@ -519,6 +752,119 @@ impl DocumentCore {
                     ),
                 });
             }
+        }
+    }
+
+    /// 셀 안 글자가 셀 밖으로 삐져나갔는지 검사한다.
+    ///
+    /// 왜 필요한가. **한컴은 셀이 좁으면 줄바꿈이 아니라 가로로 잘라낸다.**
+    /// 끊을 자리가 없는 덩어리(영문·괄호·슬래시가 붙은 토큰)는 다음 줄로
+    /// 넘어가지 못하고 셀 밖으로 나가며, 화면에서는 셀 경계에서 잘린 채
+    /// 보인다. 2026-07-31 실측: 「표준 인터페이스(」, 「한글·오피스 문」,
+    /// 「폐쇄망 구동 실」 세 곳이 그렇게 잘렸는데 저장·라운드트립·기존 lint
+    /// 를 전부 통과했다. 사람 눈 말고는 잡을 수단이 없었다.
+    ///
+    /// 경계는 **줄(TextLine) 상자의 오른쪽 끝**을 쓴다. 줄 상자는 셀 안쪽
+    /// 여백(실측 510 HWPU = 6.8px)을 이미 뺀 콘텐츠 폭이라 여백을 따로
+    /// 계산할 필요가 없다. 줄이 없으면 셀 상자 오른쪽 끝으로 대신한다.
+    #[allow(clippy::too_many_arguments)]
+    fn lint_cell_overflow(
+        node: &crate::renderer::render_tree::RenderNode,
+        page: usize,
+        table_loc: &str,
+        cell: Option<(u16, u16, f64)>,
+        line_right: Option<f64>,
+        findings: &mut Vec<Finding>,
+        seen: &mut std::collections::HashSet<String>,
+        scan: &mut LintScan,
+    ) {
+        use crate::renderer::render_tree::RenderNodeType;
+
+        /// 넘쳤다고 볼 최소 여유(px). 아래 자폭 기준의 바닥값이다.
+        ///
+        /// 0 으로 두면 **정상 문서를 오탐한다.** 배포 문서 11쪽을 훑어보니
+        /// 양쪽정렬 줄의 마지막 런이 매번 정확히 0.6px 씩 경계를 넘었다
+        /// (줄 폭을 채우고 남은 반올림).
+        const SLACK_PX: f64 = 2.0;
+
+        let mut table_loc = table_loc.to_string();
+        let mut cell = cell;
+        let mut line_right = line_right;
+
+        match node.node_type {
+            RenderNodeType::Table(ref t) => {
+                // 중첩 표는 (section, para, control) 이 비어 있다 — 바깥 표
+                // 위치에 「중첩표」를 덧붙여 어디인지 알아볼 수 있게 한다.
+                table_loc = match (t.section_index, t.para_index, t.control_index) {
+                    (Some(s), Some(p), Some(c)) => format!("sec{} para{} ctrl{}", s, p, c),
+                    _ => format!("{} 중첩표", table_loc),
+                };
+            }
+            RenderNodeType::TableCell(ref c) => {
+                scan.cells += 1;
+                cell = Some((c.row, c.col, node.bbox.x + node.bbox.width));
+                line_right = None; // 셀이 바뀌면 바깥 줄 상자는 더 이상 경계가 아니다
+            }
+            RenderNodeType::TextLine(_) => {
+                line_right = Some(node.bbox.x + node.bbox.width);
+            }
+            RenderNodeType::TextRun(ref run) => {
+                scan.text_runs += 1;
+                if let Some((row, col, cell_right)) = cell {
+                    // 공백만 있는 런은 경계를 넘어도 눈에 안 보인다. 실측:
+                    // 정상 문서에서 빈 런이 17.3px, 공백 한 칸 런이 7.9px
+                    // 밖에 나와 있었다 — 이걸 세면 오탐만 쌓인다.
+                    if !run.text.trim().is_empty() {
+                        let n = run.text.chars().count().max(1);
+                        let trail = run
+                            .text
+                            .chars()
+                            .rev()
+                            .take_while(|c| c.is_whitespace())
+                            .count();
+                        // 줄 끝 공백도 안 보이므로 평균 자폭만큼 빼고 잰다
+                        let advance = node.bbox.width / n as f64;
+                        let right = node.bbox.x + node.bbox.width - advance * trail as f64;
+                        let limit = match line_right {
+                            Some(l) => l.min(cell_right),
+                            None => cell_right,
+                        };
+                        // **글자 한 자가 통째로 밖에 밀려났을 때만 결함이다.**
+                        // 고정값 2px 로 재 봤더니 337개 문서에서 1,426건이
+                        // 걸렸는데 그 중 852건(60%)이 10px 미만 — 한 글자
+                        // (12pt 한글 ≈ 16px)의 절반도 안 되는, 줄 끝 공백이
+                        // 매달린 자국이었다. 자폭을 문턱으로 쓰면 글꼴 크기에
+                        // 따라 문턱이 같이 움직여 이 잡음이 사라진다.
+                        let over = right - limit;
+                        if over > advance.max(SLACK_PX) {
+                            let key = format!("{}|r{}c{}|{}", table_loc, row, col, run.text);
+                            if seen.insert(key) {
+                                let snippet: String = run.text.chars().take(24).collect();
+                                findings.push(Finding {
+                                    level: "error",
+                                    code: "cell-text-overflow",
+                                    location: format!(
+                                        "{} cell(r{}c{}) p{}",
+                                        table_loc,
+                                        row,
+                                        col,
+                                        page + 1
+                                    ),
+                                    message: format!(
+                                        "셀 안 글자가 오른쪽 경계를 {:.1}px 넘는다 — 한컴은 줄바꿈 대신 가로로 잘라내므로 「{}」의 뒷부분이 화면에서 사라진다 (열 폭을 넓히거나 끊을 자리를 넣어라)",
+                                        over, snippet
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        for ch in &node.children {
+            Self::lint_cell_overflow(ch, page, &table_loc, cell, line_right, findings, seen, scan);
         }
     }
 
