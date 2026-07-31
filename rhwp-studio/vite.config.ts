@@ -6,6 +6,7 @@ import { VitePWA } from 'vite-plugin-pwa';
 const pkg = JSON.parse(readFileSync(resolve(__dirname, 'package.json'), 'utf-8'));
 
 export default defineConfig({
+  base: '/rhwp-studio/',
   define: {
     __APP_VERSION__: JSON.stringify(pkg.version),
   },
@@ -66,8 +67,8 @@ export default defineConfig({
         theme_color: '#2b6cb0',
         background_color: '#ffffff',
         display: 'standalone',
-        start_url: '/rhwp/',
-        scope: '/rhwp/',
+        start_url: '/rhwp-studio/',
+        scope: '/rhwp-studio/',
         file_handlers: [
           {
             action: '/rhwp/',
