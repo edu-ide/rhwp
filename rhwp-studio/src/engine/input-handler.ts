@@ -2388,6 +2388,12 @@ export class InputHandler {
       } else if (transformedOp.kind === 'changeShapeZOrder') {
         this.applyRemoteChangeShapeZOrder(transformedOp);
         commandType = transformedOp.kind;
+      } else if (transformedOp.kind === 'groupShapes') {
+        this.applyRemoteGroupShapes(transformedOp);
+        commandType = transformedOp.kind;
+      } else if (transformedOp.kind === 'ungroupShape') {
+        this.applyRemoteUngroupShape(transformedOp);
+        commandType = transformedOp.kind;
       } else if (transformedOp.kind === 'insertTableRow') {
         this.applyRemoteTableRowOperation(transformedOp, 'insert');
         commandType = transformedOp.kind;
@@ -2546,6 +2552,24 @@ export class InputHandler {
       throw new Error('changeShapeZOrder operation requires shape anchor and zOrderAction');
     }
     this.wasm.changeShapeZOrder(op.sec, op.ppi, op.ci, op.zOrderAction);
+  }
+
+  private applyRemoteGroupShapes(op: RhwpRealtimeOperation): void {
+    if (typeof op.sec !== 'number' || !op.shapeTargets || op.shapeTargets.length < 2) {
+      throw new Error('groupShapes operation requires a section and at least two shape targets');
+    }
+    this.wasm.groupShapes(
+      op.sec,
+      op.shapeTargets.map((target) => ({ paraIdx: target.ppi, controlIdx: target.ci })),
+    );
+  }
+
+  private applyRemoteUngroupShape(op: RhwpRealtimeOperation): void {
+    const target = op.shapeTargets?.[0];
+    if (typeof op.sec !== 'number' || !target) {
+      throw new Error('ungroupShape operation requires a section and a shape target');
+    }
+    this.wasm.ungroupShape(op.sec, target.ppi, target.ci);
   }
 
   private applyRemoteTableRowOperation(op: RhwpRealtimeOperation, action: 'insert' | 'delete'): void {

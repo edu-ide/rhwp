@@ -23,6 +23,8 @@ export type RhwpRealtimeOperationKind =
   | 'insertFootnote'
   | 'insertEndnote'
   | 'changeShapeZOrder'
+  | 'groupShapes'
+  | 'ungroupShape'
   | 'insertTableRow'
   | 'insertTableColumn'
   | 'deleteTableRow'
@@ -50,6 +52,15 @@ export interface RhwpRealtimeObjectTarget {
   cellPath?: CellPathLike;
   before: Record<string, unknown>;
   after: Record<string, unknown>;
+}
+
+/**
+ * 묶기/풀기가 가리키는 개체 하나. 개체 이동·크기와 달리 before/after 가 없고,
+ * 어느 문단의 몇 번째 컨트롤인지만 있으면 된다. sec 은 연산이 갖고 있다.
+ */
+export interface RhwpRealtimeShapeTarget {
+  ppi: number;
+  ci: number;
 }
 
 export type RhwpRealtimeObjectType = 'image' | 'shape' | 'equation' | 'group' | 'line';
@@ -100,6 +111,7 @@ export interface RhwpRealtimeOperation {
   origVertOffset?: number;
   cellPath?: CellPathLike;
   objectTargets?: RhwpRealtimeObjectTarget[];
+  shapeTargets?: RhwpRealtimeShapeTarget[];
   rowIndex?: number;
   colIndex?: number;
   startRow?: number;
@@ -667,6 +679,16 @@ function mapOperationBodyAnchors(
       }),
     };
   }
+  if (op.shapeTargets && isNumber(next.sec)) {
+    const sec = next.sec;
+    next = {
+      ...next,
+      shapeTargets: op.shapeTargets.map((target) => {
+        const mapped = mapPosition({ sectionIndex: sec, paragraphIndex: target.ppi, charOffset: 0 });
+        return { ...target, ppi: mapped.paragraphIndex };
+      }),
+    };
+  }
   return next;
 }
 
@@ -1163,6 +1185,7 @@ function cloneOperation(op: RhwpRealtimeOperation): RhwpRealtimeOperation {
     mergePointOffset: op.mergePointOffset,
     cellPath: cloneCellPath(op.cellPath),
     objectTargets: op.objectTargets?.map(cloneObjectTarget),
+    shapeTargets: op.shapeTargets?.map((target) => ({ ...target })),
     tableOptions: op.tableOptions ? cloneProps(op.tableOptions) : undefined,
     tableProps: op.tableProps ? cloneProps(op.tableProps) : undefined,
     cellProps: op.cellProps ? cloneProps(op.cellProps) : undefined,

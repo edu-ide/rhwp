@@ -482,6 +482,7 @@ export const insertCommands: CommandDef[] = [
       const targets = refs.map(r => ({ paraIdx: r.ppi, controlIdx: r.ci }));
       try {
         const result = services.wasm.groupShapes(sec, targets);
+        emitGroupShapesRealtimeOperation(ih, refs, result);
         ih.exitPictureObjectSelectionAndAfterEdit();
         // 생성된 GroupShape를 선택
         ih.selectPictureObject(sec, result.paraIdx, result.controlIdx, 'group');
@@ -501,6 +502,7 @@ export const insertCommands: CommandDef[] = [
       if (!ref || ref.type !== 'group') return;
       try {
         services.wasm.ungroupShape(ref.sec, ref.ppi, ref.ci);
+        emitUngroupShapeRealtimeOperation(ih, ref);
         ih.exitPictureObjectSelectionAndAfterEdit();
       } catch (err) {
         console.warn('[ungroup-shapes] 개체 풀기 실패:', err);
@@ -717,6 +719,37 @@ function changeSelectedShapeZOrder(
   services.wasm.changeShapeZOrder(ref.sec, ref.ppi, ref.ci, action);
   emitObjectZOrderRealtimeOperation(ih, ref, action);
   ih.exitPictureObjectSelectionAndAfterEdit();
+}
+
+function emitGroupShapesRealtimeOperation(
+  ih: InsertInputHandler,
+  refs: PictureRef[],
+  result: { paraIdx: number; controlIdx: number },
+): void {
+  if (refs.some((ref) => ref.headerFooter)) return;
+  const sec = refs[0].sec;
+  // 묶기는 한 구역 안에서만 성립한다. 섞여 있으면 상대가 되살릴 수 없으므로 보내지 않는다.
+  if (refs.some((ref) => ref.sec !== sec)) return;
+  ih.emitRealtimeOperationDraftPublic({
+    kind: 'groupShapes',
+    position: { sectionIndex: sec, paragraphIndex: refs[0].ppi, charOffset: 0 },
+    sec,
+    shapeTargets: refs.map((ref) => ({ ppi: ref.ppi, ci: ref.ci })),
+    resultPpi: result.paraIdx,
+    resultCi: result.controlIdx,
+    cellPath: cloneCellPath(refs[0].cellPath),
+  });
+}
+
+function emitUngroupShapeRealtimeOperation(ih: InsertInputHandler, ref: PictureRef): void {
+  if (ref.headerFooter) return;
+  ih.emitRealtimeOperationDraftPublic({
+    kind: 'ungroupShape',
+    position: { sectionIndex: ref.sec, paragraphIndex: ref.ppi, charOffset: 0 },
+    sec: ref.sec,
+    shapeTargets: [{ ppi: ref.ppi, ci: ref.ci }],
+    cellPath: cloneCellPath(ref.cellPath),
+  });
 }
 
 function emitObjectDeleteRealtimeOperation(ih: InsertInputHandler, ref: PictureRef): void {
