@@ -203,12 +203,20 @@ impl DocumentCore {
     /// 줄였더니 그 행이 쪽 바닥에 7px 못 미치는 데서 끝났고, 옆 테두리가
     /// 허공에서 끊긴 채 다음 쪽에서 상자가 다시 열렸다. 저장·추출·쪽수·
     /// 클리핑 검사와 기존 lint 를 전부 통과했고 `errors 0` 이 떴다.
+    ///
+    /// **판정은 "쪽 바닥에 닿았나"가 아니라 "상자가 닫혔나"다.** 조각 아래에
+    /// 가로 테두리가 그려져 있으면 바닥보다 위에서 끝나도 상자는 닫혀 있다
+    /// — 그건 아래 여백이 조금 넓어 보일 뿐 결함이 아니다. 반대로 테두리가
+    /// 없으면 세로선만 허공에서 끊긴다. 그래서 두 조건을 함께 본다.
     fn lint_layout(&self, findings: &mut Vec<Finding>) {
         use crate::renderer::render_tree::{RenderNode, RenderNodeType};
 
-        /// 쪽 바닥에 닿았다고 볼 여유(px). 사업계획서 정상 쪽의 실측 오차가
-        /// 0.5px 라 그보다 크고, 눈에 띄는 최소 어긋남(7px)보다 작게 잡는다.
+        /// 쪽 바닥에 닿았다고 볼 여유(px).
         const SLACK_PX: f64 = 2.0;
+        /// 조각 아래 테두리로 인정할 세로 오차(px).
+        const BORDER_EPS: f64 = 1.5;
+        /// 답변 칸 테두리로 볼 최소 가로 길이(px). 중첩 표의 짧은 선을 제외한다.
+        const WIDE_LINE_PX: f64 = 420.0;
 
         type Key = (usize, usize, usize);
 
@@ -216,12 +224,18 @@ impl DocumentCore {
             node: &RenderNode,
             body_bottom: &mut Option<f64>,
             tables: &mut std::collections::HashMap<Key, f64>,
+            hlines: &mut Vec<f64>,
             inside_table: bool,
         ) {
             match node.node_type {
                 RenderNodeType::Body { ref clip_rect } => {
                     if let Some(r) = clip_rect {
                         *body_bottom = Some(r.y + r.height);
+                    }
+                }
+                RenderNodeType::Line(ref l) => {
+                    if (l.y1 - l.y2).abs() < 0.6 && (l.x2 - l.x1).abs() > WIDE_LINE_PX {
+                        hlines.push(l.y1);
                     }
                 }
                 RenderNodeType::Table(ref t) if !inside_table => {
@@ -241,14 +255,14 @@ impl DocumentCore {
                             .or_insert(bottom);
                     }
                     for ch in &node.children {
-                        collect(ch, body_bottom, tables, true);
+                        collect(ch, body_bottom, tables, hlines, true);
                     }
                     return;
                 }
                 _ => {}
             }
             for ch in &node.children {
-                collect(ch, body_bottom, tables, inside_table);
+                collect(ch, body_bottom, tables, hlines, inside_table);
             }
         }
 
@@ -256,7 +270,7 @@ impl DocumentCore {
         if pages < 2 {
             return;
         }
-        let mut per_page: Vec<(Option<f64>, std::collections::HashMap<Key, f64>)> =
+        let mut per_page: Vec<(Option<f64>, std::collections::HashMap<Key, f64>, Vec<f64>)> =
             Vec::with_capacity(pages);
         for p in 0..pages {
             let tree = match self.build_page_tree_cached(p as u32) {
@@ -265,12 +279,13 @@ impl DocumentCore {
             };
             let mut bottom = None;
             let mut tables = std::collections::HashMap::new();
-            collect(&tree.root, &mut bottom, &mut tables, false);
-            per_page.push((bottom, tables));
+            let mut hlines = Vec::new();
+            collect(&tree.root, &mut bottom, &mut tables, &mut hlines, false);
+            per_page.push((bottom, tables, hlines));
         }
 
         for p in 0..pages - 1 {
-            let (body_bottom, ref cur) = per_page[p];
+            let (body_bottom, ref cur, ref hlines) = per_page[p];
             let Some(body_bottom) = body_bottom else {
                 continue;
             };
@@ -281,19 +296,27 @@ impl DocumentCore {
                     continue;
                 }
                 let gap = body_bottom - frag_bottom;
-                if gap > SLACK_PX {
-                    findings.push(Finding {
-                        level: "error",
-                        code: "table-fragment-unclosed",
-                        location: format!("sec{} para{} ctrl{} p{}", key.0, key.1, key.2, p + 1),
-                        message: format!(
-                            "다음 쪽으로 이어지는 표 조각이 쪽 바닥보다 {:.1}px 위에서 끝난다 \
-                             — 옆 테두리가 허공에서 끊겨 상자가 안 닫힌 채로 보인다. \
-                             그 행 높이를 쪽 경계에 맞춰 채워라(첫 행 예산 = 쪽내지-머리행, 이후 행 = 쪽내지)",
-                            gap
-                        ),
-                    });
+                if gap <= SLACK_PX {
+                    continue; // 쪽 바닥에 닿았다 — 이음매가 쪽 경계에 앉은 정상
                 }
+                // 바닥에 못 닿았어도 조각 아래에 가로 테두리가 있으면 닫혀 있다.
+                let closed = hlines
+                    .iter()
+                    .any(|y| (y - frag_bottom).abs() < BORDER_EPS);
+                if closed {
+                    continue;
+                }
+                findings.push(Finding {
+                    level: "error",
+                    code: "table-fragment-unclosed",
+                    location: format!("sec{} para{} ctrl{} p{}", key.0, key.1, key.2, p + 1),
+                    message: format!(
+                        "다음 쪽으로 이어지는 표 조각이 쪽 바닥보다 {:.1}px 위에서 끝나는데 \
+                         닫는 가로 테두리가 없다 — 옆 테두리만 허공에서 끊겨 상자가 열린 채로 보인다. \
+                         그 행의 상·하 테두리를 살리거나(권장), 행 높이를 쪽 경계까지 채워라",
+                        gap
+                    ),
+                });
             }
         }
     }
