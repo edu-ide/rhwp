@@ -353,9 +353,15 @@ impl DocumentCore {
     /// 다음 쪽으로 넘어가 있는 모양이 된다(실측: 사업계획서 Q3 「- 이후 정부
     /// 조달·바우처와 업종 세미나로 확산」).
     ///
-    /// 끌어올려도 안전한 것만 짚는다 — 표제를 끌어올려 자식을 두고 오면 방금
-    /// 고친 고아를 새로 만드는 셈이다. 그래서 (a) 표·그림이 든 문단이 아니고
-    /// (b) 뒤에 자식을 남기지 않는 문단만 대상으로 한다.
+    /// 판정 단위는 문단이 아니라 **옮겨도 안전한 덩어리**다. 처음에 「자식 없는
+    /// 문단 하나」로 좁혔더니, 앞이 ◦-자식 블록·그림인 이음매의 17줄짜리
+    /// 구멍(사용자가 눈으로 잡은 바로 그것)을 규칙이 전혀 못 봤다. 덩어리는:
+    ///
+    /// - 표제(□/◦) + 그보다 깊은 뒤따름 전부 — 통째로 가면 고아가 안 생긴다
+    /// - 개체(그림/표) 문단 + 그 캡션 — 따로 가면 그림과 캡션이 쪽으로 갈라진다
+    /// - 잎(`-`·보통 문단) 하나 — 목록은 쪽을 넘어 이어져도 된다
+    ///
+    /// 덩어리가 통째로 들어갈 때만 짚는다.
     fn lint_pushed_paragraph(&self, findings: &mut Vec<Finding>, scan: &mut LintScan) {
         let meaningful = |p: &crate::model::paragraph::Paragraph| {
             !p.text.trim().is_empty() || !p.controls.is_empty()
@@ -418,25 +424,37 @@ impl DocumentCore {
                         else {
                             continue;
                         };
-                        // 표·그림이 든 문단은 통째로 움직일 수 없다.
+
+                        // 덩어리 경계: 개체는 캡션까지, 표제는 더 깊은 뒤따름까지.
+                        let ps = &below.paragraphs;
+                        let mut end = hi + 1;
                         if !head.controls.is_empty() {
+                            if end < ps.len()
+                                && matches!(
+                                    ps[end].text.trim_start(),
+                                    t if t.starts_with("[그림]") || t.starts_with("[표]")
+                                )
+                            {
+                                end += 1;
+                            }
+                        } else {
+                            let mine = outline_level(&head.text);
+                            if mine <= 2 {
+                                while end < ps.len()
+                                    && (!meaningful(&ps[end])
+                                        || outline_level(&ps[end].text) > mine
+                                        || !ps[end].controls.is_empty())
+                                {
+                                    end += 1;
+                                }
+                            }
+                        }
+                        // 덩어리 뒤에 아무것도 안 남으면 출발 칸이 비어 버린다.
+                        if end >= ps.len() {
                             continue;
                         }
-                        let h = para_height(head);
+                        let h: i64 = ps[..end].iter().map(|p| para_height(p)).sum();
                         if h == 0 || h > slack {
-                            continue;
-                        }
-                        // 자식을 두고 오면 새 고아가 된다 — 뒤따르는 문단이 더
-                        // 깊은 계층이면 끌어올리지 않는다.
-                        let mine = outline_level(&head.text);
-                        if below
-                            .paragraphs
-                            .iter()
-                            .skip(hi + 1)
-                            .find(|p| meaningful(p))
-                            .map(|n| outline_level(&n.text) > mine)
-                            .unwrap_or(false)
-                        {
                             continue;
                         }
 
@@ -449,8 +467,8 @@ impl DocumentCore {
                                 si, pi, ci, above.row, above.col
                             ),
                             message: format!(
-                                "앞 칸에 {}HWPU 여유가 있는데 다음 칸 첫 문단 「{}」({}HWPU)이 넘어가 있다 — 앞 칸으로 끌어올릴 것",
-                                slack, title, h
+                                "앞 칸에 {}HWPU 여유가 있는데 다음 칸 첫 덩어리 「{}」({}문단, {}HWPU)가 넘어가 있다 — 앞 칸으로 끌어올릴 것",
+                                slack, title, end, h
                             ),
                         });
                         let _ = scan;
@@ -1361,13 +1379,57 @@ mod pushed_paragraph_tests {
     }
 
     #[test]
-    fn a_heading_leaving_children_behind_is_silent() {
-        // ◦ 를 끌어올리면 그 - 자식들이 다음 쪽에 남아 새 고아가 된다.
+    fn a_block_that_would_empty_the_source_cell_is_silent() {
+        // ◦+자식 전부가 덩어리로 올라가면 출발 칸이 비어 버린다.
         let d = doc(
             cell(0, PAGE, &["□ 절", "◦ 앞 항목"]),
             cell(1, PAGE, &["◦ 경쟁 분석", "- 코난테크놀로지", "- 올거나이즈"]),
         );
-        assert!(pushed(&d).is_empty(), "자식을 두고 오는 표제를 올리라고 했다");
+        assert!(pushed(&d).is_empty(), "출발 칸을 비우는 이동을 권했다");
+    }
+
+    #[test]
+    fn a_heading_block_that_fits_whole_is_reported() {
+        // 표제 덩어리(◦+자식들)가 통째로 들어가면 고아 걱정 없이 올릴 수 있다 —
+        // 단일 문단 판정이던 시절 이 모양의 17줄 구멍을 규칙이 못 봤다.
+        let d = doc(
+            cell(0, PAGE, &["□ 절", "◦ 앞 항목"]),
+            cell(1, PAGE, &["◦ 경쟁 분석", "- 코난테크놀로지", "- 올거나이즈", "□ 다음 절"]),
+        );
+        let got = pushed(&d);
+        assert_eq!(got.len(), 1, "통째로 들어가는 표제 덩어리를 못 봤다: {got:?}");
+        assert!(got[0].contains("3문단"), "{got:?}");
+    }
+
+    #[test]
+    fn a_heading_block_too_tall_for_the_room_is_silent() {
+        // 표제는 들어가는데 자식까지는 안 들어간다 — 올리면 고아가 된다.
+        let texts: Vec<String> = (0..34).map(|i| format!("- 줄 {i}")).collect();
+        let mut above: Vec<&str> = vec!["□ 절"];
+        above.extend(texts.iter().map(|s| s.as_str()));
+        let d = doc(
+            cell(0, PAGE, &above),                       // 여유 ~2줄
+            cell(1, PAGE, &["◦ 경쟁 분석", "- 코난테크놀로지", "- 올거나이즈", "□ 다음 절"]),
+        );
+        assert!(pushed(&d).is_empty(), "자식이 못 들어가는 표제 덩어리를 올리라고 했다");
+    }
+
+    #[test]
+    fn an_object_with_caption_that_fits_is_reported_as_one_unit() {
+        // 개체+캡션은 한 몸으로만 움직인다 — 따로 가면 그림·캡션이 쪽으로 갈라진다.
+        let mut obj = line(" ", 0);
+        obj.controls.push(Control::Table(Box::new(Table::default())));
+        let below = Cell {
+            row: 1, col: 0, col_span: 3, row_span: 1, height: PAGE,
+            paragraphs: vec![obj, line("[그림] 목표 시장 규모", 1860),
+                             line("◦ 확인 방법", 3720)],
+            border_fill_id: 1,
+            ..Default::default()
+        };
+        let d = doc(cell(0, PAGE, &["□ 절", "◦ 앞 항목"]), below);
+        let got = pushed(&d);
+        assert_eq!(got.len(), 1, "개체+캡션 덩어리를 못 봤다: {got:?}");
+        assert!(got[0].contains("2문단"), "{got:?}");
     }
 
     #[test]
@@ -1378,11 +1440,11 @@ mod pushed_paragraph_tests {
     }
 
     #[test]
-    fn a_paragraph_holding_a_table_is_silent() {
-        // 표가 든 문단은 통째로 못 움직인다.
+    fn a_bare_object_paragraph_is_movable_on_its_own() {
+        // 캡션 없는 개체 문단은 홑덩어리로 움직여도 갈라질 짝이 없다.
         let mut below = cell(1, PAGE, &["", "□ 다음 절"]);
         below.paragraphs[0].controls.push(Control::Table(Box::new(Table::default())));
         let d = doc(cell(0, PAGE, &["◦ 앞 항목"]), below);
-        assert!(pushed(&d).is_empty(), "표가 든 문단을 올리라고 했다");
+        assert_eq!(pushed(&d).len(), 1, "캡션 없는 개체 문단을 못 봤다");
     }
 }
