@@ -1051,6 +1051,17 @@ impl DocumentCore {
         control_idx: usize,
         cell_idx: usize,
     ) {
+        // 문단 위/아래 간격(HWPUNIT 2배 저장 — style_resolver 의 variant_div 와 같은
+        // 규약). 셀 문단을 쌓을 때 이 값을 빼먹으면 한글에서는 간격이 벌어지는데
+        // 우리 레이아웃만 그 사실을 못 봐서, 쪽수·클리핑 검사가 전부 실제보다
+        // 짧게 잰다. 양식 문서의 본문은 전부 표 안에 있으므로 영향이 크다.
+        let para_spacing: Vec<(i64, i64)> = self
+            .document
+            .doc_info
+            .para_shapes
+            .iter()
+            .map(|ps| (ps.spacing_before as i64 / 2, ps.spacing_after as i64 / 2))
+            .collect();
         let Some(section) = self.document.sections.get_mut(section_idx) else {
             return;
         };
@@ -1078,6 +1089,13 @@ impl DocumentCore {
                 // 절대화해야 렌더러/측정기가 겹치지 않게 배치한다.
                 let mut running: i64 = 0;
                 for cell_para in &mut cell.paragraphs {
+                    // height_measurer 와 같은 셈: 문단 하나가 차지하는 세로는
+                    // 위 간격 + 줄들 + 아래 간격이다.
+                    let (space_before, space_after) = para_spacing
+                        .get(cell_para.para_shape_id as usize)
+                        .copied()
+                        .unwrap_or((0, 0));
+                    running += space_before.max(0);
                     let base = cell_para
                         .line_segs
                         .first()
@@ -1093,6 +1111,7 @@ impl DocumentCore {
                             + last.line_height as i64
                             + last.line_spacing as i64;
                     }
+                    running += space_after.max(0);
                 }
                 running
                     + cell.padding.top.max(0) as i64

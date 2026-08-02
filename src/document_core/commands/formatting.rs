@@ -1529,7 +1529,15 @@ impl DocumentCore {
         // 그 상태로 쪽나눔이 돌면 문단마다 페이지가 쪼개진다(11p -> 22p 재현).
         // reflow_cell_paragraph 가 셀 폭·패딩·문단 여백을 올바로 쓰고 소유 셀
         // 지오메트리 동기화까지 해주므로 그쪽으로 위임한다.
-        if mods.line_spacing.is_some() || mods.line_spacing_type.is_some() {
+        //
+        // 문단 위/아래 간격도 같은 경로를 타야 한다. 간격만 바꾸면 줄 나눔은
+        // 그대로지만 문단이 쌓이는 세로 위치가 달라지므로, 재배치를 안 돌리면
+        // 파일에는 간격이 들어가고 우리 지오메트리만 옛 값으로 남는다.
+        if mods.line_spacing.is_some()
+            || mods.line_spacing_type.is_some()
+            || mods.spacing_before.is_some()
+            || mods.spacing_after.is_some()
+        {
             self.reflow_cell_paragraph(
                 sec_idx,
                 parent_para_idx,
@@ -2301,6 +2309,38 @@ mod cell_para_format_reflow_tests {
             pitch_after > pitch_before,
             "줄간격을 넓혔는데 줄 좌표 간격이 그대로다: {pitch_before} -> {pitch_after}"
         );
+    }
+
+    #[test]
+    fn paragraph_spacing_pushes_the_cell_paragraph_down() {
+        let mut doc = load();
+        let before = line_tops(&doc);
+        doc.apply_para_format_in_cell_native(
+            0, PARA, CTRL, CELL, CELL_PARA, r#"{"spacingBefore":1000}"#,
+        )
+        .expect("셀 문단 서식 변경 실패");
+        let after = line_tops(&doc);
+
+        assert_eq!(after.len(), before.len(), "간격만 바꿨으니 줄 수는 그대로여야 한다");
+        // ParaShape 는 문단 간격을 HWPUNIT 2배로 저장한다(style_resolver 규약).
+        assert_eq!(
+            after[0] - before[0],
+            500,
+            "문단 위 간격이 세로 좌표에 반영되지 않았다 — 한글에서만 벌어지고 \
+             우리 쪽수·클리핑 검사는 못 보는 상태다: {before:?} -> {after:?}"
+        );
+    }
+
+    #[test]
+    fn zero_paragraph_spacing_leaves_the_cell_paragraph_alone() {
+        // 반대 방향 검증 — 위 시험이 항상 통과하는 시험이 아님을 보인다.
+        let mut doc = load();
+        let before = line_tops(&doc);
+        doc.apply_para_format_in_cell_native(
+            0, PARA, CTRL, CELL, CELL_PARA, r#"{"spacingBefore":0}"#,
+        )
+        .expect("셀 문단 서식 변경 실패");
+        assert_eq!(line_tops(&doc), before, "간격 0인데 좌표가 움직였다");
     }
 }
 
