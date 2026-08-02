@@ -52,14 +52,29 @@ struct LintScan {
     paragraphs: usize,
     /// 모델에서 훑은 글자 수 (공백·제어문자 제외)
     chars: usize,
+    /// 위아래로 이어지는 답변 칸 쌍 (소제목 고아 검사가 실제로 본 이음매 수)
+    cell_seams: usize,
 }
 
 impl LintScan {
     fn json(&self) -> String {
         format!(
-            "{{\"pages\":{},\"cells\":{},\"textRuns\":{},\"paragraphs\":{},\"chars\":{}}}",
-            self.pages, self.cells, self.text_runs, self.paragraphs, self.chars
+            "{{\"pages\":{},\"cells\":{},\"textRuns\":{},\"paragraphs\":{},\"chars\":{},\"cellSeams\":{}}}",
+            self.pages, self.cells, self.text_runs, self.paragraphs, self.chars, self.cell_seams
         )
+    }
+}
+
+/// 글머리표로 읽은 문단의 계층. 작을수록 위 계층이다.
+///
+/// 본문(글머리표 없음)을 가장 깊은 값으로 두는 것이 핵심이다. `□ 표제` 다음에
+/// 서술 문단이 오는 것도 "표제와 그 내용"이므로 같은 규칙으로 걸려야 한다.
+fn outline_level(text: &str) -> u8 {
+    match text.trim_start().chars().next() {
+        Some('□') | Some('■') | Some('▣') | Some('◆') => 1,
+        Some('◦') | Some('○') | Some('●') | Some('ㅇ') => 2,
+        Some('-') | Some('–') | Some('‐') | Some('•') | Some('∙') => 3,
+        _ => 9,
     }
 }
 
@@ -215,6 +230,7 @@ impl DocumentCore {
 
         let mut scan = LintScan::default();
         self.lint_table_style(&mut findings);
+        self.lint_orphan_heading(&mut findings, &mut scan);
         self.lint_char_style(&mut findings, &mut scan);
         self.lint_layout(&mut findings, &mut scan);
 
@@ -228,6 +244,86 @@ impl DocumentCore {
             scan.json(),
             body.join(",")
         ))
+    }
+
+    /// 소제목만 칸 끝에 남고 그 내용은 다음 칸에서 시작하는 곳을 찾는다.
+    ///
+    /// 왜 필요한가. 이 양식들은 한 문항의 답변을 **쪽마다 별도 셀**로 쪼개
+    /// 담는다(§4-1). 그래서 셀 경계가 곧 쪽 경계이고, 한글의 「다음 문단과
+    /// 함께」(keepWithNext)는 흐름이 셀을 넘지 않으므로 아무 효과가 없다.
+    /// 즉 소제목이 쪽 맨 아래 홀로 남는 사고를 막아 주는 장치가 **하나도
+    /// 없다**. 글을 한 줄 넣고 빼는 것만으로도 조용히 생기고, 쪽수·글자수·
+    /// 잘림 검사는 전부 통과한다 — 사람 눈 말고는 잡을 수단이 없었다.
+    ///
+    /// 판정은 글머리표 계층으로 한다. 다만 **모든 위 계층이 표제는 아니다** —
+    /// 처음에 「앞이 뒤보다 위 계층이면 표제」로 잡았더니 5건 중 4건이 오탐이었다.
+    /// `-` 항목은 잎이라 다음에 무엇이 오든 표제가 아니고(목록이 끝나고 그림이
+    /// 시작하는 정상적인 자리까지 걸렸다), `◦` 는 짧은 표제일 때도 있고 그
+    /// 자체로 완결된 서술일 때도 있다. 그래서 표제로 인정하는 자리는 둘뿐이다:
+    ///
+    /// - `□` 뒤에 무엇이든 딸려 오는 경우 (절 표제는 항상 표제다)
+    /// - `◦` 뒤에 `-` 자식이 오는 경우 (자식이 있다는 것이 표제라는 증거다)
+    ///
+    /// 목록이 쪽을 넘어 이어지는 것(`-` 다음 `-`)은 계층이 같으므로 안 걸린다.
+    fn lint_orphan_heading(&self, findings: &mut Vec<Finding>, scan: &mut LintScan) {
+        let meaningful = |p: &crate::model::paragraph::Paragraph| {
+            !p.text.trim().is_empty() || !p.controls.is_empty()
+        };
+
+        for (si, sec) in self.document.sections.iter().enumerate() {
+            for (pi, para) in sec.paragraphs.iter().enumerate() {
+                for (ci, ctrl) in para.controls.iter().enumerate() {
+                    let Control::Table(t) = ctrl else { continue };
+
+                    for above in &t.cells {
+                        // 바로 아래에서 이어지는 칸: 같은 열·같은 병합 폭이어야
+                        // 한 답변 칸의 연속이다. 머리행(병합 폭이 다르다)은
+                        // 여기서 자동으로 걸러진다.
+                        let Some(below) = t.cells.iter().find(|c| {
+                            c.row == above.row + above.row_span
+                                && c.col == above.col
+                                && c.col_span == above.col_span
+                        }) else {
+                            continue;
+                        };
+                        scan.cell_seams += 1;
+
+                        let Some(tail) = above.paragraphs.iter().rev().find(|p| meaningful(p))
+                        else {
+                            continue;
+                        };
+                        let Some(head) = below.paragraphs.iter().find(|p| meaningful(p)) else {
+                            continue;
+                        };
+                        // 표가 든 문단은 표제가 아니다.
+                        if !tail.controls.is_empty() {
+                            continue;
+                        }
+
+                        let up = outline_level(&tail.text);
+                        let down = outline_level(&head.text);
+                        let is_heading = (up == 1 && down > 1) || (up == 2 && down == 3);
+                        if !is_heading {
+                            continue;
+                        }
+
+                        let title: String = tail.text.trim().chars().take(28).collect();
+                        findings.push(Finding {
+                            level: "warn",
+                            code: "heading-orphaned-at-cell-end",
+                            location: format!(
+                                "sec{} para{} ctrl{} r{}c{}",
+                                si, pi, ci, above.row, above.col
+                            ),
+                            message: format!(
+                                "소제목 「{}」만 이 칸 끝에 남고 내용은 다음 칸(=다음 쪽)에서 시작한다 — 다음 칸 맨 앞으로 옮길 것",
+                                title
+                            ),
+                        });
+                    }
+                }
+            }
+        }
     }
 
     /// 표의 서식이 문서 안에서 제각각인지 검사한다.
@@ -936,5 +1032,99 @@ impl DocumentCore {
                 });
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod orphan_heading_tests {
+    //! 소제목이 칸 끝에 홀로 남는 것을 잡는지 — 그리고 **잡지 말아야 할 것을
+    //! 안 잡는지** 함께 본다. 처음 규칙은 "앞이 뒤보다 위 계층이면 표제"였는데
+    //! 실제 문서에서 5건 중 4건이 오탐이었다(`-` 잎 항목, 목록 뒤 그림).
+    use crate::document_core::DocumentCore;
+    use crate::model::control::Control;
+    use crate::model::paragraph::Paragraph;
+    use crate::model::table::{Cell, Table};
+
+    fn para(text: &str) -> Paragraph {
+        Paragraph { text: text.to_string(), ..Default::default() }
+    }
+
+    fn cell(row: u16, texts: &[&str]) -> Cell {
+        Cell {
+            row,
+            col: 0,
+            col_span: 3,
+            row_span: 1,
+            paragraphs: texts.iter().map(|t| para(t)).collect(),
+            border_fill_id: 1,
+            ..Default::default()
+        }
+    }
+
+    /// 답변 칸 두 개가 위아래로 이어지는 최소 문서.
+    fn doc(above: &[&str], below: &[&str]) -> DocumentCore {
+        let mut d = DocumentCore::new_empty();
+        let mut table = Table::default();
+        table.row_count = 2;
+        table.col_count = 3;
+        table.cells = vec![cell(0, above), cell(1, below)];
+        let mut p = Paragraph::default();
+        p.controls.push(Control::Table(Box::new(table)));
+        d.document.sections.push(Default::default());
+        d.document.sections[0].paragraphs.push(p);
+        d
+    }
+
+    fn orphans(d: &DocumentCore) -> Vec<String> {
+        let mut findings = Vec::new();
+        let mut scan = super::LintScan::default();
+        d.lint_orphan_heading(&mut findings, &mut scan);
+        assert_eq!(scan.cell_seams, 1, "이음매를 못 찾았으면 검사가 죽은 것이다");
+        findings
+            .iter()
+            .filter(|f| f.code == "heading-orphaned-at-cell-end")
+            .map(|f| f.message.clone())
+            .collect()
+    }
+
+    #[test]
+    fn section_heading_left_alone_is_reported() {
+        let d = doc(&["◦ 앞 내용", "□ 문서 호환성 검증 결과"], &["◦ 사내 실무 문서 표본으로 검증함"]);
+        let got = orphans(&d);
+        assert_eq!(got.len(), 1, "□ 표제가 칸 끝에 혼자 남았는데 안 잡혔다: {got:?}");
+        assert!(got[0].contains("문서 호환성"), "{got:?}");
+    }
+
+    #[test]
+    fn item_heading_whose_children_are_overleaf_is_reported() {
+        let d = doc(&["□ 절", "◦ 경쟁 분석"], &["- 코난테크놀로지·솔트룩스", "- 올거나이즈"]);
+        assert_eq!(orphans(&d).len(), 1, "◦ 표제의 - 자식이 다음 쪽인데 안 잡혔다");
+    }
+
+    #[test]
+    fn heading_with_its_content_in_the_same_cell_is_silent() {
+        let d = doc(&["□ 절", "◦ 내용이 같은 칸에 있음"], &["□ 다음 절", "◦ 그 내용"]);
+        assert!(orphans(&d).is_empty(), "정상인데 잡혔다");
+    }
+
+    #[test]
+    fn list_continuing_across_the_page_is_silent() {
+        let d = doc(&["◦ 항목", "- 첫째"], &["- 둘째", "- 셋째"]);
+        assert!(orphans(&d).is_empty(), "쪽을 넘어 이어지는 목록은 표제가 아니다");
+    }
+
+    #[test]
+    fn leaf_item_followed_by_a_figure_is_silent() {
+        // 실제 오탐 사례: `-` 목록이 끝나고 다음 쪽이 그림으로 시작한다.
+        let d = doc(&["◦ 항목", "- 타깃은 업종명이 아니라 구조임"], &[" ", "[그림] 업무 화면 구성안"]);
+        assert!(orphans(&d).is_empty(), "잎 항목은 표제가 아니다: {:?}", orphans(&d));
+    }
+
+    #[test]
+    fn a_long_bullet_sentence_followed_by_prose_is_silent() {
+        // `◦` 는 짧은 표제일 수도, 완결된 서술일 수도 있다. 자식(`-`)이 없으면
+        // 표제로 단정하지 않는다.
+        let d = doc(&["□ 절", "◦ 사내 문서 표본으로 형식별 처리 능력을 검증함"], &["앞에서 본 것처럼 결과는 다음과 같습니다."]);
+        assert!(orphans(&d).is_empty(), "자식 없는 ◦ 를 표제로 단정했다");
     }
 }
