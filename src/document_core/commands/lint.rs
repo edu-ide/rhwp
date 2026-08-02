@@ -78,6 +78,17 @@ fn outline_level(text: &str) -> u8 {
     }
 }
 
+
+/// 쪽 내지(본문이 놓이는) 높이. 셀이 이만큼 크면 그 셀 경계가 곧 쪽 경계다.
+fn page_body_height(sec: &crate::model::document::Section) -> i64 {
+    let pd = &sec.section_def.page_def;
+    pd.height as i64
+        - pd.margin_top as i64
+        - pd.margin_bottom as i64
+        - pd.margin_header as i64
+        - pd.margin_footer as i64
+}
+
 impl DocumentCore {
     /// 문서 전체를 검사해 한컴 호환성 소견을 JSON 으로 돌려준다.
     pub fn lint_native(&self) -> Result<String, crate::error::HwpError> {
@@ -231,6 +242,7 @@ impl DocumentCore {
         let mut scan = LintScan::default();
         self.lint_table_style(&mut findings);
         self.lint_orphan_heading(&mut findings, &mut scan);
+        self.lint_pushed_paragraph(&mut findings, &mut scan);
         self.lint_char_style(&mut findings, &mut scan);
         self.lint_layout(&mut findings, &mut scan);
 
@@ -271,11 +283,18 @@ impl DocumentCore {
         };
 
         for (si, sec) in self.document.sections.iter().enumerate() {
+            let half_page = page_body_height(sec) / 2;
             for (pi, para) in sec.paragraphs.iter().enumerate() {
                 for (ci, ctrl) in para.controls.iter().enumerate() {
                     let Control::Table(t) = ctrl else { continue };
 
                     for above in &t.cells {
+                        // 쪽만큼 큰 칸에서만 셀 경계가 쪽 경계다. 표지의 이름·
+                        // 닉네임 같은 라벨 행은 위아래로 이어져 있어도 쪽을
+                        // 가르지 않으므로 여기서 걸러낸다(실측 오탐).
+                        if (above.height as i64) < half_page {
+                            continue;
+                        }
                         // 바로 아래에서 이어지는 칸: 같은 열·같은 병합 폭이어야
                         // 한 답변 칸의 연속이다. 머리행(병합 폭이 다르다)은
                         // 여기서 자동으로 걸러진다.
@@ -320,6 +339,121 @@ impl DocumentCore {
                                 title
                             ),
                         });
+                    }
+                }
+            }
+        }
+    }
+
+    /// 앞 칸에 자리가 남는데 뒤 칸으로 밀려간 문단을 찾는다.
+    ///
+    /// 소제목 고아의 거울상이다. 답변을 쪽마다 칸으로 쪼갠 뒤 글자 크기·줄간격·
+    /// 문장을 고치면 앞 칸에 **새로 자리가 생기는데**, 쪼갠 자리는 그때 그대로
+    /// 남는다. 그래서 쪽 아래가 다섯 줄쯤 비었는데 같은 목록의 마지막 항목만
+    /// 다음 쪽으로 넘어가 있는 모양이 된다(실측: 사업계획서 Q3 「- 이후 정부
+    /// 조달·바우처와 업종 세미나로 확산」).
+    ///
+    /// 끌어올려도 안전한 것만 짚는다 — 표제를 끌어올려 자식을 두고 오면 방금
+    /// 고친 고아를 새로 만드는 셈이다. 그래서 (a) 표·그림이 든 문단이 아니고
+    /// (b) 뒤에 자식을 남기지 않는 문단만 대상으로 한다.
+    fn lint_pushed_paragraph(&self, findings: &mut Vec<Finding>, scan: &mut LintScan) {
+        let meaningful = |p: &crate::model::paragraph::Paragraph| {
+            !p.text.trim().is_empty() || !p.controls.is_empty()
+        };
+        // ParaShape 는 문단 간격을 HWPUNIT 2배로 저장한다(style_resolver 규약).
+        let space_before = |p: &crate::model::paragraph::Paragraph| -> i64 {
+            self.document
+                .doc_info
+                .para_shapes
+                .get(p.para_shape_id as usize)
+                .map(|ps| ps.spacing_before as i64 / 2)
+                .unwrap_or(0)
+                .max(0)
+        };
+        let para_height = |p: &crate::model::paragraph::Paragraph| -> i64 {
+            space_before(p)
+                + p.line_segs
+                    .iter()
+                    .map(|s| s.line_height as i64 + s.line_spacing as i64)
+                    .sum::<i64>()
+        };
+
+        for (si, sec) in self.document.sections.iter().enumerate() {
+            let half_page = page_body_height(sec) / 2;
+            for (pi, para) in sec.paragraphs.iter().enumerate() {
+                for (ci, ctrl) in para.controls.iter().enumerate() {
+                    let Control::Table(t) = ctrl else { continue };
+
+                    for above in &t.cells {
+                        if (above.height as i64) < half_page {
+                            continue;
+                        }
+                        let Some(below) = t.cells.iter().find(|c| {
+                            c.row == above.row + above.row_span
+                                && c.col == above.col
+                                && c.col_span == above.col_span
+                        }) else {
+                            continue;
+                        };
+
+                        // 앞 칸이 쓰고 남은 높이 (cell-valign-slack 과 같은 셈)
+                        let mut used: i64 = 0;
+                        for cp in &above.paragraphs {
+                            if let Some(last) = cp.line_segs.last() {
+                                used = used.max(
+                                    last.vertical_pos as i64
+                                        + last.line_height as i64
+                                        + last.line_spacing as i64,
+                                );
+                            }
+                        }
+                        used += above.padding.top.max(0) as i64 + above.padding.bottom.max(0) as i64;
+                        let slack = above.height as i64 - used;
+                        if slack <= 0 {
+                            continue;
+                        }
+
+                        let Some((hi, head)) =
+                            below.paragraphs.iter().enumerate().find(|(_, p)| meaningful(p))
+                        else {
+                            continue;
+                        };
+                        // 표·그림이 든 문단은 통째로 움직일 수 없다.
+                        if !head.controls.is_empty() {
+                            continue;
+                        }
+                        let h = para_height(head);
+                        if h == 0 || h > slack {
+                            continue;
+                        }
+                        // 자식을 두고 오면 새 고아가 된다 — 뒤따르는 문단이 더
+                        // 깊은 계층이면 끌어올리지 않는다.
+                        let mine = outline_level(&head.text);
+                        if below
+                            .paragraphs
+                            .iter()
+                            .skip(hi + 1)
+                            .find(|p| meaningful(p))
+                            .map(|n| outline_level(&n.text) > mine)
+                            .unwrap_or(false)
+                        {
+                            continue;
+                        }
+
+                        let title: String = head.text.trim().chars().take(28).collect();
+                        findings.push(Finding {
+                            level: "warn",
+                            code: "paragraph-pushed-despite-room",
+                            location: format!(
+                                "sec{} para{} ctrl{} r{}c{}",
+                                si, pi, ci, above.row, above.col
+                            ),
+                            message: format!(
+                                "앞 칸에 {}HWPU 여유가 있는데 다음 칸 첫 문단 「{}」({}HWPU)이 넘어가 있다 — 앞 칸으로 끌어올릴 것",
+                                slack, title, h
+                            ),
+                        });
+                        let _ = scan;
                     }
                 }
             }
@@ -1126,5 +1260,129 @@ mod orphan_heading_tests {
         // 표제로 단정하지 않는다.
         let d = doc(&["□ 절", "◦ 사내 문서 표본으로 형식별 처리 능력을 검증함"], &["앞에서 본 것처럼 결과는 다음과 같습니다."]);
         assert!(orphans(&d).is_empty(), "자식 없는 ◦ 를 표제로 단정했다");
+    }
+}
+
+#[cfg(test)]
+mod pushed_paragraph_tests {
+    //! 앞 칸에 자리가 남는데 뒤 칸으로 밀려간 문단을 잡는지.
+    //!
+    //! 끌어올려도 **안전한 것만** 짚어야 한다 — 표제를 끌어올려 자식을 두고 오면
+    //! 방금 고친 고아를 새로 만드는 셈이고, 표지의 라벨 행처럼 쪽을 가르지 않는
+    //! 이음매에 대고 말하면 무의미한 소견이 된다(실측 오탐 「이름」).
+    use crate::document_core::DocumentCore;
+    use crate::model::control::Control;
+    use crate::model::paragraph::{LineSeg, Paragraph};
+    use crate::model::table::{Cell, Table};
+
+    const PITCH: i32 = 1860; // 15pt · 줄간격 124%
+    const PAGE: u32 = 67_684;
+
+    /// 한 줄짜리 문단. vpos 는 칸 안 누적 좌표다.
+    fn line(text: &str, vpos: i32) -> Paragraph {
+        Paragraph {
+            text: text.to_string(),
+            line_segs: vec![LineSeg {
+                vertical_pos: vpos,
+                line_height: 1500,
+                line_spacing: 360,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn cell(row: u16, height: u32, texts: &[&str]) -> Cell {
+        Cell {
+            row,
+            col: 0,
+            col_span: 3,
+            row_span: 1,
+            height,
+            paragraphs: texts
+                .iter()
+                .enumerate()
+                .map(|(i, t)| line(t, i as i32 * PITCH))
+                .collect(),
+            border_fill_id: 1,
+            ..Default::default()
+        }
+    }
+
+    fn doc(above: Cell, below: Cell) -> DocumentCore {
+        let mut d = DocumentCore::new_empty();
+        let mut table = Table::default();
+        table.row_count = 2;
+        table.col_count = 3;
+        table.cells = vec![above, below];
+        let mut p = Paragraph::default();
+        p.controls.push(Control::Table(Box::new(table)));
+        let mut sec = crate::model::document::Section::default();
+        sec.section_def.page_def.height = 84_186;
+        sec.section_def.page_def.margin_top = 4_252;
+        sec.section_def.page_def.margin_bottom = 4_252;
+        sec.section_def.page_def.margin_header = 2_835;
+        sec.section_def.page_def.margin_footer = 2_835;
+        sec.paragraphs.push(p);
+        d.document.sections.push(sec);
+        d
+    }
+
+    fn pushed(d: &DocumentCore) -> Vec<String> {
+        let mut findings = Vec::new();
+        let mut scan = super::LintScan::default();
+        d.lint_pushed_paragraph(&mut findings, &mut scan);
+        findings
+            .iter()
+            .filter(|f| f.code == "paragraph-pushed-despite-room")
+            .map(|f| f.message.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_leaf_item_that_fits_in_the_room_above_is_reported() {
+        // 앞 칸은 쪽만큼 크고 두 줄만 썼다 — 뒤 칸 첫 줄이 넉넉히 들어간다.
+        let d = doc(
+            cell(0, PAGE, &["◦ 시장 진입 전략", "- 협회·파트너 채널로 무료 베타 5곳 확보"]),
+            cell(1, PAGE, &["- 이후 정부 조달·바우처로 확산", "□ 추진 일정"]),
+        );
+        let got = pushed(&d);
+        assert_eq!(got.len(), 1, "앞 쪽이 비었는데 밀려간 문단을 못 잡았다: {got:?}");
+        assert!(got[0].contains("정부 조달"), "{got:?}");
+    }
+
+    #[test]
+    fn no_room_above_is_silent() {
+        // 앞 칸이 꽉 찼다 — 끌어올릴 자리가 없다.
+        let texts: Vec<String> = (0..36).map(|i| format!("- 줄 {i}")).collect();
+        let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+        let d = doc(cell(0, PAGE, &refs), cell(1, PAGE, &["- 다음 줄", "□ 다음 절"]));
+        assert!(pushed(&d).is_empty(), "자리가 없는데 올리라고 했다: {:?}", pushed(&d));
+    }
+
+    #[test]
+    fn a_heading_leaving_children_behind_is_silent() {
+        // ◦ 를 끌어올리면 그 - 자식들이 다음 쪽에 남아 새 고아가 된다.
+        let d = doc(
+            cell(0, PAGE, &["□ 절", "◦ 앞 항목"]),
+            cell(1, PAGE, &["◦ 경쟁 분석", "- 코난테크놀로지", "- 올거나이즈"]),
+        );
+        assert!(pushed(&d).is_empty(), "자식을 두고 오는 표제를 올리라고 했다");
+    }
+
+    #[test]
+    fn a_label_row_that_does_not_break_the_page_is_silent() {
+        // 표지의 멘토기관/이름 같은 라벨 행 — 위아래로 이어져도 쪽을 안 가른다.
+        let d = doc(cell(0, 2_331, &["멘토기관"]), cell(1, 2_331, &["이름"]));
+        assert!(pushed(&d).is_empty(), "쪽을 가르지 않는 이음매에 대고 말했다");
+    }
+
+    #[test]
+    fn a_paragraph_holding_a_table_is_silent() {
+        // 표가 든 문단은 통째로 못 움직인다.
+        let mut below = cell(1, PAGE, &["", "□ 다음 절"]);
+        below.paragraphs[0].controls.push(Control::Table(Box::new(Table::default())));
+        let d = doc(cell(0, PAGE, &["◦ 앞 항목"]), below);
+        assert!(pushed(&d).is_empty(), "표가 든 문단을 올리라고 했다");
     }
 }
