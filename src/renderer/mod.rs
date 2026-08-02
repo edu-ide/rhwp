@@ -660,6 +660,23 @@ pub fn px_to_hwpunit(px: f64, dpi: f64) -> i32 {
 ///
 /// 폰트 이름에 명조/바탕/궁서 등 세리프 계열 키워드가 포함되면 "serif",
 /// 그 외에는 "sans-serif"를 반환한다.
+/// SVG/CSS `font-family` 목록을 만든다 — 원본 폰트명은 반드시 **인용**한다.
+///
+/// 「한컴 윤고딕 240」처럼 숫자로 시작하는 낱말이 든 이름을 따옴표 없이
+/// 내보내면, CSS 문법상 그 이름만 버려지는 게 아니라 **선언 전체가 무효**가
+/// 된다(식별자는 숫자로 시작할 수 없다). 그러면 뒤에 세워 둔 'Malgun Gothic'
+/// 폴백 사슬까지 통째로 죽고, usvg 는 기본 Times 로 떨어져 한글을 비상
+/// 폴백(Unifont)으로 그린다 — 그 Unifont 임베딩을 못 그리는 뷰어(PDFium 등)
+/// 에서는 한글이 전부 사라져 「1:1 ?」만 남는다(2026-08-02 활동보고서 PDF 실측).
+/// 브라우저는 관대한 자체 폴백으로 가려 주기 때문에 확장에서는 안 보였다.
+pub fn css_font_list(font_family: &str) -> String {
+    if font_family.is_empty() {
+        return generic_fallback("").to_string();
+    }
+    let quoted = format!("'{}'", font_family.replace('\'', ""));
+    format!("{},{}", quoted, generic_fallback(font_family))
+}
+
 pub fn generic_fallback(font_family: &str) -> &'static str {
     // Task #727 (F-1): sans/serif chain 마지막 단계에 함초롬바탕 family
     // (확장B → 확장 → 일반) 를 끼움. 한컴 자체 PUA 영역 (사각 안 숫자
@@ -1159,5 +1176,30 @@ mod tests {
         assert_eq!(format_number(2, NumberFormat::HangulGaNaDa), "나");
         assert_eq!(format_number(1, NumberFormat::HangulNumber), "일");
         assert_eq!(format_number(12, NumberFormat::HangulNumber), "십이");
+    }
+}
+
+#[cfg(test)]
+mod css_font_list_tests {
+    use super::css_font_list;
+
+    #[test]
+    fn a_name_with_a_digit_word_is_quoted() {
+        // 「한컴 윤고딕 240」 — 무인용이면 CSS 선언 전체가 무효가 되어
+        // 폴백 사슬까지 죽는다 (활동보고서 PDF 「1:1 ?」 실측).
+        let got = css_font_list("한컴 윤고딕 240");
+        assert!(got.starts_with("'한컴 윤고딕 240',"), "{got}");
+        assert!(got.contains("'Malgun Gothic'"), "{got}");
+    }
+
+    #[test]
+    fn empty_name_falls_back_to_the_generic_chain() {
+        assert!(css_font_list("").starts_with("'Malgun Gothic'"));
+    }
+
+    #[test]
+    fn a_quote_inside_the_name_cannot_break_out() {
+        let got = css_font_list("bad'name");
+        assert!(got.starts_with("'badname',"), "{got}");
     }
 }

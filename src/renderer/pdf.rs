@@ -41,6 +41,9 @@ pub fn svg_to_pdf(svg_content: &str) -> Result<Vec<u8>, String> {
     let fontdb = create_fontdb();
     let mut options = usvg::Options::default();
     options.fontdb = std::sync::Arc::new(fontdb);
+    // 해석 불가한 font-family 의 기본값 — usvg 기본(Times)은 한글이 없어
+    // 비상 폴백(Unifont)으로 떨어지고, 그 임베딩을 PDFium 계열이 못 그린다.
+    options.font_family = "맑은 고딕".to_string();
     let svg_with_fallback = add_font_fallbacks(svg_content);
     let tree = usvg::Tree::from_str(&svg_with_fallback, &options)
         .map_err(|e| format!("SVG 파싱 실패: {}", e))?;
@@ -69,6 +72,7 @@ pub fn svgs_to_pdf(svg_pages: &[String]) -> Result<Vec<u8>, String> {
     let fontdb = create_fontdb();
     let mut options = usvg::Options::default();
     options.fontdb = std::sync::Arc::new(fontdb);
+    options.font_family = "맑은 고딕".to_string();
 
     let mut alloc = Ref::new(1);
     let catalog_ref = alloc.bump();

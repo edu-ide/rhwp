@@ -313,12 +313,7 @@ impl SvgRenderer {
                     } else {
                         12.0
                     };
-                    let font_family = if run.style.font_family.is_empty() {
-                        "sans-serif".to_string()
-                    } else {
-                        let fb = super::generic_fallback(&run.style.font_family);
-                        format!("{},{}", run.style.font_family, fb)
-                    };
+                    let font_family = super::css_font_list(&run.style.font_family);
                     let mut attrs = format!("font-family=\"{}\" font-size=\"{}\" fill=\"{}\" text-anchor=\"middle\" dominant-baseline=\"central\"",
                         escape_xml(&font_family), font_size, color);
                     if run.style.is_visually_bold() {
@@ -1961,12 +1956,7 @@ impl SvgRenderer {
         let stroke_color: &str = if is_reversed { "#000000" } else { &glyph_color };
         let text_color: &str = if is_reversed { "#FFFFFF" } else { &glyph_color };
 
-        let font_family_str = if style.font_family.is_empty() {
-            "sans-serif".to_string()
-        } else {
-            let fb = super::generic_fallback(&style.font_family);
-            format!("{},{}", style.font_family, fb)
-        };
+        let font_family_str = super::css_font_list(&style.font_family);
         let mut font_attrs = format!(
             "font-family=\"{}\" font-size=\"{:.2}\"",
             escape_xml(&font_family_str),
@@ -2105,12 +2095,7 @@ impl SvgRenderer {
         let stroke_color: &str = if is_reversed { "#000000" } else { &glyph_color };
         let text_color: &str = if is_reversed { "#FFFFFF" } else { &glyph_color };
 
-        let font_family_str = if style.font_family.is_empty() {
-            "sans-serif".to_string()
-        } else {
-            let fb = super::generic_fallback(&style.font_family);
-            format!("{},{}", style.font_family, fb)
-        };
+        let font_family_str = super::css_font_list(&style.font_family);
         let mut font_attrs = format!(
             "font-family=\"{}\" font-size=\"{:.2}\"",
             escape_xml(&font_family_str),
@@ -2668,12 +2653,7 @@ impl Renderer for SvgRenderer {
         } else {
             12.0
         };
-        let font_family = if style.font_family.is_empty() {
-            "sans-serif".to_string()
-        } else {
-            let fb = super::generic_fallback(&style.font_family);
-            format!("{},{}", style.font_family, fb)
-        };
+        let font_family = super::css_font_list(&style.font_family);
 
         let ratio = if style.ratio > 0.0 { style.ratio } else { 1.0 };
         let has_ratio = (ratio - 1.0).abs() > 0.01;
