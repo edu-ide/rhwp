@@ -35,7 +35,7 @@ export type EvidenceAxisNote = {
   sources: EvidenceSource[];
 };
 
-export type EvidenceAiReview = { verdict: string; reason: string; kept_sources: number[] };
+export type EvidenceAiReview = { verdict: string; reason: string; kept_sources: number[]; span_before?: number; span_after?: number };
 
 export type EvidenceNote = {
   sentence: string;
@@ -160,28 +160,41 @@ export class EvidenceNotesOverlay {
     this.notes = notes;
     let shown = 0;
     let unmapped = 0;
-    // 문장마다 배지를 붙이면 문서가 배지로 뒤덮인다 — 같은 판정의 연속
-    // 줄은 하나의 구간 노트로 병합한다: 줄마다 색 띠, 구간당 배지 1개.
-    type Entry = { note: EvidenceNote; line: LineBox; idx: number };
+    // 문장마다 배지를 붙이면 문서가 배지로 뒤덮인다 — 구간으로 병합한다.
+    // 구간의 경계는 하이브리드다: 규칙(같은 판정·같은 문단·연속 줄)이
+    // 기본이고, AI 재심이 "같은 주장"이라고 지정한 이웃(span)은 판정이
+    // 달라도 한 구간으로 묶는다 — 주장의 의미 단위는 규칙만으로 못 본다.
+    type Entry = { note: EvidenceNote; line: LineBox; idx: number; noteIdx: number };
     const entries: Entry[] = [];
-    for (const note of notes) {
+    notes.forEach((note, noteIdx) => {
       const line = this.locate(note.sentence);
       if (!line) {
         unmapped++;
-        continue;
+        return;
       }
-      entries.push({ note, line, idx: this.lines.indexOf(line) });
+      entries.push({ note, line, idx: this.lines.indexOf(line), noteIdx });
       shown++;
-    }
+    });
     entries.sort((a, b) => a.idx - b.idx);
+    const aiLinked = (a: Entry, b: Entry): boolean => {
+      // 노트 순서 기준 서로 이웃 — 어느 한쪽의 span 이 상대를 포함하면 연결.
+      const d = b.noteIdx - a.noteIdx;
+      if (d < 1 || d > 2) return false;
+      const fwd = a.note.ai_review?.span_after ?? 0;
+      const bwd = b.note.ai_review?.span_before ?? 0;
+      return fwd >= d || bwd >= d;
+    };
     let i = 0;
     while (i < entries.length) {
       let j = i;
       while (
         j + 1 < entries.length &&
-        entries[j + 1].note.verdict === entries[i].note.verdict &&
         entries[j + 1].line.page === entries[i].line.page &&
-        entries[j + 1].idx - entries[j].idx <= 1
+        entries[j + 1].idx - entries[j].idx <= 1 &&
+        ((entries[j + 1].note.verdict === entries[i].note.verdict &&
+          entries[j + 1].line.pi === entries[i].line.pi &&
+          entries[j + 1].line.block === entries[i].line.block) ||
+          aiLinked(entries[j], entries[j + 1]))
       ) j++;
       this.segment(entries.slice(i, j + 1));
       i = j + 1;
@@ -190,9 +203,15 @@ export class EvidenceNotesOverlay {
   }
 
   /** 구간(같은 판정의 연속 줄) 하나를 그린다 — 줄 띠 + 배지 1개. */
-  private segment(entries: { note: EvidenceNote; line: LineBox; idx: number }[]): void {
+  private segment(entries: { note: EvidenceNote; line: LineBox; idx: number; noteIdx?: number }[]): void {
     const first = entries[0];
-    const verdict = first.note.verdict;
+    // 구간 대표 판정은 가장 위험한 등급 — AI 가 묶은 혼합 구간에서 초록이
+    // 빨강을 가리면 안 된다.
+    const RANK: Record<string, number> = { 숫자불일치: 0, 근거불명: 1, 양식문구: 2, 근거확보: 3 };
+    const verdict = entries.reduce(
+      (worst, e) => ((RANK[e.note.verdict] ?? 9) < (RANK[worst] ?? 9) ? e.note.verdict : worst),
+      first.note.verdict,
+    );
     const layer = this.layer(first.line.page);
     const zoom = this.viewportManager.getZoom();
     const color = VERDICT_COLOR[verdict] ?? '#64748b';
