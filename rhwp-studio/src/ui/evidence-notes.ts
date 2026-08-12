@@ -140,16 +140,71 @@ export class EvidenceNotesOverlay {
     this.notes = notes;
     let shown = 0;
     let unmapped = 0;
+    // 문장마다 배지를 붙이면 문서가 배지로 뒤덮인다 — 같은 판정의 연속
+    // 줄은 하나의 구간 노트로 병합한다: 줄마다 색 띠, 구간당 배지 1개.
+    type Entry = { note: EvidenceNote; line: LineBox; idx: number };
+    const entries: Entry[] = [];
     for (const note of notes) {
       const line = this.locate(note.sentence);
       if (!line) {
         unmapped++;
         continue;
       }
-      this.badge(line, note);
+      entries.push({ note, line, idx: this.lines.indexOf(line) });
       shown++;
     }
+    entries.sort((a, b) => a.idx - b.idx);
+    let i = 0;
+    while (i < entries.length) {
+      let j = i;
+      while (
+        j + 1 < entries.length &&
+        entries[j + 1].note.verdict === entries[i].note.verdict &&
+        entries[j + 1].line.page === entries[i].line.page &&
+        entries[j + 1].idx - entries[j].idx <= 1
+      ) j++;
+      this.segment(entries.slice(i, j + 1));
+      i = j + 1;
+    }
     return { shown, unmapped };
+  }
+
+  /** 구간(같은 판정의 연속 줄) 하나를 그린다 — 줄 띠 + 배지 1개. */
+  private segment(entries: { note: EvidenceNote; line: LineBox; idx: number }[]): void {
+    const first = entries[0];
+    const verdict = first.note.verdict;
+    const layer = this.layer(first.line.page);
+    const zoom = this.viewportManager.getZoom();
+    const color = VERDICT_COLOR[verdict] ?? '#64748b';
+
+    const seenIdx = new Set<number>();
+    for (const { line, idx } of entries) {
+      if (seenIdx.has(idx)) continue;
+      seenIdx.add(idx);
+      const band = document.createElement('div');
+      band.className = 'evidence-note-band';
+      band.style.cssText = `position:absolute;left:${line.x * zoom}px;top:${line.y * zoom}px;` +
+        `width:${line.w * zoom}px;height:${line.h * zoom}px;` +
+        `background:${VERDICT_BG[verdict] ?? 'transparent'};border-left:3px solid ${color};` +
+        `pointer-events:none;border-radius:2px;`;
+      layer.appendChild(band);
+    }
+
+    const dot = document.createElement('button');
+    dot.className = 'evidence-note-dot';
+    dot.type = 'button';
+    dot.title = entries.length > 1 ? `${verdict} · 문장 ${entries.length}개` : verdict;
+    dot.setAttribute('aria-label', dot.title);
+    dot.textContent = verdict === '숫자불일치' ? '!' : verdict === '근거불명' ? '?' : verdict === '양식문구' ? '§' : '✓';
+    dot.style.cssText = `position:absolute;left:${Math.max(2, first.line.x * zoom - 22)}px;top:${first.line.y * zoom}px;` +
+      `width:16px;height:16px;border-radius:8px;border:none;cursor:pointer;` +
+      `background:${color};color:#fff;font-size:11px;line-height:16px;text-align:center;` +
+      `pointer-events:auto;padding:0;`;
+    dot.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      this.openPopover(dot, entries.map((e) => e.note));
+    });
+    layer.appendChild(dot);
   }
 
   /** 문장 → 첫 줄. 감사기가 전문을 그대로 잘랐으므로 indexOf 가 1차 수단이다. */
@@ -214,36 +269,7 @@ export class EvidenceNotesOverlay {
     el.dataset.zoom = String(zoom);
   }
 
-  private badge(line: LineBox, note: EvidenceNote): void {
-    const layer = this.layer(line.page);
-    const zoom = this.viewportManager.getZoom();
-    const color = VERDICT_COLOR[note.verdict] ?? '#64748b';
-
-    const band = document.createElement('div');
-    band.className = 'evidence-note-band';
-    band.style.cssText = `position:absolute;left:${line.x * zoom}px;top:${line.y * zoom}px;` +
-      `width:${line.w * zoom}px;height:${line.h * zoom}px;` +
-      `background:${VERDICT_BG[note.verdict] ?? 'transparent'};border-left:3px solid ${color};` +
-      `pointer-events:none;border-radius:2px;`;
-    layer.appendChild(band);
-
-    const dot = document.createElement('button');
-    dot.className = 'evidence-note-dot';
-    dot.type = 'button';
-    dot.title = note.verdict;
-    dot.textContent = note.verdict === '숫자불일치' ? '!' : note.verdict === '근거불명' ? '?' : '✓';
-    dot.style.cssText = `position:absolute;left:${Math.max(2, line.x * zoom - 22)}px;top:${line.y * zoom}px;` +
-      `width:16px;height:16px;border-radius:8px;border:none;cursor:pointer;` +
-      `background:${color};color:#fff;font-size:11px;line-height:16px;text-align:center;` +
-      `pointer-events:auto;padding:0;`;
-    dot.addEventListener('click', (ev) => {
-      ev.stopPropagation();
-      this.openPopover(dot, note);
-    });
-    layer.appendChild(dot);
-  }
-
-  private openPopover(anchor: HTMLElement, note: EvidenceNote): void {
+  private openPopover(anchor: HTMLElement, notes: EvidenceNote[]): void {
     this.closePopover();
     const pop = document.createElement('div');
     pop.className = 'evidence-note-popover';
@@ -251,7 +277,6 @@ export class EvidenceNotesOverlay {
       'position:fixed;z-index:9999;max-width:380px;max-height:320px;overflow:auto;' +
       'background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:10px 12px;' +
       'box-shadow:0 8px 24px rgba(15,23,42,0.18);font-size:12px;color:#334155;';
-    const color = VERDICT_COLOR[note.verdict];
     const renderSources = (sources: EvidenceSource[]) =>
       sources.length
         ? sources
@@ -264,40 +289,65 @@ export class EvidenceNotesOverlay {
             .join('')
         : '<div style="color:#94a3b8;margin-top:4px;">접점이 있는 출처를 찾지 못했습니다.</div>';
 
-    let body: string;
-    if (note.verdict === '양식문구') {
-      // 양식 제공 문구 — 작성자의 주장이 아니므로 사실 감사 대상이 아니다.
-      body =
-        '<div style="color:#64748b;margin-top:4px;">양식이 제공한 문구입니다 — 작성 내용 감사 대상이 아닙니다.</div>' +
-        renderSources(note.sources);
-    } else if (note.axes && note.axes.length > 0) {
-      // 다축: 축마다 판정과 출처를 구분해 보여 준다 (내용 축 / 양식 축).
-      body = note.axes
-        .map((ax) => {
-          const axColor = VERDICT_COLOR[ax.verdict] ?? '#334155';
-          const nums = ax.unsupported_numbers.length
-            ? `<div style="color:#dc2626;margin-top:2px;">확인되지 않은 수치: ${ax.unsupported_numbers.join(', ')}</div>`
-            : '';
-          return (
-            `<div style="margin-top:8px;padding-top:6px;border-top:1px solid #f1f5f9;">` +
-            `<div><span style="font-weight:700;color:#475569;">[${escapeHtml(ax.axis)}]</span> ` +
-            `<span style="font-weight:700;color:${axColor};">${ax.verdict}</span></div>` +
-            nums +
-            renderSources(ax.sources) +
-            `</div>`
-          );
-        })
-        .join('');
-    } else {
+    const noteBody = (note: EvidenceNote): string => {
+      if (note.verdict === '양식문구') {
+        // 양식 제공 문구 — 작성자의 주장이 아니므로 사실 감사 대상이 아니다.
+        return (
+          '<div style="color:#64748b;margin-top:4px;">양식이 제공한 문구입니다 — 작성 내용 감사 대상이 아닙니다.</div>' +
+          renderSources(note.sources)
+        );
+      }
+      if (note.axes && note.axes.length > 0) {
+        // 다축: 축마다 판정과 출처를 구분해 보여 준다 (내용 축 / 양식 축).
+        return note.axes
+          .map((ax) => {
+            const axColor = VERDICT_COLOR[ax.verdict] ?? '#334155';
+            const nums = ax.unsupported_numbers.length
+              ? `<div style="color:#dc2626;margin-top:2px;">확인되지 않은 수치: ${ax.unsupported_numbers.join(', ')}</div>`
+              : '';
+            return (
+              `<div style="margin-top:8px;padding-top:6px;border-top:1px solid #f1f5f9;">` +
+              `<div><span style="font-weight:700;color:#475569;">[${escapeHtml(ax.axis)}]</span> ` +
+              `<span style="font-weight:700;color:${axColor};">${ax.verdict}</span></div>` +
+              nums +
+              renderSources(ax.sources) +
+              `</div>`
+            );
+          })
+          .join('');
+      }
       const numbers = note.unsupported_numbers.length
         ? `<div style="color:#dc2626;margin-top:4px;">원문에서 확인되지 않은 수치: ${note.unsupported_numbers.join(', ')}</div>`
         : '';
-      body = numbers + renderSources(note.sources);
-    }
+      return numbers + renderSources(note.sources);
+    };
+
+    // 구간 노트: 첫 문장은 근거까지 전부, 나머지 문장은 접어서(요약 줄로)
+    // 보여 준다 — 구간이 길어도 팝오버가 문서만큼 길어지지 않는다.
+    const first = notes[0];
+    const color = VERDICT_COLOR[first.verdict];
+    const MAX_LISTED = 8;
+    const rest = notes.slice(1, 1 + MAX_LISTED);
+    const restHtml = rest
+      .map((n) => {
+        const nums = n.unsupported_numbers.length
+          ? ` <span style="color:#dc2626;">(미확인: ${n.unsupported_numbers.join(', ')})</span>`
+          : '';
+        return `<li style="margin-top:2px;color:#475569;">${escapeHtml(n.sentence)}${nums}</li>`;
+      })
+      .join('');
+    const moreCount = notes.length - 1 - rest.length;
     pop.innerHTML =
-      `<div style="font-weight:700;color:${color};">${note.verdict}</div>` +
-      `<div style="margin-top:4px;">${escapeHtml(note.sentence)}</div>` +
-      body;
+      `<div style="font-weight:700;color:${color};">${first.verdict}` +
+      (notes.length > 1 ? `<span style="margin-left:6px;font-weight:400;font-size:10.5px;color:#94a3b8;">문장 ${notes.length}개 구간</span>` : '') +
+      `</div>` +
+      `<div style="margin-top:4px;">${escapeHtml(first.sentence)}</div>` +
+      noteBody(first) +
+      (rest.length
+        ? `<div style="margin-top:8px;padding-top:6px;border-top:1px solid #f1f5f9;font-weight:600;color:#64748b;">같은 구간의 문장</div>` +
+          `<ul style="margin:2px 0 0 14px;padding:0;">${restHtml}</ul>` +
+          (moreCount > 0 ? `<div style="margin-top:2px;color:#94a3b8;">…외 ${moreCount}건</div>` : '')
+        : '');
     document.body.appendChild(pop);
     const rect = anchor.getBoundingClientRect();
     pop.style.left = `${Math.min(rect.right + 8, window.innerWidth - 400)}px`;
