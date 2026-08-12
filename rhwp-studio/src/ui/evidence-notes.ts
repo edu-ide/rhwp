@@ -50,7 +50,7 @@ export type EvidenceNote = {
   ai_review?: EvidenceAiReview;
 };
 
-type LineBox = { page: number; x: number; y: number; w: number; h: number; text: string; start: number; block: number; pi: number };
+type LineBox = { page: number; x: number; y: number; w: number; h: number; text: string; start: number; block: number; pi: number; cell?: boolean };
 
 const VERDICT_COLOR: Record<EvidenceNote['verdict'], string> = {
   숫자불일치: '#dc2626',
@@ -77,6 +77,7 @@ export class EvidenceNotesOverlay {
   private unsubscribe: (() => void) | null = null;
   private visible = true;
   private blockSeq = 0;
+  private cellDepth = 0;
 
   constructor(
     private scrollContent: HTMLElement,
@@ -94,6 +95,7 @@ export class EvidenceNotesOverlay {
   collect(): { text: string; lineCount: number; pageCount: number } {
     this.lines = [];
     this.blockSeq = 0;
+    this.cellDepth = 0;
     const pageCount = this.wasm.pageCount;
     for (let p = 0; p < pageCount; p++) {
       const tree = this.wasm.getPageRenderTree(p);
@@ -111,7 +113,12 @@ export class EvidenceNotesOverlay {
       parts.push(line.text);
       const next = this.lines[i + 1];
       const samePara = !!next && next.block === line.block && next.pi === line.pi && next.page === line.page;
-      parts.push(samePara ? ' ' : '\n');
+      // 표의 같은 행: 셀이 달라도(block 증가) 수직 대역이 겹치면 한 행의
+      // 칸들이다 — "전환율 60%" 같은 셀 파편이 문맥 없이 감사되어 오탐이
+      // 나던 것을, 행 전체를 한 문장으로 이어 해소한다.
+      const sameTableRow = !!next && !samePara && line.cell && next.cell && next.page === line.page
+        && Math.abs(next.y - line.y) < Math.min(line.h, next.h) * 0.6;
+      parts.push(samePara || sameTableRow ? ' ' : '\n');
       offset += line.text.length + 1;
     });
     this.fullText = parts.join('').replace(/[\s\n]$/, '');
@@ -130,7 +137,7 @@ export class EvidenceNotesOverlay {
       const text = this.lineText(n).trim();
       if (text) {
         const pi = typeof n.pi === 'number' ? n.pi : -1;
-        this.lines.push({ page, x: b.x, y: b.y, w: b.w, h: b.h, text, start: 0, block: this.blockSeq, pi });
+        this.lines.push({ page, x: b.x, y: b.y, w: b.w, h: b.h, text, start: 0, block: this.blockSeq, pi, cell: this.cellDepth > 0 });
       }
       return;
     }
@@ -139,9 +146,12 @@ export class EvidenceNotesOverlay {
     if (n.type === 'Cell' || n.type === 'Header' || n.type === 'Footer') {
       this.blockSeq++;
     }
+    const isCell = n.type === 'Cell';
+    if (isCell) this.cellDepth++;
     for (const key of ['children', 'nodes']) {
       if (key in n) this.walk(n[key], page);
     }
+    if (isCell) this.cellDepth--;
   }
 
   private lineText(node: unknown): string {
