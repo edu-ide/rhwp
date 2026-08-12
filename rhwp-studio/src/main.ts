@@ -4,6 +4,7 @@ import { EventBus } from '@/core/event-bus';
 import { CanvasView } from '@/view/canvas-view';
 import { InputHandler } from '@/engine/input-handler';
 import { Toolbar } from '@/ui/toolbar';
+import { EvidenceNotesOverlay, type EvidenceNote } from '@/ui/evidence-notes';
 import { MenuBar } from '@/ui/menu-bar';
 import { loadWebFonts } from '@/core/font-loader';
 import { loadExtensionViewerSettings, type ExtensionViewerSettings } from '@/core/extension-settings';
@@ -74,6 +75,7 @@ if (import.meta.env.DEV) {
   initRhwpDev(wasm);
 }
 let canvasView: CanvasView | null = null;
+let evidenceOverlay: EvidenceNotesOverlay | null = null;
 let inputHandler: InputHandler | null = null;
 let toolbar: Toolbar | null = null;
 let ruler: Ruler | null = null;
@@ -205,6 +207,14 @@ async function initialize(): Promise<void> {
       renderBackend,
       renderProfile,
       canvaskitRenderer,
+    );
+
+    evidenceOverlay = new EvidenceNotesOverlay(
+      document.getElementById('scroll-content')!,
+      wasm,
+      canvasView.getVirtualScroll(),
+      canvasView.getViewportManager(),
+      eventBus,
     );
 
     // 눈금자 초기화
@@ -1159,6 +1169,25 @@ window.addEventListener('message', async (e) => {
           canUndo: inputHandler?.canUndo() ?? false,
           canRedo: inputHandler?.canRedo() ?? false,
         });
+        break;
+      }
+      case 'evidenceCollect': {
+        await initPromise;
+        if (!evidenceOverlay) { reply(undefined, '오버레이가 준비되지 않았습니다'); break; }
+        reply(evidenceOverlay.collect());
+        break;
+      }
+      case 'evidenceShow': {
+        await initPromise;
+        if (!evidenceOverlay) { reply(undefined, '오버레이가 준비되지 않았습니다'); break; }
+        const notes = Array.isArray(params?.notes) ? (params.notes as EvidenceNote[]) : [];
+        reply(evidenceOverlay.show(notes));
+        break;
+      }
+      case 'evidenceClear': {
+        await initPromise;
+        evidenceOverlay?.clear();
+        reply({ ok: true });
         break;
       }
       case 'openCommandPalette': {

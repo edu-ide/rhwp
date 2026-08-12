@@ -495,6 +495,12 @@ export class WasmBridge {
     return '';
   }
 
+  /** 페이지 렌더 트리(JSON) — 줄/셀 bbox 를 그대로 노출한다 (근거 노트 오버레이용). */
+  getPageRenderTree(pageNum: number): unknown {
+    if (!this.doc) throw new Error('문서가 로드되지 않았습니다');
+    return JSON.parse(this.doc.getPageRenderTree(pageNum));
+  }
+
   renderPageSvg(pageNum: number): string {
     if (!this.doc) throw new Error('문서가 로드되지 않았습니다');
     return this.doc.renderPageSvg(pageNum);
