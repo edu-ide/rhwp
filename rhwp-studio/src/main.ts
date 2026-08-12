@@ -1195,6 +1195,24 @@ window.addEventListener('message', async (e) => {
         reply({ ok: true });
         break;
       }
+      case 'evidenceHighlightSource': {
+        await initPromise;
+        if (!evidenceOverlay) { reply({ ok: false }); break; }
+        const q = params as { snippet?: string; page?: number } | undefined;
+        const res = q?.snippet ? evidenceOverlay.highlightSnippet(q.snippet) : { ok: false, matched: 0, page: null };
+        // 스니펫을 못 찾으면 쪽 번호로라도 이동한다 — 열어 놓고 침묵하지 않는다.
+        if (!res.ok && typeof q?.page === 'number' && q.page > 0) {
+          evidenceOverlay.scrollToPage(q.page);
+        }
+        reply(res);
+        break;
+      }
+      case 'evidenceScrollToPage': {
+        await initPromise;
+        const page = Number((params as { page?: number } | undefined)?.page ?? 0);
+        reply(evidenceOverlay ? evidenceOverlay.scrollToPage(page) : { ok: false });
+        break;
+      }
       case 'evidenceSetVisible': {
         await initPromise;
         const visible = Boolean((params as { visible?: boolean } | undefined)?.visible);

@@ -320,13 +320,17 @@ export class EvidenceNotesOverlay {
       'position:fixed;z-index:9999;max-width:380px;max-height:320px;overflow:auto;' +
       'background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:10px 12px;' +
       'box-shadow:0 8px 24px rgba(15,23,42,0.18);font-size:12px;color:#334155;';
+    // 출처 줄은 링크다 — 클릭하면 부모 앱이 그 원문 파일을 연다(임베드
+    // 환경에서만 의미가 있으므로 postMessage 로 올려 보낸다).
     const renderSources = (sources: EvidenceSource[]) =>
       sources.length
         ? sources
             .map(
               (s) =>
                 `<div style="margin-top:6px;padding:6px;border-radius:6px;background:#f8fafc;">` +
-                `<div style="font-weight:600;color:#475569;">${escapeHtml(s.source_path)} · ${escapeHtml(s.locator)}</div>` +
+                `<div class="evidence-source-link" data-path="${escapeHtml(s.source_path)}" data-locator="${escapeHtml(s.locator)}" ` +
+                `data-snippet="${escapeHtml(s.text.slice(0, 500))}" ` +
+                `style="font-weight:600;color:#2563eb;cursor:pointer;" title="원문 열기 — 근거 부분을 강조해 보여 줍니다">${escapeHtml(s.source_path)} · ${escapeHtml(s.locator)} ↗</div>` +
                 `<div style="margin-top:2px;color:#64748b;white-space:pre-wrap;">${escapeHtml(s.text)}</div></div>`,
             )
             .join('')
@@ -397,6 +401,20 @@ export class EvidenceNotesOverlay {
           (moreCount > 0 ? `<div style="margin-top:2px;color:#94a3b8;">…외 ${moreCount}건</div>` : '')
         : '');
     document.body.appendChild(pop);
+    pop.querySelectorAll<HTMLElement>('.evidence-source-link').forEach((link) => {
+      link.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        window.parent?.postMessage(
+          {
+            type: 'ilhae:evidence-open-source',
+            path: link.dataset.path,
+            locator: link.dataset.locator,
+            snippet: link.dataset.snippet,
+          },
+          '*',
+        );
+      });
+    });
     const rect = anchor.getBoundingClientRect();
     pop.style.left = `${Math.min(rect.right + 8, window.innerWidth - 400)}px`;
     pop.style.top = `${Math.min(rect.top, window.innerHeight - 340)}px`;
@@ -413,6 +431,56 @@ export class EvidenceNotesOverlay {
   private closePopover(): void {
     this.popover?.remove();
     this.popover = null;
+  }
+
+  /**
+   * 출처 스니펫이 가리키는 줄들을 찾아 강조하고 그 자리로 스크롤한다.
+   *
+   * 근거 노트의 역방향이다: 노트의 출처 링크로 원문을 열었을 때 "어느
+   * 부분이 근거였는가"를 원문 위에 그대로 보여 준다. 강조는 8초 뒤
+   * 서서히 걷는다 — 원문 읽기를 방해하지 않는다.
+   */
+  highlightSnippet(snippet: string): { ok: boolean; matched: number; page: number | null } {
+    if (!this.lines.length) this.collect();
+    const squish = (s: string) => s.replace(/\s+/g, '');
+    const hay = squish(snippet);
+    if (hay.length < 6) return { ok: false, matched: 0, page: null };
+    const hits = this.lines.filter((line) => {
+      const t = squish(line.text);
+      if (t.length < 6) return false;
+      // 줄이 스니펫 안에 있거나(짧은 줄), 스니펫 머리가 줄 안에 있거나(긴 줄).
+      return hay.includes(t) || t.includes(hay.slice(0, 24));
+    });
+    if (!hits.length) return { ok: false, matched: 0, page: null };
+    const page = hits[0].page;
+    const onPage = hits.filter((h) => h.page === page);
+    const zoom = this.viewportManager.getZoom();
+    const layer = this.layer(page);
+    const marks: HTMLElement[] = [];
+    for (const line of onPage) {
+      const mark = document.createElement('div');
+      mark.className = 'evidence-source-flash';
+      mark.style.cssText =
+        `position:absolute;left:${line.x * zoom - 2}px;top:${line.y * zoom - 2}px;` +
+        `width:${line.w * zoom + 4}px;height:${line.h * zoom + 4}px;` +
+        `background:rgba(250,204,21,0.32);outline:2px solid #f59e0b;border-radius:3px;` +
+        `pointer-events:none;transition:opacity 1.2s ease;`;
+      layer.appendChild(mark);
+      marks.push(mark);
+    }
+    const y = this.virtualScroll.getPageOffset(page) + onPage[0].y * zoom;
+    this.viewportManager.setScrollTop(Math.max(0, y - 120));
+    window.setTimeout(() => marks.forEach((m) => (m.style.opacity = '0')), 8000);
+    window.setTimeout(() => marks.forEach((m) => m.remove()), 9500);
+    return { ok: true, matched: onPage.length, page };
+  }
+
+  /** 지정한 쪽(0부터)으로 스크롤한다 — 출처 링크로 문서를 열 때 쓴다. */
+  scrollToPage(pageIdx: number): { ok: boolean } {
+    const y = this.virtualScroll.getPageOffset(Math.max(0, pageIdx));
+    if (!Number.isFinite(y)) return { ok: false };
+    this.viewportManager.setScrollTop(Math.max(0, y - 24));
+    return { ok: true };
   }
 
   /** 줌이 바뀌면 저장된 노트로 전부 다시 그린다. */
