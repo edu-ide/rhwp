@@ -39,7 +39,7 @@ export type EvidenceAiReview = { verdict: string; reason: string; kept_sources: 
 
 export type EvidenceNote = {
   sentence: string;
-  verdict: '근거확보' | '근거불명' | '숫자불일치' | '양식문구';
+  verdict: '근거확보' | '근거불명' | '숫자불일치' | '양식문구' | '구조문구';
   /** "작성"(작성자가 쓴 줄) | "양식"(양식 제공 문구) — 구버전 감사기는 생략. */
   origin?: '작성' | '양식';
   unsupported_numbers: string[];
@@ -57,6 +57,7 @@ const VERDICT_COLOR: Record<EvidenceNote['verdict'], string> = {
   근거불명: '#d97706',
   근거확보: '#059669',
   양식문구: '#64748b',
+  구조문구: '#94a3b8',
 };
 
 const VERDICT_BG: Record<EvidenceNote['verdict'], string> = {
@@ -64,6 +65,7 @@ const VERDICT_BG: Record<EvidenceNote['verdict'], string> = {
   근거불명: 'rgba(217,119,6,0.10)',
   근거확보: 'rgba(5,150,105,0.08)',
   양식문구: 'rgba(100,116,139,0.08)',
+  구조문구: 'transparent',
 };
 
 export class EvidenceNotesOverlay {
@@ -170,7 +172,7 @@ export class EvidenceNotesOverlay {
       // 양식 제공 문구는 작성자의 주장이 아니다 — 감사에서 빠졌다는 표시를
       // 문서 위에 배지로 남기는 것 자체가 소음이라, 요약 카운트로만 남기고
       // 오버레이에는 그리지 않는다.
-      if (note.verdict === '양식문구') return;
+      if (note.verdict === '양식문구' || note.verdict === '구조문구') return;
       const line = this.locate(note.sentence);
       if (!line) {
         unmapped++;
