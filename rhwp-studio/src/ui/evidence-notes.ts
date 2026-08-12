@@ -28,11 +28,22 @@ export type EvidenceSource = {
   score: number;
 };
 
-export type EvidenceNote = {
-  sentence: string;
+export type EvidenceAxisNote = {
+  axis: string;
   verdict: '근거확보' | '근거불명' | '숫자불일치';
   unsupported_numbers: string[];
   sources: EvidenceSource[];
+};
+
+export type EvidenceNote = {
+  sentence: string;
+  verdict: '근거확보' | '근거불명' | '숫자불일치' | '양식문구';
+  /** "작성"(작성자가 쓴 줄) | "양식"(양식 제공 문구) — 구버전 감사기는 생략. */
+  origin?: '작성' | '양식';
+  unsupported_numbers: string[];
+  sources: EvidenceSource[];
+  /** 다축 감사일 때 축별 대조 결과 (양식 축 등). */
+  axes?: EvidenceAxisNote[];
 };
 
 type LineBox = { page: number; x: number; y: number; w: number; h: number; text: string; start: number };
@@ -41,12 +52,14 @@ const VERDICT_COLOR: Record<EvidenceNote['verdict'], string> = {
   숫자불일치: '#dc2626',
   근거불명: '#d97706',
   근거확보: '#059669',
+  양식문구: '#64748b',
 };
 
 const VERDICT_BG: Record<EvidenceNote['verdict'], string> = {
   숫자불일치: 'rgba(220,38,38,0.10)',
   근거불명: 'rgba(217,119,6,0.10)',
   근거확보: 'rgba(5,150,105,0.08)',
+  양식문구: 'rgba(100,116,139,0.08)',
 };
 
 export class EvidenceNotesOverlay {
@@ -239,24 +252,52 @@ export class EvidenceNotesOverlay {
       'background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:10px 12px;' +
       'box-shadow:0 8px 24px rgba(15,23,42,0.18);font-size:12px;color:#334155;';
     const color = VERDICT_COLOR[note.verdict];
-    const numbers = note.unsupported_numbers.length
-      ? `<div style="color:#dc2626;margin-top:4px;">원문에서 확인되지 않은 수치: ${note.unsupported_numbers.join(', ')}</div>`
-      : '';
-    const sources = note.sources.length
-      ? note.sources
-          .map(
-            (s) =>
-              `<div style="margin-top:6px;padding:6px;border-radius:6px;background:#f8fafc;">` +
-              `<div style="font-weight:600;color:#475569;">${escapeHtml(s.source_path)} · ${escapeHtml(s.locator)}</div>` +
-              `<div style="margin-top:2px;color:#64748b;white-space:pre-wrap;">${escapeHtml(s.text)}</div></div>`,
-          )
-          .join('')
-      : '<div style="color:#94a3b8;margin-top:4px;">대조할 출처를 찾지 못했습니다.</div>';
+    const renderSources = (sources: EvidenceSource[]) =>
+      sources.length
+        ? sources
+            .map(
+              (s) =>
+                `<div style="margin-top:6px;padding:6px;border-radius:6px;background:#f8fafc;">` +
+                `<div style="font-weight:600;color:#475569;">${escapeHtml(s.source_path)} · ${escapeHtml(s.locator)}</div>` +
+                `<div style="margin-top:2px;color:#64748b;white-space:pre-wrap;">${escapeHtml(s.text)}</div></div>`,
+            )
+            .join('')
+        : '<div style="color:#94a3b8;margin-top:4px;">접점이 있는 출처를 찾지 못했습니다.</div>';
+
+    let body: string;
+    if (note.verdict === '양식문구') {
+      // 양식 제공 문구 — 작성자의 주장이 아니므로 사실 감사 대상이 아니다.
+      body =
+        '<div style="color:#64748b;margin-top:4px;">양식이 제공한 문구입니다 — 작성 내용 감사 대상이 아닙니다.</div>' +
+        renderSources(note.sources);
+    } else if (note.axes && note.axes.length > 0) {
+      // 다축: 축마다 판정과 출처를 구분해 보여 준다 (내용 축 / 양식 축).
+      body = note.axes
+        .map((ax) => {
+          const axColor = VERDICT_COLOR[ax.verdict] ?? '#334155';
+          const nums = ax.unsupported_numbers.length
+            ? `<div style="color:#dc2626;margin-top:2px;">확인되지 않은 수치: ${ax.unsupported_numbers.join(', ')}</div>`
+            : '';
+          return (
+            `<div style="margin-top:8px;padding-top:6px;border-top:1px solid #f1f5f9;">` +
+            `<div><span style="font-weight:700;color:#475569;">[${escapeHtml(ax.axis)}]</span> ` +
+            `<span style="font-weight:700;color:${axColor};">${ax.verdict}</span></div>` +
+            nums +
+            renderSources(ax.sources) +
+            `</div>`
+          );
+        })
+        .join('');
+    } else {
+      const numbers = note.unsupported_numbers.length
+        ? `<div style="color:#dc2626;margin-top:4px;">원문에서 확인되지 않은 수치: ${note.unsupported_numbers.join(', ')}</div>`
+        : '';
+      body = numbers + renderSources(note.sources);
+    }
     pop.innerHTML =
       `<div style="font-weight:700;color:${color};">${note.verdict}</div>` +
       `<div style="margin-top:4px;">${escapeHtml(note.sentence)}</div>` +
-      numbers +
-      sources;
+      body;
     document.body.appendChild(pop);
     const rect = anchor.getBoundingClientRect();
     pop.style.left = `${Math.min(rect.right + 8, window.innerWidth - 400)}px`;
