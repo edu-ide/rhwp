@@ -35,6 +35,8 @@ export type EvidenceAxisNote = {
   sources: EvidenceSource[];
 };
 
+export type EvidenceAiReview = { verdict: string; reason: string; kept_sources: number[] };
+
 export type EvidenceNote = {
   sentence: string;
   verdict: '근거확보' | '근거불명' | '숫자불일치' | '양식문구';
@@ -44,6 +46,8 @@ export type EvidenceNote = {
   sources: EvidenceSource[];
   /** 다축 감사일 때 축별 대조 결과 (양식 축 등). */
   axes?: EvidenceAxisNote[];
+  /** AI 재심 소견 — 규칙이 검증한 후보 안에서 로컬 LLM이 고른 결과. */
+  ai_review?: EvidenceAiReview;
 };
 
 type LineBox = { page: number; x: number; y: number; w: number; h: number; text: string; start: number; block: number; pi: number };
@@ -353,11 +357,16 @@ export class EvidenceNotesOverlay {
       })
       .join('');
     const moreCount = notes.length - 1 - rest.length;
+    const aiBadge = first.ai_review
+      ? `<div style="margin-top:6px;padding:6px 8px;border-radius:6px;background:#eef2ff;color:#4338ca;font-size:11px;">` +
+        `<b>AI 재심(로컬):</b> ${escapeHtml(first.ai_review.verdict)} — ${escapeHtml(first.ai_review.reason)}</div>`
+      : '';
     pop.innerHTML =
       `<div style="font-weight:700;color:${color};">${first.verdict}` +
       (notes.length > 1 ? `<span style="margin-left:6px;font-weight:400;font-size:10.5px;color:#94a3b8;">문장 ${notes.length}개 구간</span>` : '') +
       `</div>` +
       `<div style="margin-top:4px;">${escapeHtml(first.sentence)}</div>` +
+      aiBadge +
       noteBody(first) +
       (rest.length
         ? `<div style="margin-top:8px;padding-top:6px;border-top:1px solid #f1f5f9;font-weight:600;color:#64748b;">같은 구간의 문장</div>` +
