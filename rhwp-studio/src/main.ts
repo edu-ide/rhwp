@@ -803,6 +803,11 @@ async function loadBytes(
 }
 
 function shouldSkipInitialAutosaveRecovery(): boolean {
+  // iframe 임베드(데스크톱 뷰어·office-mcp)는 호스트가 무엇을 열지
+  // 결정한다 — 빈 화면 복구 제안은 스탠드얼론에서만 의미가 있다.
+  // 임베드에서 띄우면 파일이 로드되기 직전의 idle 틈마다 다이얼로그가
+  // 끼어들고, '나중에'는 복구본을 보존하므로 열 때마다 다시 뜬다.
+  if (window.parent !== window) return true;
   const params = new URLSearchParams(window.location.search);
   return params.has('url');
 }
