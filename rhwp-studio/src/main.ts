@@ -1190,6 +1190,12 @@ window.addEventListener('message', async (e) => {
         reply({ ok: true });
         break;
       }
+      case 'evidenceSetVisible': {
+        await initPromise;
+        const visible = Boolean((params as { visible?: boolean } | undefined)?.visible);
+        reply(evidenceOverlay ? evidenceOverlay.setVisible(visible) : { visible: false });
+        break;
+      }
       case 'openCommandPalette': {
         await initPromise;
         const palette = (inputHandler as any)?.commandPalette;

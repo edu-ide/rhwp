@@ -56,6 +56,7 @@ export class EvidenceNotesOverlay {
   private notes: EvidenceNote[] = [];
   private popover: HTMLElement | null = null;
   private unsubscribe: (() => void) | null = null;
+  private visible = true;
 
   constructor(
     private scrollContent: HTMLElement,
@@ -171,6 +172,10 @@ export class EvidenceNotesOverlay {
     el.dataset.page = String(page);
     el.style.position = 'absolute';
     el.style.pointerEvents = 'none';
+    // 가상 스크롤러가 스크롤 중 페이지 캔버스를 나중 형제로 재부착하므로,
+    // z-index 없이는 배지가 캔버스 밑에 깔린다.
+    el.style.zIndex = '30';
+    el.style.display = this.visible ? 'block' : 'none';
     this.scrollContent.appendChild(el);
     this.layers[page] = el;
     this.placeLayer(page);
@@ -283,7 +288,20 @@ export class EvidenceNotesOverlay {
     this.closePopover();
     for (const layer of this.layers) layer?.remove();
     this.layers = [];
-    if (reset) this.notes = [];
+    if (reset) {
+      this.notes = [];
+      this.visible = true;
+    }
+  }
+
+  /** 감사 결과를 버리지 않고 배지만 보이거나 숨긴다 (재감사 없는 토글용). */
+  setVisible(visible: boolean): { visible: boolean } {
+    this.visible = visible;
+    if (!visible) this.closePopover();
+    for (const layer of this.layers) {
+      if (layer) layer.style.display = visible ? 'block' : 'none';
+    }
+    return { visible };
   }
 
   destroy(): void {
