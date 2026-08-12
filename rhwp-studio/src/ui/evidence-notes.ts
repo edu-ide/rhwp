@@ -167,6 +167,10 @@ export class EvidenceNotesOverlay {
     type Entry = { note: EvidenceNote; line: LineBox; idx: number; noteIdx: number };
     const entries: Entry[] = [];
     notes.forEach((note, noteIdx) => {
+      // 양식 제공 문구는 작성자의 주장이 아니다 — 감사에서 빠졌다는 표시를
+      // 문서 위에 배지로 남기는 것 자체가 소음이라, 요약 카운트로만 남기고
+      // 오버레이에는 그리지 않는다.
+      if (note.verdict === '양식문구') return;
       const line = this.locate(note.sentence);
       if (!line) {
         unmapped++;
