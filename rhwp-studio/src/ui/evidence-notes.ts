@@ -46,7 +46,7 @@ export type EvidenceNote = {
   axes?: EvidenceAxisNote[];
 };
 
-type LineBox = { page: number; x: number; y: number; w: number; h: number; text: string; start: number };
+type LineBox = { page: number; x: number; y: number; w: number; h: number; text: string; start: number; block: number; pi: number };
 
 const VERDICT_COLOR: Record<EvidenceNote['verdict'], string> = {
   숫자불일치: '#dc2626',
@@ -70,6 +70,7 @@ export class EvidenceNotesOverlay {
   private popover: HTMLElement | null = null;
   private unsubscribe: (() => void) | null = null;
   private visible = true;
+  private blockSeq = 0;
 
   constructor(
     private scrollContent: HTMLElement,
@@ -86,19 +87,28 @@ export class EvidenceNotesOverlay {
   /** 전 페이지 렌더 트리에서 줄 텍스트·좌표를 모으고 감사용 전문을 돌려준다. */
   collect(): { text: string; lineCount: number; pageCount: number } {
     this.lines = [];
+    this.blockSeq = 0;
     const pageCount = this.wasm.pageCount;
     for (let p = 0; p < pageCount; p++) {
       const tree = this.wasm.getPageRenderTree(p);
       this.walk(tree, p);
     }
+    // 줄바꿈은 문장 경계가 아니다 — 같은 문단(pi)의 줄들은 공백으로 잇고,
+    // 문단이 바뀔 때만 개행을 넣는다. 줄 단위로 끊으면 "전환하라는 방향을
+    // 받음" 같은 문장 조각이 각각 감사되어 근거불명으로 쏠린다는 것이
+    // 실측으로 드러났다. (블록(block)은 표 셀·머리글마다 증가해, 다른
+    // 셀의 같은 pi 가 한 문단으로 붙는 것을 막는다.)
     let offset = 0;
     const parts: string[] = [];
-    for (const line of this.lines) {
+    this.lines.forEach((line, i) => {
       line.start = offset;
       parts.push(line.text);
-      offset += line.text.length + 1; // '\n'
-    }
-    this.fullText = parts.join('\n');
+      const next = this.lines[i + 1];
+      const samePara = !!next && next.block === line.block && next.pi === line.pi && next.page === line.page;
+      parts.push(samePara ? ' ' : '\n');
+      offset += line.text.length + 1;
+    });
+    this.fullText = parts.join('').replace(/[\s\n]$/, '');
     return { text: this.fullText, lineCount: this.lines.length, pageCount };
   }
 
@@ -113,9 +123,15 @@ export class EvidenceNotesOverlay {
       const b = n.bbox as Record<string, number>;
       const text = this.lineText(n).trim();
       if (text) {
-        this.lines.push({ page, x: b.x, y: b.y, w: b.w, h: b.h, text, start: 0 });
+        const pi = typeof n.pi === 'number' ? n.pi : -1;
+        this.lines.push({ page, x: b.x, y: b.y, w: b.w, h: b.h, text, start: 0, block: this.blockSeq, pi });
       }
       return;
+    }
+    // 표 셀·머리글·꼬리글은 별개 텍스트 블록이다 — 문단 인덱스(pi)가 셀마다
+    // 0부터 다시 시작하므로, 블록 경계를 넘어 문단을 잇지 않는다.
+    if (n.type === 'Cell' || n.type === 'Header' || n.type === 'Footer') {
+      this.blockSeq++;
     }
     for (const key of ['children', 'nodes']) {
       if (key in n) this.walk(n[key], page);
