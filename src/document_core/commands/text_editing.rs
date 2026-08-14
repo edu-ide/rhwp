@@ -3556,6 +3556,21 @@ impl DocumentCore {
 
         // 리플로우 (최외곽 표 기준 — 중첩 표 셀 폭은 별도 계산이 필요하나 우선 section dirty로 처리)
         self.document.sections[section_idx].raw_stream = None;
+        // 편집한 셀 문단의 LineSeg 재계산.
+        //
+        // section dirty 만으로는 저장된 LineSeg 가 그대로 남는다. 텍스트가
+        // 짧아진 문단이 예전 줄 수만큼 자리를 차지해 앞쪽에 빈 줄이 생기고,
+        // 그림을 넣은 문단은 줄 높이가 모자라 그림이 그려지지 않는다.
+        // `reflow_cell_paragraph_by_path` 는 중첩 표 셀 폭까지 계산한다.
+        if let Some(&(_, reflow_cell, reflow_para)) = path.last() {
+            self.reflow_cell_paragraph_by_path(
+                section_idx,
+                parent_para_idx,
+                &path[..path.len() - 1],
+                reflow_cell,
+                reflow_para,
+            );
+        }
         self.mark_section_dirty(section_idx);
         self.paginate_if_needed();
 
@@ -3587,6 +3602,21 @@ impl DocumentCore {
         let outer_ctrl = path[0].0;
         self.mark_cell_control_dirty(section_idx, parent_para_idx, outer_ctrl);
         self.document.sections[section_idx].raw_stream = None;
+        // 편집한 셀 문단의 LineSeg 재계산.
+        //
+        // section dirty 만으로는 저장된 LineSeg 가 그대로 남는다. 텍스트가
+        // 짧아진 문단이 예전 줄 수만큼 자리를 차지해 앞쪽에 빈 줄이 생기고,
+        // 그림을 넣은 문단은 줄 높이가 모자라 그림이 그려지지 않는다.
+        // `reflow_cell_paragraph_by_path` 는 중첩 표 셀 폭까지 계산한다.
+        if let Some(&(_, reflow_cell, reflow_para)) = path.last() {
+            self.reflow_cell_paragraph_by_path(
+                section_idx,
+                parent_para_idx,
+                &path[..path.len() - 1],
+                reflow_cell,
+                reflow_para,
+            );
+        }
         self.mark_section_dirty(section_idx);
         self.paginate_if_needed();
 
@@ -3653,6 +3683,21 @@ impl DocumentCore {
         let outer_ctrl = path[0].0;
         self.mark_cell_control_dirty(section_idx, parent_para_idx, outer_ctrl);
         self.document.sections[section_idx].raw_stream = None;
+        // 편집한 셀 문단의 LineSeg 재계산.
+        //
+        // section dirty 만으로는 저장된 LineSeg 가 그대로 남는다. 텍스트가
+        // 짧아진 문단이 예전 줄 수만큼 자리를 차지해 앞쪽에 빈 줄이 생기고,
+        // 그림을 넣은 문단은 줄 높이가 모자라 그림이 그려지지 않는다.
+        // `reflow_cell_paragraph_by_path` 는 중첩 표 셀 폭까지 계산한다.
+        if let Some(&(_, reflow_cell, reflow_para)) = path.last() {
+            self.reflow_cell_paragraph_by_path(
+                section_idx,
+                parent_para_idx,
+                &path[..path.len() - 1],
+                reflow_cell,
+                reflow_para,
+            );
+        }
         self.mark_section_dirty(section_idx);
         self.paginate_if_needed();
 
@@ -3723,6 +3768,21 @@ impl DocumentCore {
         let outer_ctrl = path[0].0;
         self.mark_cell_control_dirty(section_idx, parent_para_idx, outer_ctrl);
         self.document.sections[section_idx].raw_stream = None;
+        // 편집한 셀 문단의 LineSeg 재계산.
+        //
+        // section dirty 만으로는 저장된 LineSeg 가 그대로 남는다. 텍스트가
+        // 짧아진 문단이 예전 줄 수만큼 자리를 차지해 앞쪽에 빈 줄이 생기고,
+        // 그림을 넣은 문단은 줄 높이가 모자라 그림이 그려지지 않는다.
+        // `reflow_cell_paragraph_by_path` 는 중첩 표 셀 폭까지 계산한다.
+        if let Some(&(_, reflow_cell, reflow_para)) = path.last() {
+            self.reflow_cell_paragraph_by_path(
+                section_idx,
+                parent_para_idx,
+                &path[..path.len() - 1],
+                reflow_cell,
+                reflow_para,
+            );
+        }
         self.mark_section_dirty(section_idx);
         self.paginate_if_needed();
 

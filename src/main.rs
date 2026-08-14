@@ -413,11 +413,12 @@ fn print_help() {
     println!();
     println!("  set-cell-text <파일.hwp> --para N --ctrl N (--cell N|--row N --col N) [--cell-para N] --text <텍스트> -o <출력.hwp>");
     println!("      표 셀 문단 텍스트를 직접 교체");
+    println!("      * --cell-path 는 표 안의 표(중첩 표) 셀까지 지정한다: [[표ctrl,셀,셀문단],[안쪽표ctrl,셀,셀문단]]");
     println!();
-    println!("  insert-cell-text <파일.hwp> --para N --ctrl N (--cell N|--row N --col N) [--cell-para N] --offset N --text <텍스트> -o <출력.hwp>");
+    println!("  insert-cell-text <파일.hwp> --para N [--ctrl N (--cell N|--row N --col N) [--cell-para N] | --cell-path <JSON>] --offset N --text <텍스트> -o <출력.hwp>");
     println!("      표 셀 문단의 지정 문자 오프셋에 텍스트를 삽입");
     println!();
-    println!("  delete-cell-text <파일.hwp> --para N --ctrl N (--cell N|--row N --col N) [--cell-para N] --offset N --count N -o <출력.hwp>");
+    println!("  delete-cell-text <파일.hwp> --para N [--ctrl N (--cell N|--row N --col N) [--cell-para N] | --cell-path <JSON>] --offset N --count N -o <출력.hwp>");
     println!("      표 셀 문단의 지정 문자 범위를 삭제");
     println!();
     println!("  insert-cell-paragraph <파일.hwp> --para N --ctrl N (--cell N|--row N --col N) --cell-para N [--text <텍스트>] -o <출력.hwp>");
@@ -427,10 +428,10 @@ fn print_help() {
     println!("      표 셀 내부 문단을 삭제");
     println!();
     println!("  move-cell-paragraphs <파일.hwp> --para N --ctrl N --from-row R --from-col C --start N --end N --to-row R --to-col C [--at N] -o <출력.hwp>");
-    println!("  split-cell-paragraph <파일.hwp> --para N --ctrl N (--cell N|--row N --col N) [--cell-para N] --offset N -o <출력.hwp>");
+    println!("  split-cell-paragraph <파일.hwp> --para N [--ctrl N (--cell N|--row N --col N) [--cell-para N] | --cell-path <JSON>] --offset N -o <출력.hwp>");
     println!("      표 셀 내부 문단을 문자 오프셋에서 분할");
     println!();
-    println!("  merge-cell-paragraph <파일.hwp> --para N --ctrl N (--cell N|--row N --col N) --cell-para N -o <출력.hwp>");
+    println!("  merge-cell-paragraph <파일.hwp> --para N [--ctrl N (--cell N|--row N --col N) --cell-para N | --cell-path <JSON>] -o <출력.hwp>");
     println!("      표 셀 내부 문단을 이전 셀 문단에 병합");
     println!();
     println!("  set-cell-field <파일.hwp> --para N --ctrl N (--cell N|--row N --col N) --name <필드명> -o <출력.hwp>");
@@ -3568,6 +3569,78 @@ fn add_cell_text_edit_details(
         }
     }
     value.to_string()
+}
+
+/// 중첩 표 셀 텍스트 삽입 (cellPath 경로형).
+///
+/// `--cell/--row/--col` 은 본문 문단 바로 아래 표 1단계만 지정할 수 있어
+/// 표 안의 표(중첩 표) 셀에는 닿지 않는다. core 는 `*_by_path` 로 다단계
+/// 경로를 이미 지원하므로 CLI 에서도 같은 경로를 받는다.
+fn insert_hwp_cell_text_by_path_bytes_for_cli(
+    data: &[u8],
+    table_para_idx: usize,
+    cell_path_json: &str,
+    char_offset: usize,
+    text: &str,
+) -> Result<HwpEditCliResult, String> {
+    let path = parse_cell_path_for_cli(cell_path_json)?;
+    if path.is_empty() {
+        return Err("--cell-path 가 비어 있습니다.".to_string());
+    }
+    edit_hwp_table_structure_bytes_for_cli(data, "insert-cell-text", |core| {
+        let details = core
+            .insert_text_in_cell_by_path(0, table_para_idx, &path, char_offset, text)
+            .map_err(|e| format!("셀 텍스트 삽입 실패: {}", e))?;
+        Ok(details)
+    })
+}
+
+/// 중첩 표 셀 텍스트 삭제 (cellPath 경로형).
+fn delete_hwp_cell_text_by_path_bytes_for_cli(
+    data: &[u8],
+    table_para_idx: usize,
+    cell_path_json: &str,
+    char_offset: usize,
+    count: usize,
+) -> Result<HwpEditCliResult, String> {
+    let path = parse_cell_path_for_cli(cell_path_json)?;
+    if path.is_empty() {
+        return Err("--cell-path 가 비어 있습니다.".to_string());
+    }
+    edit_hwp_table_structure_bytes_for_cli(data, "delete-cell-text", |core| {
+        let details = core
+            .delete_text_in_cell_by_path(0, table_para_idx, &path, char_offset, count)
+            .map_err(|e| format!("셀 텍스트 삭제 실패: {}", e))?;
+        Ok(details)
+    })
+}
+
+/// 중첩 표 셀 문단 나눔/합침 (cellPath 경로형).
+fn cell_paragraph_by_path_bytes_for_cli(
+    data: &[u8],
+    table_para_idx: usize,
+    cell_path_json: &str,
+    char_offset: usize,
+    merge: bool,
+) -> Result<HwpEditCliResult, String> {
+    let path = parse_cell_path_for_cli(cell_path_json)?;
+    if path.is_empty() {
+        return Err("--cell-path 가 비어 있습니다.".to_string());
+    }
+    let op = if merge {
+        "merge-cell-paragraph"
+    } else {
+        "split-cell-paragraph"
+    };
+    edit_hwp_table_structure_bytes_for_cli(data, op, |core| {
+        let details = if merge {
+            core.merge_paragraph_in_cell_by_path(0, table_para_idx, &path)
+        } else {
+            core.split_paragraph_in_cell_by_path(0, table_para_idx, &path, char_offset)
+        }
+        .map_err(|e| format!("셀 문단 처리 실패: {}", e))?;
+        Ok(details)
+    })
 }
 
 fn insert_hwp_cell_text_bytes_for_cli(
@@ -10659,6 +10732,7 @@ fn cell_text_edit_cli(args: &[String], delete: bool) {
     let mut row: Option<String> = None;
     let mut col: Option<String> = None;
     let mut cell_para: Option<String> = Some("0".to_string());
+    let mut cell_path: Option<String> = None;
     let mut offset: Option<String> = None;
     let mut count: Option<String> = None;
     let mut inline_text: Option<String> = None;
@@ -10710,6 +10784,13 @@ fn cell_text_edit_cli(args: &[String], delete: bool) {
                 }
                 cell_para = Some(args[i].clone());
             }
+            "--cell-path" => {
+                i += 1;
+                if i >= args.len() {
+                    exit_cli_error("--cell-path 뒤에 JSON 문자열이 필요합니다.");
+                }
+                cell_path = Some(args[i].clone());
+            }
             "--offset" => {
                 i += 1;
                 if i >= args.len() {
@@ -10751,8 +10832,17 @@ fn cell_text_edit_cli(args: &[String], delete: bool) {
     }
 
     let para = parse_usize_cli(para, "--para");
-    let ctrl = parse_usize_cli(ctrl, "--ctrl");
-    let cell_para = parse_usize_cli(cell_para, "--cell-para");
+    // --cell-path 는 경로에 ctrl/셀/셀문단이 모두 들어 있어 개별 인자가 필요 없다.
+    let ctrl = if cell_path.is_some() {
+        0
+    } else {
+        parse_usize_cli(ctrl, "--ctrl")
+    };
+    let cell_para = if cell_path.is_some() {
+        0
+    } else {
+        parse_usize_cli(cell_para, "--cell-para")
+    };
     let offset = parse_usize_cli(offset, "--offset");
     let output = output_path.unwrap_or_else(|| input.clone());
     let data = fs::read(&input)
@@ -10776,6 +10866,17 @@ fn cell_text_edit_cli(args: &[String], delete: bool) {
             insert_hwp_cell_text_by_position_bytes_for_cli(
                 &data, para, ctrl, row, col, cell_para, offset, &text,
             )
+        }
+    } else if let Some(path_json) = cell_path.clone() {
+        // 중첩 표 경로 지정 — --cell/--row/--col 대신 다단계 경로 사용
+        if delete {
+            let count = parse_usize_cli(count, "--count");
+            delete_hwp_cell_text_by_path_bytes_for_cli(&data, para, &path_json, offset, count)
+        } else {
+            let text = read_optional_text_argument(inline_text, text_file)
+                .unwrap_or_else(|e| exit_cli_error(&e))
+                .unwrap_or_else(|| exit_cli_error("--text 또는 --text-file 값이 필요합니다."));
+            insert_hwp_cell_text_by_path_bytes_for_cli(&data, para, &path_json, offset, &text)
         }
     } else {
         let cell = parse_usize_cli(cell, "--cell");
@@ -10809,6 +10910,7 @@ fn cell_paragraph_cli(args: &[String], merge: bool) {
     let mut row: Option<String> = None;
     let mut col: Option<String> = None;
     let mut cell_para: Option<String> = if merge { None } else { Some("0".to_string()) };
+    let mut cell_path: Option<String> = None;
     let mut offset: Option<String> = None;
     let mut output_path: Option<String> = None;
 
@@ -10857,6 +10959,13 @@ fn cell_paragraph_cli(args: &[String], merge: bool) {
                 }
                 cell_para = Some(args[i].clone());
             }
+            "--cell-path" => {
+                i += 1;
+                if i >= args.len() {
+                    exit_cli_error("--cell-path 뒤에 JSON 문자열이 필요합니다.");
+                }
+                cell_path = Some(args[i].clone());
+            }
             "--offset" if !merge => {
                 i += 1;
                 if i >= args.len() {
@@ -10877,8 +10986,8 @@ fn cell_paragraph_cli(args: &[String], merge: bool) {
     }
 
     let para = parse_usize_cli(para, "--para");
-    let ctrl = parse_usize_cli(ctrl, "--ctrl");
-    let cell_para = parse_usize_cli(cell_para, "--cell-para");
+    let ctrl = if cell_path.is_some() { 0 } else { parse_usize_cli(ctrl, "--ctrl") };
+    let cell_para = if cell_path.is_some() { 0 } else { parse_usize_cli(cell_para, "--cell-para") };
     let output = output_path.unwrap_or_else(|| input.clone());
     let data = fs::read(&input)
         .unwrap_or_else(|e| exit_cli_error(&format!("파일 읽기 실패 - {}: {}", input, e)));
@@ -10899,6 +11008,14 @@ fn cell_paragraph_cli(args: &[String], merge: bool) {
                 &data, para, ctrl, row, col, cell_para, offset,
             )
         }
+    } else if let Some(path_json) = cell_path.clone() {
+        // 중첩 표 경로 지정
+        let split_offset = if merge {
+            0
+        } else {
+            parse_usize_cli(offset, "--offset")
+        };
+        cell_paragraph_by_path_bytes_for_cli(&data, para, &path_json, split_offset, merge)
     } else {
         let cell = parse_usize_cli(cell, "--cell");
         if merge {
