@@ -3820,6 +3820,42 @@ impl DocumentCore {
         let end = (char_offset + count).min(total);
         Ok(text_chars[char_offset..end].iter().collect())
     }
+
+    /// 셀(중첩 표 포함) 안 모든 문단의 글자 수와 텍스트를 JSON 으로 반환한다.
+    ///
+    /// `--offset` / `--count` 를 눈대중으로 넘기면 옆 문단이 잘려 나간다.
+    /// 편집 전에 문단별 실제 길이를 확인할 수 있도록 한 번에 제공한다.
+    /// `path` 마지막 항목의 문단 인덱스는 무시하고 전체를 나열한다.
+    pub fn get_cell_paragraphs_by_path(
+        &self,
+        section_idx: usize,
+        parent_para_idx: usize,
+        path: &[(usize, usize, usize)],
+    ) -> Result<String, HwpError> {
+        if path.is_empty() {
+            return Err(HwpError::RenderError("경로가 비어있습니다".to_string()));
+        }
+        let count = self.resolve_container_para_count_by_path(section_idx, parent_para_idx, path)?;
+        let mut items = Vec::with_capacity(count);
+        let mut probe = path.to_vec();
+        for idx in 0..count {
+            if let Some(last) = probe.last_mut() {
+                last.2 = idx;
+            }
+            let para = self.resolve_paragraph_by_path(section_idx, parent_para_idx, &probe)?;
+            items.push(serde_json::json!({
+                "index": idx,
+                "length": para.text.chars().count(),
+                "text": para.text,
+            }));
+        }
+        let out = serde_json::json!({
+            "ok": true,
+            "paragraphCount": count,
+            "paragraphs": items,
+        });
+        Ok(out.to_string())
+    }
 }
 
 #[cfg(test)]

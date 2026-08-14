@@ -86,6 +86,7 @@ fn main() {
         Some("merge-table-cells") => table_structure_cli(&args[2..], "merge-table-cells"),
         Some("split-table-cell") => table_structure_cli(&args[2..], "split-table-cell"),
         Some("get-cell-properties") => get_table_properties_cli(&args[2..], true),
+        Some("get-cell-text") => get_cell_text_cli(&args[2..]),
         Some("set-cell-properties") => set_table_properties_cli(&args[2..], true),
         Some("get-table-properties") => get_table_properties_cli(&args[2..], false),
         Some("set-table-properties") => set_table_properties_cli(&args[2..], false),
@@ -472,6 +473,11 @@ fn print_help() {
     println!();
     println!("  get-cell-properties <파일.hwp> --section N --para N --ctrl N --cell N");
     println!("      표 셀 속성을 JSON으로 조회");
+    println!();
+    println!("  get-cell-text <파일.hwp> --para N [--ctrl N --cell N | --cell-path <JSON>]");
+    println!("      셀 안 문단의 글자 수와 텍스트를 조회 (중첩 표 포함)");
+    println!("      * 편집 명령의 --offset/--count 를 눈대중으로 넘기면 옆 문단이 잘린다.");
+    println!("        먼저 이 명령으로 문단별 실제 길이를 확인할 것");
     println!();
     println!("  set-cell-properties <파일.hwp> --section N --para N --ctrl N --cell N --json <속성JSON> -o <출력.hwp>");
     println!("      표 셀 폭/높이/패딩/정렬/보호/테두리/채우기 속성을 직접 수정");
@@ -11665,6 +11671,81 @@ fn table_structure_cli(args: &[String], operation: &str) {
             "pageCountAfter": result.page_count_after,
         })
     );
+}
+
+/// 셀 안 문단의 글자 수와 텍스트를 조회한다 (중첩 표 포함).
+///
+/// 편집 명령의 `--offset` / `--count` 를 정확히 계산하기 위한 읽기 전용
+/// 명령. 길이를 눈대중으로 넘겨 옆 문단이 잘려 나가는 사고를 막는다.
+fn get_cell_text_cli(args: &[String]) {
+    if args.is_empty() {
+        exit_cli_error(
+            "사용법: rhwp get-cell-text <파일.hwp> --para N [--ctrl N --cell N | --cell-path <JSON>]",
+        );
+    }
+    let input = args[0].clone();
+    let mut para: Option<String> = None;
+    let mut ctrl: Option<String> = None;
+    let mut cell: Option<String> = None;
+    let mut cell_path: Option<String> = None;
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--para" => {
+                i += 1;
+                if i >= args.len() {
+                    exit_cli_error("--para 뒤에 값이 필요합니다.");
+                }
+                para = Some(args[i].clone());
+            }
+            "--ctrl" => {
+                i += 1;
+                if i >= args.len() {
+                    exit_cli_error("--ctrl 뒤에 값이 필요합니다.");
+                }
+                ctrl = Some(args[i].clone());
+            }
+            "--cell" => {
+                i += 1;
+                if i >= args.len() {
+                    exit_cli_error("--cell 뒤에 값이 필요합니다.");
+                }
+                cell = Some(args[i].clone());
+            }
+            "--cell-path" => {
+                i += 1;
+                if i >= args.len() {
+                    exit_cli_error("--cell-path 뒤에 JSON 문자열이 필요합니다.");
+                }
+                cell_path = Some(args[i].clone());
+            }
+            other => exit_cli_error(&format!("알 수 없는 옵션: {}", other)),
+        }
+        i += 1;
+    }
+
+    let para = parse_usize_cli(para, "--para");
+    let data = std::fs::read(&input)
+        .unwrap_or_else(|e| exit_cli_error(&format!("파일 읽기 실패 - {}: {}", input, e)));
+
+    // --cell-path 가 없으면 --ctrl/--cell 로 1 단계 경로를 만든다.
+    let path_json = match cell_path {
+        Some(p) => p,
+        None => {
+            let ctrl = parse_usize_cli(ctrl, "--ctrl");
+            let cell = parse_usize_cli(cell, "--cell");
+            format!("[[{},{},0]]", ctrl, cell)
+        }
+    };
+    let path = parse_cell_path_for_cli(&path_json).unwrap_or_else(|e| exit_cli_error(&e));
+
+    let core = rhwp::document_core::DocumentCore::from_bytes(&data)
+        .unwrap_or_else(|e| exit_cli_error(&format!("HWP 파싱 실패: {}", e)));
+    let out = core
+        .get_cell_paragraphs_by_path(0, para, &path)
+        .unwrap_or_else(|e| exit_cli_error(&format!("셀 문단 조회 실패: {}", e)));
+    println!("{}", out);
 }
 
 fn get_table_properties_cli(args: &[String], is_cell: bool) {
