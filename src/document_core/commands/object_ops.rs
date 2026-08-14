@@ -15,6 +15,39 @@ use crate::model::shape::{common_obj_offsets, CommonObjAttr, ShapeObject};
 const MIN_SHAPE_SIZE: u32 = 200;
 
 impl DocumentCore {
+    /// 이미지 헤더에서 원본 픽셀 크기를 읽는다 (전체 디코딩 없이 헤더만).
+    ///
+    /// `CropInfo` 는 `natural_px * 75` 로 산출된다. natural 크기가 0 이면 crop 이
+    /// (0,0,0,0) 이 되어 렌더러가 원본 좌표계를 알 수 없고, 그림이 확대되어
+    /// 그려진다 (1895x830 PNG 기준 약 4 배). caller 가 크기를 넘기지 않은
+    /// 경우 본 함수로 보충한다.
+    fn probe_natural_size(
+        image_data: &[u8],
+        natural_width_px: u32,
+        natural_height_px: u32,
+        display_width_hu: u32,
+        display_height_hu: u32,
+    ) -> (u32, u32) {
+        if natural_width_px != 0 && natural_height_px != 0 {
+            return (natural_width_px, natural_height_px);
+        }
+        if let Some((w, h)) = image::ImageReader::new(std::io::Cursor::new(image_data))
+            .with_guessed_format()
+            .ok()
+            .and_then(|r| r.into_dimensions().ok())
+        {
+            if w != 0 && h != 0 {
+                return (w, h);
+            }
+        }
+        // 헤더 판독 실패 (미지원 포맷 등): 표시 크기를 원본으로 간주한다.
+        // crop 이 0 이 되어 그림이 사라지는 것보다 낫다.
+        (
+            (display_width_hu / 75).max(1),
+            (display_height_hu / 75).max(1),
+        )
+    }
+
     const COMMON_OBJ_ATTR_KNOWN_MASK: u32 = 0x01
         | (0x03 << 3)
         | (0x07 << 5)
@@ -2499,6 +2532,9 @@ impl DocumentCore {
         use crate::model::image::{CropInfo, ImageAttr, ImageEffect, Picture};
         use crate::model::shape::{CommonObjAttr, HorzRelTo, ShapeComponentAttr, VertRelTo};
 
+        let (natural_width_px, natural_height_px) =
+            Self::probe_natural_size(image_data, natural_width_px, natural_height_px, width, height);
+
         if section_idx >= self.document.sections.len() {
             return Err(HwpError::RenderError(format!(
                 "구역 인덱스 {} 범위 초과",
@@ -3149,6 +3185,10 @@ impl DocumentCore {
         use crate::model::image::{CropInfo, ImageAttr, ImageEffect, Picture};
         use crate::model::paragraph::{CharShapeRef, LineSeg};
         use crate::model::shape::{CommonObjAttr, HorzRelTo, ShapeComponentAttr, VertRelTo};
+
+        let (natural_width_px, natural_height_px) =
+            Self::probe_natural_size(image_data, natural_width_px, natural_height_px, width, height);
+
         // 유효성 검사
         if section_idx >= self.document.sections.len() {
             return Err(HwpError::RenderError(format!(

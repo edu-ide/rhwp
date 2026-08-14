@@ -541,6 +541,9 @@ fn print_help() {
     println!();
     println!("  insert-picture <파일.hwp> --section N --para N --offset N --image <이미지> --width N --height N [--cell-path <JSON>|--table-ctrl N --row R --col C [--cell-para N]] -o <출력.hwp>");
     println!("      그림 컨트롤을 삽입");
+    println!("      --natural-width/--natural-height 생략 시 이미지 헤더에서 자동 판독");
+    println!("      --inline  표 셀 안에 글자처럼(인라인) 삽입 — 셀 높이가 그림에 맞춰 늘어난다.");
+    println!("                생략하면 한컴 default 인 표 옆 floating 배치 (셀 밖으로 넘칠 수 있음)");
     println!();
     println!("  list-objects <파일.hwp>");
     println!("      본문/표 셀 내부 그림·도형·글상자 객체 목록을 JSON으로 조회");
@@ -12884,12 +12887,16 @@ fn insert_picture_cli(args: &[String]) {
     let image_path = image_path.unwrap_or_else(|| exit_cli_error("--image <이미지>가 필요합니다."));
     let width = parse_u32_cli(width, "--width");
     let height = parse_u32_cli(height, "--height");
+    // 미지정 시 0 을 넘겨 core 가 이미지 헤더에서 원본 픽셀 크기를 판독하게 한다.
+    // 예전 기본값 (width/75) 은 "원본 = 표시 크기" 가정이라, 실제로는 이미지의
+    // 좌상단 일부만 crop 되어 확대 표시됐다 (1895x830 PNG 를 41100x18000 으로
+    // 넣으면 좌상단 29% 만 보임).
     let natural_width = natural_width
         .map(|v| parse_u32_cli(Some(v), "--natural-width"))
-        .unwrap_or_else(|| (width / 75).max(1));
+        .unwrap_or(0);
     let natural_height = natural_height
         .map(|v| parse_u32_cli(Some(v), "--natural-height"))
-        .unwrap_or_else(|| (height / 75).max(1));
+        .unwrap_or(0);
     let extension = extension.unwrap_or_else(|| {
         Path::new(&image_path)
             .extension()
