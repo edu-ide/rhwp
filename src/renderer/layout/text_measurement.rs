@@ -1828,6 +1828,11 @@ fn is_fullwidth_symbol(c: char) -> bool {
     || ('\u{3200}'..='\u{32FF}').contains(&c) // Enclosed CJK Letters (㉠㉡ 등)
     || ('\u{3300}'..='\u{33FF}').contains(&c) // CJK Compatibility (㎜㎝ 등)
     || ('\u{2160}'..='\u{217F}').contains(&c) // Roman Numerals (Ⅰ Ⅱ Ⅲ 등)
+    // Arrows (→←↑↓⇒↔ 등). 메트릭 DB 의 latin_ranges 가 본 블록을 수록하지
+    // 않아 `get_width` 가 None 을 반환, 폴백 `font_size * 0.5` 로 측정되었다.
+    // 실제 글리프는 전각에 가까워 (맑은 고딕 U+2190~U+21D2 = 1946/2048 =
+    // 0.950 em) 다음 글자가 화살표 위로 겹쳐 그려졌다.
+    || ('\u{2190}'..='\u{21FF}').contains(&c) // Arrows
 }
 
 /// 한글 자모 초성 여부 (옛한글 포함)
@@ -2344,6 +2349,35 @@ mod tests {
             style.font_size * 0.35,
             comma_advance
         );
+    }
+
+    // ── 화살표 advance 회귀 ──
+    //
+    // Arrows 블록은 메트릭 DB 의 latin_ranges 미수록이라 등록 폰트에서도 폴백
+    // 경로를 탄다. 폴백이 반각(0.5 em) 이면 다음 글자가 화살표 위에 겹쳐 그려진다.
+    #[test]
+    fn test_arrow_glyph_is_fullwidth_fallback() {
+        let m = EmbeddedTextMeasurer;
+        let style = TextStyle {
+            font_family: UNREGISTERED_FONT.to_string(),
+            font_size: 15.0,
+            ratio: 1.0,
+            ..Default::default()
+        };
+        // "AI→그" — 화살표 advance 는 전각(font_size) 이어야 한다.
+        let positions = m.compute_char_positions("AI\u{2192}그", &style);
+        let arrow_advance = positions[3] - positions[2];
+        assert!(
+            (arrow_advance - style.font_size).abs() < 0.5,
+            "arrow advance should be ~font_size ({:.2}), got {:.2}",
+            style.font_size,
+            arrow_advance
+        );
+        for c in ['\u{2190}', '\u{2191}', '\u{2193}', '\u{21D2}', '\u{2194}'] {
+            assert!(is_fullwidth_symbol(c), "U+{:04X} should be fullwidth", c as u32);
+        }
+        // 수학 기호는 전각이 아니다 (∀ 실측 0.696 em) — 과확장 방지.
+        assert!(!is_fullwidth_symbol('\u{2200}'));
     }
 
     #[test]
