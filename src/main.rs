@@ -519,7 +519,7 @@ fn print_help() {
     println!("  get-cell-char-properties <파일.hwp> --section N --para N --ctrl N (--cell N|--row R --col C) [--cell-para N] --offset N");
     println!("      셀 내부 글자 속성을 JSON으로 조회");
     println!();
-    println!("  set-cell-char-format <파일.hwp> --section N --para N --ctrl N (--cell N|--row R --col C) [--cell-para N] --start N --end N --json <서식JSON> -o <출력.hwp>");
+    println!("  set-cell-char-format <파일.hwp> --section N --para N (--ctrl N (--cell N|--row R --col C) [--cell-para N] | --cell-path <JSON>) --start N --end N --json <서식JSON> -o <출력.hwp>");
     println!("      셀 내부 글자 범위 서식을 직접 수정");
     println!();
     println!("  get-cell-para-properties <파일.hwp> --section N --para N --ctrl N (--cell N|--row R --col C) [--cell-para N]");
@@ -4678,6 +4678,33 @@ fn get_hwp_cell_char_properties_at_json_for_cli(
         obj.insert("cellIndex".to_string(), serde_json::json!(cell_idx));
     }
     Ok(details)
+}
+
+/// 중첩 표(표 안의 표) 셀 문단의 글자 서식. 경로는 [[표ctrl,셀,셀문단],…].
+fn set_hwp_cell_char_format_by_path_bytes_for_cli(
+    data: &[u8],
+    section_idx: usize,
+    parent_para_idx: usize,
+    cell_path_json: &str,
+    start_offset: usize,
+    end_offset: usize,
+    props_json: &str,
+) -> Result<HwpEditCliResult, String> {
+    let cell_path = parse_cell_path_for_cli(cell_path_json)?;
+    if cell_path.is_empty() {
+        return Err("cell-path는 비어 있을 수 없습니다.".to_string());
+    }
+    edit_hwp_table_structure_bytes_for_cli(data, "set-cell-char-format", |core| {
+        core.apply_char_format_in_cell_by_path_native(
+            section_idx,
+            parent_para_idx,
+            &cell_path,
+            start_offset,
+            end_offset,
+            props_json,
+        )
+        .map_err(|e| format!("중첩 셀 글자 서식 설정 실패: {}", e))
+    })
 }
 
 fn set_hwp_cell_char_format_bytes_for_cli(
@@ -12441,6 +12468,7 @@ fn set_format_cli(args: &[String], kind: &str) {
     let mut row: Option<String> = None;
     let mut col: Option<String> = None;
     let mut cell_para: Option<String> = Some("0".to_string());
+    let mut cell_path: Option<String> = None;
     let mut start: Option<String> = None;
     let mut end: Option<String> = None;
     let mut inline_json: Option<String> = None;
@@ -12450,6 +12478,13 @@ fn set_format_cli(args: &[String], kind: &str) {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
+            "--cell-path" => {
+                i += 1;
+                if i >= args.len() {
+                    exit_cli_error("--cell-path 뒤에 JSON 이 필요합니다.");
+                }
+                cell_path = Some(args[i].clone());
+            }
             "--section" => {
                 i += 1;
                 if i >= args.len() {
@@ -12554,6 +12589,23 @@ fn set_format_cli(args: &[String], kind: &str) {
             set_hwp_char_format_bytes_for_cli(&data, section, para, start, end, &props_json)
         }
         "para" => set_hwp_para_format_bytes_for_cli(&data, section, para, &props_json),
+        "cell-char" if cell_path.is_some() => {
+            // 중첩 표 셀: 경로가 바깥 표 ctrl 부터 담으므로 --ctrl/--cell 과 같이 쓰지 않는다.
+            if ctrl.is_some() || cell.is_some() || row.is_some() || col.is_some() {
+                exit_cli_error("--cell-path 는 --ctrl/--cell/--row/--col 과 함께 사용할 수 없습니다.");
+            }
+            let start = parse_usize_cli(start, "--start");
+            let end = parse_usize_cli(end, "--end");
+            set_hwp_cell_char_format_by_path_bytes_for_cli(
+                &data,
+                section,
+                para,
+                cell_path.as_deref().unwrap_or_default(),
+                start,
+                end,
+                &props_json,
+            )
+        }
         "cell-char" => {
             let ctrl = parse_usize_cli(ctrl, "--ctrl");
             let cell_para = parse_usize_cli(cell_para, "--cell-para");
@@ -20412,6 +20464,44 @@ fn extract_thumbnail(args: &[String]) {
 #[cfg(test)]
 mod doc_mcp_hwp_write_cli_tests {
     use super::*;
+
+    /// samples/issue_1133.hwp 문단 29 = 8×2 표, 셀 3 문단 5 안의 1×1 표 "※ 지원시 유의사항".
+    fn nested_notice_color_at(bytes: &[u8], offset: usize) -> rhwp::model::ColorRef {
+        use rhwp::model::control::Control;
+        let core = rhwp::document_core::DocumentCore::from_bytes(bytes).expect("parse");
+        let document = core.document();
+        let Control::Table(outer) = &document.sections[0].paragraphs[29].controls[0] else {
+            panic!("outer table");
+        };
+        let Control::Table(inner) = &outer.cells[3].paragraphs[5].controls[0] else {
+            panic!("inner table");
+        };
+        let paragraph = &inner.cells[0].paragraphs[0];
+        assert!(paragraph.text.starts_with("※ 지원시"), "{}", paragraph.text);
+        let id = paragraph.char_shape_id_at(offset).expect("char shape") as usize;
+        document.doc_info.char_shapes[id].text_color
+    }
+
+    #[test]
+    fn set_cell_char_format_reaches_a_nested_table_cell() {
+        let data = fs::read("samples/issue_1133.hwp").expect("sample");
+        let before_head = nested_notice_color_at(&data, 0);
+        let before_tail = nested_notice_color_at(&data, 8);
+        let target = if before_head == 0 { "#FF0000" } else { "#000000" };
+        let result = set_hwp_cell_char_format_by_path_bytes_for_cli(
+            &data,
+            0,
+            29,
+            "[[0,3,5],[0,0,0]]",
+            0,
+            3,
+            &format!(r#"{{"textColor":"{target}"}}"#),
+        )
+        .expect("nested char format");
+        assert_ne!(nested_notice_color_at(&result.bytes, 0), before_head, "range recolored");
+        assert_eq!(nested_notice_color_at(&result.bytes, 8), before_tail, "outside the range kept");
+        assert!(set_hwp_cell_char_format_by_path_bytes_for_cli(&data, 0, 29, "[]", 0, 1, "{}").is_err());
+    }
 
     #[test]
     fn create_hwp_bytes_from_text_roundtrips_body_text() {
