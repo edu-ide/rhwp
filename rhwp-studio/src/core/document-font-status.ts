@@ -1,9 +1,10 @@
 import { REGISTERED_FONTS } from './font-loader.ts';
-import { resolveFont } from './font-substitution.ts';
+import { resolveFont, resolveGovernmentFontSuccessor } from './font-substitution.ts';
 import {
   getDetectedLocalFonts,
   getLocalFontDetectionMethod,
   getLocalFontState,
+  resolveLocalFont,
   type LocalFontDetectionSource,
 } from './local-fonts.ts';
 
@@ -100,9 +101,19 @@ export function analyzeDocumentFonts(
   };
 
   const fonts = normalizeDocumentFonts(docFonts).map((fontName): DocumentFontStatusItem => {
-    if (localSet.has(fontName)) {
+    const localRecord = options.localFonts === undefined ? resolveLocalFont(fontName) : null;
+    if (localSet.has(fontName) || localRecord) {
       summary.available++;
       return { fontName, status: 'available', source: 'local', substituteFont: null };
+    }
+
+    const successorFont = resolveGovernmentFontSuccessor(
+      fontName,
+      options.localFonts === undefined ? undefined : localFonts,
+    );
+    if (successorFont) {
+      summary.available++;
+      return { fontName, status: 'available', source: 'local', substituteFont: successorFont };
     }
 
     if (GENERIC_FONTS.has(fontName) || REGISTERED_FONTS.has(fontName)) {

@@ -25,9 +25,10 @@ test('remote z-order operations are applied by InputHandler', () => {
 });
 
 test('local z-order paths emit realtime drafts', () => {
-  assertSource(insertSource, /emitObjectZOrderRealtimeOperation/, 'insert z-order commands should emit realtime draft');
+  assertSource(insertSource, /realtimeOperation:\s*\{/, 'insert z-order commands publish through the operation router');
   assertSource(insertSource, /kind:\s*'changeShapeZOrder'/, 'z-order draft should use changeShapeZOrder');
-  assertSource(insertSource, /zOrderAction:\s*action/, 'z-order draft should carry action');
-  assertSource(mouseSource, /emitRealtimeOperationDraftPublic\?\./, 'mouse bring-to-front path should publish draft when available');
+  assertSource(insertSource, /zOrderAction:\s*operation/, 'z-order draft should carry action');
+  assertSource(mouseSource, /realtimeOperation:\s*\{/, 'mouse bring-to-front draft must run through the operation router');
+  assertSource(inputHandlerSource, /!desc\.command\.isNoOp\?\.\(\)/, 'a no-op command must not publish a collaboration operation');
   assertSource(mouseSource, /kind:\s*'changeShapeZOrder'/, 'mouse path should use changeShapeZOrder');
 });

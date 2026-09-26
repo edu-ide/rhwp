@@ -107,7 +107,8 @@ export const formatCommands: CommandDef[] = [
       if (!ih) return;
       const props = ih.getParaProperties();
       const current = props?.lineSpacing ?? 160;
-      const newValue = current - 10;
+      // toolbar.ts ▼ 버튼과 동일하게 5%로 하한 clamp (issue #3009)
+      const newValue = Math.max(5, current - 10);
       ih.setLineSpacing(newValue);
     },
   },
@@ -243,6 +244,7 @@ export const formatCommands: CommandDef[] = [
   // 글자 모양 대화상자
   {
     id: 'format:char-shape',
+    opensDialog: true,
     label: '글자 모양',
     icon: 'icon-char-shape',
     shortcutLabel: 'Alt+L',
@@ -270,6 +272,7 @@ export const formatCommands: CommandDef[] = [
   },
   {
     id: 'format:para-shape',
+    opensDialog: true,
     label: '문단 모양',
     icon: 'icon-para-shape',
     shortcutLabel: 'Alt+T',
@@ -328,6 +331,7 @@ export const formatCommands: CommandDef[] = [
   },
   {
     id: 'format:para-num-shape',
+    opensDialog: true,
     label: '문단 번호 모양',
     canExecute: (ctx) => ctx.hasDocument,
     execute(services) {
@@ -405,13 +409,14 @@ export const formatCommands: CommandDef[] = [
   // 스타일 대화상자
   {
     id: 'format:style-dialog',
+    opensDialog: true,
     label: '스타일',
     shortcutLabel: 'F6',
     canExecute: (ctx) => ctx.hasDocument,
     execute(services) {
       const ih = services.getInputHandler();
       if (!ih) return;
-      const dialog = new StyleDialog(services.wasm, services.eventBus);
+      const dialog = new StyleDialog(services.wasm, services.eventBus, services);
 
       // 편집 요청
       dialog.onEditRequest = (styleId: number) => {
@@ -421,7 +426,7 @@ export const formatCommands: CommandDef[] = [
         const editDlg = new StyleEditDialog(services.wasm, services.eventBus, 'edit', {
           id: style.id, name: style.name, englishName: style.englishName,
           type: style.type, nextStyleId: style.nextStyleId,
-        });
+        }, undefined, services);
         editDlg.onSave = () => dialog.refresh();
         editDlg.show();
       };
@@ -437,7 +442,7 @@ export const formatCommands: CommandDef[] = [
         } catch {
           baseInfo = {};
         }
-        const addDlg = new StyleEditDialog(services.wasm, services.eventBus, 'add', undefined, baseInfo);
+        const addDlg = new StyleEditDialog(services.wasm, services.eventBus, 'add', undefined, baseInfo, services);
         addDlg.onSave = () => dialog.refresh();
         addDlg.show();
       };
@@ -455,6 +460,7 @@ export const formatCommands: CommandDef[] = [
   },
   {
     id: 'format:object-properties',
+    opensDialog: true,
     label: '개체 속성',
     icon: 'icon-obj-props',
     shortcutLabel: 'P',
@@ -468,11 +474,11 @@ export const formatCommands: CommandDef[] = [
         const ref = ih.getSelectedPictureRef();
         if (!ref) return;
         if (ref.type === 'equation') {
-          const dialog = new EquationPropertiesDialog(services.wasm, services.eventBus);
+          const dialog = new EquationPropertiesDialog(services.wasm, services.eventBus, services);
           dialog.open(ref.sec, ref.ppi, ref.ci, ref.cellIdx, ref.cellParaIdx, ref.noteRef);
           return;
         }
-        const dialog = new PicturePropsDialog(services.wasm, services.eventBus);
+        const dialog = new PicturePropsDialog(services.wasm, services.eventBus, services);
         dialog.open(ref.sec, ref.ppi, ref.ci, ref.type);
         return;
       }
@@ -482,7 +488,7 @@ export const formatCommands: CommandDef[] = [
         const pos = ih.getCursorPosition();
         if (pos.parentParaIndex === undefined || pos.controlIndex === undefined || pos.cellIndex === undefined) return;
         const tableCtx = { sec: pos.sectionIndex, ppi: pos.parentParaIndex, ci: pos.controlIndex };
-        const dialog = new TableCellPropsDialog(services.wasm, services.eventBus, tableCtx, pos.cellIndex, 'table');
+        const dialog = new TableCellPropsDialog(services.wasm, services.eventBus, tableCtx, pos.cellIndex, 'table', services);
         dialog.show();
       }
     },

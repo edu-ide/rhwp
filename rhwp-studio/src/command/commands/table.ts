@@ -6,6 +6,13 @@ import { CellSplitDialog } from '@/ui/cell-split-dialog';
 import { CellBorderBgDialog } from '@/ui/cell-border-bg-dialog';
 import { FormulaDialog } from '@/ui/formula-dialog';
 import {
+  planBlockCalculation,
+  preflightBlockCalculationJobs,
+  type BlockCalculationCellState,
+  type BlockCalculationFunction,
+  type BlockCalculationJob,
+} from '@/command/block-calculation-plan';
+import {
   TableDeleteRowColumnDialog,
   TableInsertRowColumnDialog,
   type TableDeleteRowColumnMode,
@@ -14,6 +21,7 @@ import {
 
 const inTable = (ctx: EditorContext) => ctx.inTable;
 const inTableOrCellSelection = (ctx: EditorContext) => ctx.inTable || ctx.inCellSelectionMode;
+const hasMultiCellSelection = (ctx: EditorContext) => ctx.hasMultiCellSelection;
 
 type CellRange = { startRow: number; startCol: number; endRow: number; endCol: number };
 type TableDimensions = { rowCount: number; colCount: number; cellCount: number };
@@ -25,6 +33,66 @@ type TableCellCommandContext = {
 
 function safeTableOp(fn: () => void, label: string): void {
   try { fn(); } catch (e) { console.error(`[table] ${label} 실패:`, e); }
+}
+
+function isTopLevelTableCellEmpty(
+  wasm: CommandServices['wasm'],
+  sec: number,
+  ppi: number,
+  ci: number,
+  cellIdx: number,
+): boolean {
+  const paragraphCount = wasm.getCellParagraphCount(sec, ppi, ci, cellIdx);
+  for (let cellParaIdx = 0; cellParaIdx < paragraphCount; cellParaIdx += 1) {
+    if (wasm.getCellParagraphLength(sec, ppi, ci, cellIdx, cellParaIdx) > 0) return false;
+  }
+  return true;
+}
+
+function selectedBlockCalculationCells(
+  wasm: CommandServices['wasm'],
+  sec: number,
+  ppi: number,
+  ci: number,
+  range: CellRange,
+  dims: TableDimensions,
+): BlockCalculationCellState[][] | null {
+  if (range.startRow < 0 || range.startCol < 0 ||
+      range.endRow >= dims.rowCount || range.endCol >= dims.colCount) return null;
+
+  const byCoordinate = new Map<string, {
+    cellIdx: number;
+    rowSpan: number;
+    colSpan: number;
+  }>();
+  for (let cellIdx = 0; cellIdx < dims.cellCount; cellIdx += 1) {
+    const info = wasm.getCellInfo(sec, ppi, ci, cellIdx);
+    if (!isCellInRange(info, range)) continue;
+    const key = `${info.row}:${info.col}`;
+    if (byCoordinate.has(key)) return null;
+    byCoordinate.set(key, {
+      cellIdx,
+      rowSpan: info.rowSpan,
+      colSpan: info.colSpan,
+    });
+  }
+
+  const cells: BlockCalculationCellState[][] = [];
+  for (let row = range.startRow; row <= range.endRow; row += 1) {
+    const cellRow: BlockCalculationCellState[] = [];
+    for (let col = range.startCol; col <= range.endCol; col += 1) {
+      const cell = byCoordinate.get(`${row}:${col}`);
+      // 병합 셀이 덮은 비-anchor 좌표도 여기서 빠지므로 fail-closed한다.
+      if (!cell) return null;
+      cellRow.push({
+        empty: isTopLevelTableCellEmpty(wasm, sec, ppi, ci, cell.cellIdx),
+        rowSpan: cell.rowSpan,
+        colSpan: cell.colSpan,
+      });
+    }
+    cells.push(cellRow);
+  }
+  return cells;
 }
 
 function equalizeTargetRange(ih: ReturnType<CommandServices['getInputHandler']>, dims: TableDimensions): CellRange {
@@ -39,6 +107,11 @@ function equalizeTargetRange(ih: ReturnType<CommandServices['getInputHandler']>,
 
 function hasNonRectangularCellSelection(ih: ReturnType<CommandServices['getInputHandler']>): boolean {
   return Boolean(ih?.isInCellSelectionMode?.() && ih.hasExcludedCellSelection?.());
+}
+
+function isTransposeTargetOverflowError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return message.includes('표 크기') && message.includes('초과');
 }
 
 function isCellInRange(cell: { row: number; col: number }, range: CellRange): boolean {
@@ -57,7 +130,12 @@ function stub(id: string, label: string, icon?: string, shortcut?: string): Comm
   };
 }
 
-function blockCalcCommand(id: string, label: string, func: string, shortcut: string): CommandDef {
+function blockCalcCommand(
+  id: string,
+  label: string,
+  func: BlockCalculationFunction,
+  shortcut: string,
+): CommandDef {
   return {
     id,
     label,
@@ -69,46 +147,64 @@ function blockCalcCommand(id: string, label: string, func: string, shortcut: str
       const pos = ih.getCursorPosition();
       if (pos.parentParaIndex === undefined || pos.controlIndex === undefined || pos.cellIndex === undefined) return;
       try {
-        const cellInfo = services.wasm.getCellInfo(pos.sectionIndex, pos.parentParaIndex, pos.controlIndex, pos.cellIndex);
-        const row = cellInfo.row;
-        const col = cellInfo.col;
-        const cellParaIndex = pos.cellParaIndex ?? 0;
-        const oldLen = services.wasm.getCellParagraphLength(
-          pos.sectionIndex,
-          pos.parentParaIndex,
-          pos.controlIndex,
-          pos.cellIndex,
-          cellParaIndex,
+        const tableContext = ih.getCellTableContext();
+        const range = ih.getSelectedCellRange();
+        if (!tableContext || !range || !ih.isInCellSelectionMode()) return;
+        const nested = (tableContext.cellPath?.length ?? 0) > 1;
+        if (nested || ih.hasExcludedCellSelection()) return;
+
+        const { sec, ppi, ci } = tableContext;
+        const dims = services.wasm.getTableDimensions(sec, ppi, ci);
+        const cells = selectedBlockCalculationCells(services.wasm, sec, ppi, ci, range, dims);
+        if (!cells) return;
+        const plan = planBlockCalculation({
+          range,
+          cells,
+          functionName: func,
+          hasExcludedCells: false,
+          nested: false,
+        });
+        if (!plan) return;
+
+        const evaluate = (
+          wasm: CommandServices['wasm'],
+          job: BlockCalculationJob,
+          writeResult: boolean,
+        ): { ok: boolean } => JSON.parse(wasm.evaluateTableFormula(
+          sec, ppi, ci, job.targetRow, job.targetCol, job.formula, writeResult,
+        ));
+        const preflightOk = preflightBlockCalculationJobs(
+          plan.jobs,
+          (job, writeResult) => evaluate(services.wasm, job, writeResult),
         );
-        const oldText = oldLen > 0
-          ? services.wasm.getTextInCell(
-            pos.sectionIndex,
-            pos.parentParaIndex,
-            pos.controlIndex,
-            pos.cellIndex,
-            cellParaIndex,
-            0,
-            oldLen,
-          )
-          : '';
-        const formula = `=${func}(above)`;
-        const result = services.wasm.evaluateTableFormula(
-          pos.sectionIndex, pos.parentParaIndex, pos.controlIndex,
-          row, col, formula, true,
-        );
-        const parsed = JSON.parse(result);
-        if (parsed.ok) {
-          emitFormulaResultRealtimeOperations(
-            ih,
-            services,
-            pos.sectionIndex,
-            pos.parentParaIndex,
-            pos.controlIndex,
-            pos.cellIndex,
-            cellParaIndex,
-            oldText,
-            parsed.result,
-          );
+        if (!preflightOk) return;
+
+        // 모든 결과를 먼저 dry-run한 뒤 하나의 snapshot에서 기록한다. write 중 예외가 나면
+        // SnapshotCommand가 before snapshot으로 전체 rollback한다.
+        const previousCells = Array.from({ length: dims.cellCount }, (_, cellIndex) => {
+          const info = services.wasm.getCellInfo(sec, ppi, ci, cellIndex);
+          const length = services.wasm.getCellParagraphLength(sec, ppi, ci, cellIndex, 0);
+          return { cellIndex, info, text: services.wasm.getTextInCell(sec, ppi, ci, cellIndex, 0, 0, length) };
+        }).filter(cell => plan.jobs.some(job => job.targetRow === cell.info.row && job.targetCol === cell.info.col));
+        let committed = false;
+        safeTableOp(() => ih.executeOperation({
+          kind: 'snapshot',
+          operationType: 'tableBlockCalc',
+          operation: (wasm) => {
+            for (const job of plan.jobs) {
+              const result = evaluate(wasm, job, true);
+              if (!result.ok) throw new Error(`블록 계산 쓰기 실패: ${job.formula}`);
+            }
+            committed = true;
+            return pos;
+          },
+        }), '블록 계산');
+        if (committed) {
+          for (const cell of previousCells) {
+            const length = services.wasm.getCellParagraphLength(sec, ppi, ci, cell.cellIndex, 0);
+            const actual = services.wasm.getTextInCell(sec, ppi, ci, cell.cellIndex, 0, 0, length);
+            emitCellTextReplacementRealtimeOperations(ih, sec, ppi, ci, cell.cellIndex, 0, cell.text, actual);
+          }
         }
       } catch (err) {
         console.warn(`[${id}] 블록 계산 실패:`, err);
@@ -127,7 +223,7 @@ function openFormulaDialog(services: Parameters<CommandDef['execute']>[0]): void
     ppi: pos.parentParaIndex,
     ci: pos.controlIndex,
     cellIndex: pos.cellIndex,
-  });
+  }, services);
   dialog.onRealtimeOperation = (draft) => ih.emitRealtimeOperationDraftPublic(draft);
   dialog.show();
 }
@@ -502,6 +598,7 @@ function applyTableDeleteRowColumn(
 
 export const tableCommands: CommandDef[] = [
   { id: 'table:create', label: '표 만들기', icon: 'icon-table',
+    opensDialog: true,
     canExecute: (ctx) => ctx.hasDocument && !ctx.inTable,
     execute(services, params) {
       const ih = services.getInputHandler();
@@ -554,6 +651,7 @@ export const tableCommands: CommandDef[] = [
   },
   {
     id: 'table:cell-props',
+    opensDialog: true,
     label: '표/셀 속성',
     canExecute: (ctx) => ctx.inTable || ctx.inCellSelectionMode || ctx.inTableObjectSelection,
     execute(services) {
@@ -563,8 +661,8 @@ export const tableCommands: CommandDef[] = [
         const ref = ih.getSelectedTableRef();
         if (!ref) return;
         const tableCtx = { sec: ref.sec, ppi: ref.ppi, ci: ref.ci };
-        const dialog = new TableCellPropsDialog(services.wasm, services.eventBus, tableCtx, 0, 'table');
-        dialog.onRealtimeOperation = (draft) => ih.emitRealtimeOperationDraftPublic(draft);
+        const dialog = new TableCellPropsDialog(services.wasm, services.eventBus, tableCtx, 0, 'table', services);
+  dialog.onRealtimeOperation = (draft) => ih.emitRealtimeOperationDraftPublic(draft);
         dialog.show();
         return;
       }
@@ -572,13 +670,14 @@ export const tableCommands: CommandDef[] = [
       const pos = ih.getCursorPosition();
       if (pos.parentParaIndex === undefined || pos.controlIndex === undefined || pos.cellIndex === undefined) return;
       const tableCtx = { sec: pos.sectionIndex, ppi: pos.parentParaIndex, ci: pos.controlIndex };
-      const dialog = new TableCellPropsDialog(services.wasm, services.eventBus, tableCtx, pos.cellIndex, 'cell');
-      dialog.onRealtimeOperation = (draft) => ih.emitRealtimeOperationDraftPublic(draft);
+      const dialog = new TableCellPropsDialog(services.wasm, services.eventBus, tableCtx, pos.cellIndex, 'cell', services);
+  dialog.onRealtimeOperation = (draft) => ih.emitRealtimeOperationDraftPublic(draft);
       dialog.show();
     },
   },
   {
     id: 'table:border-each',
+    opensDialog: true,
     label: '각 셀마다 적용(E)...',
     canExecute: inTable,
     execute(services) {
@@ -587,28 +686,48 @@ export const tableCommands: CommandDef[] = [
       const pos = ih.getCursorPosition();
       if (pos.parentParaIndex === undefined || pos.controlIndex === undefined || pos.cellIndex === undefined) return;
       const tableCtx = { sec: pos.sectionIndex, ppi: pos.parentParaIndex, ci: pos.controlIndex };
-      const dialog = new CellBorderBgDialog(services.wasm, services.eventBus, tableCtx, pos.cellIndex, 'each');
-      dialog.onRealtimeOperation = (draft) => ih.emitRealtimeOperationDraftPublic(draft);
+      const selectionRange = ih.isInCellSelectionMode?.() ? ih.getSelectedCellRange?.() ?? null : null;
+      const dialog = new CellBorderBgDialog(
+        services.wasm,
+        services.eventBus,
+        tableCtx,
+        pos.cellIndex,
+        'each',
+        selectionRange,
+        services,
+      );
+  dialog.onRealtimeOperation = (draft) => ih.emitRealtimeOperationDraftPublic(draft);
       dialog.show();
     },
   },
   {
     id: 'table:border-one',
+    opensDialog: true,
     label: '하나의 셀처럼 적용(Z)...',
-    canExecute: inTable,
+    canExecute: hasMultiCellSelection,
     execute(services) {
       const ih = services.getInputHandler();
       if (!ih) return;
+      if (!ih.hasMultiCellSelection()) return;
       const pos = ih.getCursorPosition();
       if (pos.parentParaIndex === undefined || pos.controlIndex === undefined || pos.cellIndex === undefined) return;
       const tableCtx = { sec: pos.sectionIndex, ppi: pos.parentParaIndex, ci: pos.controlIndex };
-      const dialog = new CellBorderBgDialog(services.wasm, services.eventBus, tableCtx, pos.cellIndex, 'asOne');
-      dialog.onRealtimeOperation = (draft) => ih.emitRealtimeOperationDraftPublic(draft);
+      const dialog = new CellBorderBgDialog(
+        services.wasm,
+        services.eventBus,
+        tableCtx,
+        pos.cellIndex,
+        'asOne',
+        ih.getSelectedCellRange(),
+        services,
+      );
+  dialog.onRealtimeOperation = (draft) => ih.emitRealtimeOperationDraftPublic(draft);
       dialog.show();
     },
   },
   {
     id: 'table:insert-row-col',
+    opensDialog: true,
     label: '줄/칸 추가하기(I)...',
     shortcutLabel: 'Alt+Enter',
     canExecute: inTable,
@@ -623,6 +742,7 @@ export const tableCommands: CommandDef[] = [
   },
   {
     id: 'table:delete-row-col',
+    opensDialog: true,
     label: '줄/칸 지우기(E)...',
     shortcutLabel: 'Alt+Delete',
     canExecute: inTable,
@@ -787,6 +907,7 @@ export const tableCommands: CommandDef[] = [
   },
   {
     id: 'table:cell-split',
+    opensDialog: true,
     label: '셀 나누기',
     shortcutLabel: 'S',
     canExecute: inTable,
@@ -869,6 +990,231 @@ export const tableCommands: CommandDef[] = [
         },
       }), '셀 합치기');
       ih.exitCellSelectionMode();
+    },
+  },
+  {
+    id: 'table:transpose-copy',
+    label: '행/열 바꿈 복사',
+    canExecute: (ctx) => ctx.inCellSelectionMode,
+    execute(services) {
+      const ih = services.getInputHandler();
+      if (!ih) return;
+      const range = ih.getSelectedCellRange?.();
+      const tableCtx = ih.getCellTableContext?.();
+      if (!range || !tableCtx) return;
+      if (hasNonRectangularCellSelection(ih)) return;
+      if (tableCtx.cellPath && tableCtx.cellPath.length > 1) return;
+
+      safeTableOp(() => {
+        services.wasm.copyTableCellsTransposed(
+          tableCtx.sec,
+          tableCtx.ppi,
+          tableCtx.ci,
+          range.startRow,
+          range.startCol,
+          range.endRow,
+          range.endCol,
+        );
+      }, '행/열 바꿈 복사');
+      restoreEditorFocus(ih);
+    },
+  },
+  {
+    id: 'table:transpose-paste',
+    label: '행/열 바꿈 붙여넣기',
+    canExecute: (ctx) => ctx.hasDocument && ctx.hasTableTransposeClipboard,
+    execute(services) {
+      const ih = services.getInputHandler();
+      if (!ih) return;
+      const pos = ih.getCursorPosition();
+      if ((pos.cellPath?.length ?? 0) > 1) return;
+
+      safeTableOp(() => ih.executeOperation({
+        kind: 'snapshot',
+        operationType: 'pasteTableCellsTransposed',
+        operation: (wasm) => {
+          const pasteAsNewTable = (sectionIndex: number, paragraphIndex: number, charOffset: number) => {
+            const result = wasm.pasteTableCellsTransposedAsTable(
+              sectionIndex,
+              paragraphIndex,
+              charOffset,
+            );
+            if (result.ok && result.paraIdx !== undefined && result.controlIdx !== undefined) {
+              return {
+                sectionIndex,
+                paragraphIndex: 0,
+                charOffset: 0,
+                parentParaIndex: result.paraIdx,
+                controlIndex: result.controlIdx,
+                cellIndex: 0,
+                cellParaIndex: 0,
+              };
+            }
+            return pos;
+          };
+
+          const selectionTableCtx = ih.isInCellSelectionMode?.() ? ih.getCellTableContext?.() : null;
+          if (selectionTableCtx) {
+            if ((selectionTableCtx.cellPath?.length ?? 0) > 1) return pos;
+            const range = ih.getSelectedCellRange?.();
+            const dims = wasm.getTableDimensions(
+              selectionTableCtx.sec,
+              selectionTableCtx.ppi,
+              selectionTableCtx.ci,
+            );
+            const isWholeTable = range
+              && range.startRow === 0
+              && range.startCol === 0
+              && range.endRow === dims.rowCount - 1
+              && range.endCol === dims.colCount - 1;
+            if (isWholeTable) {
+              wasm.transposeTableCellsInPlace(
+                selectionTableCtx.sec,
+                selectionTableCtx.ppi,
+                selectionTableCtx.ci,
+              );
+              return {
+                sectionIndex: selectionTableCtx.sec,
+                paragraphIndex: 0,
+                charOffset: 0,
+                parentParaIndex: selectionTableCtx.ppi,
+                controlIndex: selectionTableCtx.ci,
+                cellIndex: 0,
+                cellParaIndex: 0,
+              };
+            }
+            if (range) {
+              try {
+                wasm.pasteTableCellsTransposed(
+                  selectionTableCtx.sec,
+                  selectionTableCtx.ppi,
+                  selectionTableCtx.ci,
+                  range.startRow,
+                  range.startCol,
+                );
+                return {
+                  sectionIndex: selectionTableCtx.sec,
+                  paragraphIndex: 0,
+                  charOffset: 0,
+                  parentParaIndex: selectionTableCtx.ppi,
+                  controlIndex: selectionTableCtx.ci,
+                  cellIndex: 0,
+                  cellParaIndex: 0,
+                };
+              } catch (err) {
+                if (!isTransposeTargetOverflowError(err)) throw err;
+              }
+            }
+            return pasteAsNewTable(selectionTableCtx.sec, selectionTableCtx.ppi, 0);
+          }
+
+          if (pos.parentParaIndex !== undefined && pos.controlIndex !== undefined && pos.cellIndex !== undefined) {
+            const cellInfo = services.wasm.getCellInfo(
+              pos.sectionIndex,
+              pos.parentParaIndex,
+              pos.controlIndex,
+              pos.cellIndex,
+            );
+            try {
+              wasm.pasteTableCellsTransposed(
+                pos.sectionIndex,
+                pos.parentParaIndex,
+                pos.controlIndex,
+                cellInfo.row,
+                cellInfo.col,
+              );
+            } catch (err) {
+              if (!isTransposeTargetOverflowError(err)) throw err;
+              return pasteAsNewTable(pos.sectionIndex, pos.parentParaIndex, 0);
+            }
+            return pos;
+          }
+
+          return pasteAsNewTable(pos.sectionIndex, pos.paragraphIndex, pos.charOffset);
+        },
+      }), '행/열 바꿈 붙여넣기');
+      restoreEditorFocus(ih);
+    },
+  },
+  {
+    id: 'table:split',
+    label: '표 나누기',
+    shortcutLabel: 'Ctrl+M,A',
+    canExecute: (ctx) => ctx.inTable,
+    execute(services) {
+      const ih = services.getInputHandler();
+      if (!ih) return;
+      const pos = ih.getCursorPosition();
+      if (pos?.parentParaIndex === undefined || pos.controlIndex === undefined || pos.cellIndex === undefined) return;
+      // 중첩 표(cellPath 깊이 2+)는 flat 인덱스가 바깥 표를 가리켜 오동작한다 —
+      // path 기반 API 가 생기기 전까지는 최상위 표에서만 허용.
+      if ((pos.cellPath?.length ?? 0) > 1) return;
+      const { sectionIndex: sec, parentParaIndex: ppi, controlIndex: ci, cellIndex } = pos;
+      safeTableOp(() => {
+        // Rust 쪽에서도 첫 행을 거부하지만, snapshot 을 뜬 뒤 실패하면 빈 undo
+        // 항목이 남으므로 확정 실패는 executeOperation 전에 걸러낸다.
+        const info = services.wasm.getCellInfo(sec, ppi, ci, cellIndex);
+        if (info.row === 0) {
+          console.warn('[table:split] 첫 번째 줄에서는 표 나누기를 할 수 없습니다.');
+          return;
+        }
+        ih.executeOperation({
+          kind: 'snapshot',
+          operationType: 'splitTable',
+          operation: (wasm) => {
+            // 커서 셀(row >= 분할행)은 예외 없이 뒤 표로 옮겨지므로, 작업 전
+            // 위치를 그대로 반환하면 앞 표의 범위 밖 cellIndex 가 된다
+            // (redo 시에도 같은 무효 위치로 복원). 뒤 표 기준으로 재계산한다.
+            const res = wasm.splitTable(sec, ppi, ci, info.row);
+            const frontCells = wasm.getTableDimensions(sec, ppi, ci).cellCount;
+            return {
+              sectionIndex: sec,
+              paragraphIndex: 0,
+              charOffset: 0,
+              parentParaIndex: res.backParaIdx,
+              controlIndex: 0,
+              cellIndex: Math.max(0, cellIndex - frontCells),
+              cellParaIndex: 0,
+            };
+          },
+        });
+      }, '표 나누기');
+    },
+  },
+  {
+    // 한컴 용어는 '붙이기'(attach)지만 의미는 다음 표와의 행 병합이라
+    // WASM API 는 mergeTableWithNext, 이벤트는 TablesMerged 를 쓴다.
+    id: 'table:attach',
+    label: '표 붙이기',
+    shortcutLabel: 'Ctrl+M,Z',
+    canExecute: (ctx) => ctx.inTable || ctx.inTableObjectSelection,
+    execute(services) {
+      const ih = services.getInputHandler();
+      if (!ih) return;
+      // 셀 컨텍스트가 필요 없는 명령이라 표 객체 선택 상태도 지원한다
+      // (table:delete 와 같은 패턴 — 테두리 클릭 진입 시 커서는 셀 밖이다).
+      let sec: number, ppi: number, ci: number;
+      const ref = ih.getSelectedTableRef();
+      if (ref) {
+        sec = ref.sec; ppi = ref.ppi; ci = ref.ci;
+      } else {
+        const pos = ih.getCursorPosition();
+        if (pos?.parentParaIndex === undefined || pos.controlIndex === undefined) return;
+        // 중첩 표(cellPath 깊이 2+)는 flat 인덱스가 바깥 표를 가리켜 오동작한다 —
+        // path 기반 API 가 생기기 전까지는 최상위 표에서만 허용.
+        if ((pos.cellPath?.length ?? 0) > 1) return;
+        sec = pos.sectionIndex; ppi = pos.parentParaIndex; ci = pos.controlIndex;
+      }
+      safeTableOp(() => {
+        ih.executeOperation({
+          kind: 'snapshot',
+          operationType: 'mergeTableWithNext',
+          operation: (wasm) => {
+            wasm.mergeTableWithNext(sec, ppi, ci);
+            return ih.getCursorPosition()!;
+          },
+        });
+      }, '표 붙이기');
     },
   },
   {
@@ -1135,10 +1481,24 @@ export const tableCommands: CommandDef[] = [
           result = sign + formatted + decPart;
         }
         if (result === text) return;
-        services.wasm.deleteTextInCell(sec, ppi, ci, cei, cpi, 0, len);
-        services.wasm.insertTextInCell(sec, ppi, ci, cei, cpi, 0, result);
-        emitCellTextReplacementRealtimeOperations(ih, sec, ppi, ci, cei, cpi, text, result);
-        services.eventBus.emit('document-changed');
+        // [#2344] delete+insert 를 하나의 snapshot 으로 원자화해 라우팅 — 미기록 시 셀 문자
+        // 수가 바뀌어 후속 undo 오프셋이 오염되고 텍스트가 손상된다("1234567"→쉼표→Ctrl+Z="67").
+        // 라우터가 refresh 하므로 수동 document-changed emit 은 제거.
+        // [Task #2370] 종전에는 여기를 safeTableOp 으로 한 겹 더 감쌌으나, 이 문장이 바깥
+        // try 의 마지막이라 바깥 catch 는 도달할 수 없었다. 관측 차이는 로그뿐이고 바깥
+        // catch 의 메시지가 더 구체적이므로 한 겹만 남긴다.
+        let committed = false;
+        ih.executeOperation({
+          kind: 'snapshot',
+          operationType: 'cellNumberFormat',
+          operation: (wasm) => {
+            wasm.deleteTextInCell(sec, ppi, ci, cei, cpi, 0, len);
+            wasm.insertTextInCell(sec, ppi, ci, cei, cpi, 0, result);
+            committed = true;
+            return pos;
+          },
+        });
+        if (committed) emitCellTextReplacementRealtimeOperations(ih, sec, ppi, ci, cei, cpi, text, result);
       } catch (err) {
         console.warn('[table:thousand-sep] 구분 쉼표 변환 실패:', err);
       }
@@ -1169,10 +1529,24 @@ export const tableCommands: CommandDef[] = [
         const fmtInt = hasCommas ? intPart.replace(/\B(?=(\d{3})+(?!\d))/g, ',') : intPart;
         const result = sign + fmtInt + '.' + newDecimals;
         if (result === text) return;
-        services.wasm.deleteTextInCell(sec, ppi, ci, cei, cpi, 0, len);
-        services.wasm.insertTextInCell(sec, ppi, ci, cei, cpi, 0, result);
-        emitCellTextReplacementRealtimeOperations(ih, sec, ppi, ci, cei, cpi, text, result);
-        services.eventBus.emit('document-changed');
+        // [#2344] delete+insert 를 하나의 snapshot 으로 원자화해 라우팅 — 미기록 시 셀 문자
+        // 수가 바뀌어 후속 undo 오프셋이 오염되고 텍스트가 손상된다("1234567"→쉼표→Ctrl+Z="67").
+        // 라우터가 refresh 하므로 수동 document-changed emit 은 제거.
+        // [Task #2370] 종전에는 여기를 safeTableOp 으로 한 겹 더 감쌌으나, 이 문장이 바깥
+        // try 의 마지막이라 바깥 catch 는 도달할 수 없었다. 관측 차이는 로그뿐이고 바깥
+        // catch 의 메시지가 더 구체적이므로 한 겹만 남긴다.
+        let committed = false;
+        ih.executeOperation({
+          kind: 'snapshot',
+          operationType: 'cellNumberFormat',
+          operation: (wasm) => {
+            wasm.deleteTextInCell(sec, ppi, ci, cei, cpi, 0, len);
+            wasm.insertTextInCell(sec, ppi, ci, cei, cpi, 0, result);
+            committed = true;
+            return pos;
+          },
+        });
+        if (committed) emitCellTextReplacementRealtimeOperations(ih, sec, ppi, ci, cei, cpi, text, result);
       } catch (err) {
         console.warn('[table:decimal-add] 자릿점 넣기 실패:', err);
       }
@@ -1203,10 +1577,24 @@ export const tableCommands: CommandDef[] = [
         const newDecimals = decimals.slice(0, -1);
         const result = newDecimals ? sign + fmtInt + '.' + newDecimals : sign + fmtInt;
         if (result === text) return;
-        services.wasm.deleteTextInCell(sec, ppi, ci, cei, cpi, 0, len);
-        services.wasm.insertTextInCell(sec, ppi, ci, cei, cpi, 0, result);
-        emitCellTextReplacementRealtimeOperations(ih, sec, ppi, ci, cei, cpi, text, result);
-        services.eventBus.emit('document-changed');
+        // [#2344] delete+insert 를 하나의 snapshot 으로 원자화해 라우팅 — 미기록 시 셀 문자
+        // 수가 바뀌어 후속 undo 오프셋이 오염되고 텍스트가 손상된다("1234567"→쉼표→Ctrl+Z="67").
+        // 라우터가 refresh 하므로 수동 document-changed emit 은 제거.
+        // [Task #2370] 종전에는 여기를 safeTableOp 으로 한 겹 더 감쌌으나, 이 문장이 바깥
+        // try 의 마지막이라 바깥 catch 는 도달할 수 없었다. 관측 차이는 로그뿐이고 바깥
+        // catch 의 메시지가 더 구체적이므로 한 겹만 남긴다.
+        let committed = false;
+        ih.executeOperation({
+          kind: 'snapshot',
+          operationType: 'cellNumberFormat',
+          operation: (wasm) => {
+            wasm.deleteTextInCell(sec, ppi, ci, cei, cpi, 0, len);
+            wasm.insertTextInCell(sec, ppi, ci, cei, cpi, 0, result);
+            committed = true;
+            return pos;
+          },
+        });
+        if (committed) emitCellTextReplacementRealtimeOperations(ih, sec, ppi, ci, cei, cpi, text, result);
       } catch (err) {
         console.warn('[table:decimal-remove] 자릿점 빼기 실패:', err);
       }

@@ -4,7 +4,19 @@
 import { MoveTableCommand, MovePictureCommand, MoveShapeCommand } from './command';
 import { getObjectProperties, setObjectProperties } from './input-handler-picture';
 import type { CellBbox } from '@/core/types';
+import type { WasmBridge } from '@/core/wasm-bridge';
 import type { BorderEdge } from './table-resize-renderer';
+import {
+  buildColumnResizeUpdates,
+  buildLocalResizeUpdates,
+  buildBoundaryResizeUpdates,
+  buildCellSelectionColumnDragUpdates,
+  cellOverlapsSelectionRange,
+  findResizeCompensationNeighbors,
+  type CellSelectionRange,
+  type LocalResizeUpdate,
+  type ResizeArrowKey,
+} from './table-resize-updates';
 import { showToast } from '@/ui/toast';
 
 const MIN_TABLE_CELL_SIZE_HWP = 200;
@@ -99,17 +111,24 @@ function computeAffectedResizePositionBounds(
   for (const cellIdx of affectedCellIndices) {
     const targetBox = bboxes.find(b => b.cellIdx === cellIdx);
     if (!targetBox) continue;
-    const neighborIdx = findResizeCompensationNeighbor(edge, targetBox, bboxes);
-    const neighborBox = neighborIdx === null
-      ? null
-      : bboxes.find(b => b.cellIdx === neighborIdx) ?? null;
+    const neighborBoxes = findResizeCompensationNeighbors(edge, targetBox, bboxes);
 
     if (edge.type === 'col') {
       min = Math.max(min, targetBox.x + minSizePx);
-      max = Math.min(max, neighborBox ? neighborBox.x + neighborBox.w - minSizePx : maxX);
+      max = Math.min(
+        max,
+        neighborBoxes.length > 0
+          ? Math.min(...neighborBoxes.map(b => b.x + b.w - minSizePx))
+          : maxX,
+      );
     } else {
       min = Math.max(min, targetBox.y + minSizePx);
-      max = Math.min(max, neighborBox ? neighborBox.y + neighborBox.h - minSizePx : maxY);
+      max = Math.min(
+        max,
+        neighborBoxes.length > 0
+          ? Math.min(...neighborBoxes.map(b => b.y + b.h - minSizePx))
+          : maxY,
+      );
     }
     found = true;
   }
@@ -503,25 +522,12 @@ function pushLocalResizeDisplayHint(
   }
 }
 
-function findResizeCompensationNeighbor(
-  edge: BorderEdge,
-  bbox: CellBbox,
-  bboxes: CellBbox[],
-): number | null {
-  if (edge.type === 'col') {
-    const neighbor = bboxes.find(b => b.row === bbox.row && b.col === bbox.col + bbox.colSpan);
-    return neighbor?.cellIdx ?? null;
-  }
-
-  const neighbor = bboxes.find(b => b.col === bbox.col && b.row === bbox.row + bbox.rowSpan);
-  return neighbor?.cellIdx ?? null;
-}
 
 function clampCompensatedResizeDelta(
   wasm: any,
   tableRef: { sec: number; ppi: number; ci: number },
   edge: BorderEdge,
-  pairs: Array<{ targetCellIdx: number; neighborCellIdx: number | null }>,
+  pairs: Array<{ targetCellIdx: number; neighborCellIdxs: number[] }>,
   requestedDelta: number,
 ): number {
   if (requestedDelta === 0) return 0;
@@ -535,8 +541,8 @@ function clampCompensatedResizeDelta(
         finiteLimits.push(Math.max(0, Math.round(targetSize - MIN_TABLE_CELL_SIZE_HWP)));
       }
 
-      if (pair.neighborCellIdx !== null) {
-        const neighborProps = wasm.getCellProperties(tableRef.sec, tableRef.ppi, tableRef.ci, pair.neighborCellIdx);
+      for (const neighborCellIdx of pair.neighborCellIdxs) {
+        const neighborProps = wasm.getCellProperties(tableRef.sec, tableRef.ppi, tableRef.ci, neighborCellIdx);
         const neighborSize = edge.type === 'col' ? neighborProps.width : neighborProps.height;
         if (requestedDelta > 0 && Number.isFinite(neighborSize)) {
           finiteLimits.push(Math.max(0, Math.round(neighborSize - MIN_TABLE_CELL_SIZE_HWP)));
@@ -555,7 +561,7 @@ function clampCompensatedResizeDelta(
 
 function clampCompensatedDisplayDelta(
   edge: BorderEdge,
-  pairs: Array<{ targetBox: CellBbox; neighborBox: CellBbox | null }>,
+  pairs: Array<{ targetBox: CellBbox; neighborBoxes: CellBbox[] }>,
   requestedDelta: number,
 ): number {
   if (requestedDelta === 0) return 0;
@@ -563,10 +569,11 @@ function clampCompensatedDisplayDelta(
 
   for (const pair of pairs) {
     if (requestedDelta > 0) {
-      if (!pair.neighborBox) continue;
-      finiteLimits.push(
-        Math.max(0, getCellDisplaySize(pair.neighborBox, edge) - MIN_TABLE_CELL_SIZE_HWP),
-      );
+      for (const neighborBox of pair.neighborBoxes) {
+        finiteLimits.push(
+          Math.max(0, getCellDisplaySize(neighborBox, edge) - MIN_TABLE_CELL_SIZE_HWP),
+        );
+      }
     } else {
       finiteLimits.push(
         Math.max(0, getCellDisplaySize(pair.targetBox, edge) - MIN_TABLE_CELL_SIZE_HWP),
@@ -869,40 +876,17 @@ export function finishResizeDrag(this: any, e: MouseEvent): void {
       return;
     }
   } else if (state.edge.type === 'col' && inCellSel && range) {
-    // 선택 셀만 추출
+    // 선택 셀만 추출 — 병합 셀은 시작 좌표가 아니라 겹침으로 판정한다
     const selectedBboxes = state.affectedCellIndices
       .map((cellIdx: any) => state.bboxes.find((b: any) => b.cellIdx === cellIdx))
-      .filter((b: any): b is CellBbox =>
-        b !== undefined &&
-        b.row >= range.startRow && b.row <= range.endRow &&
-        b.col >= range.startCol && b.col <= range.endCol);
+      .filter((b: any): b is CellBbox => b !== undefined && cellOverlapsSelectionRange(b, range));
     if (selectedBboxes.length === 0) {
       this.cleanupResizeDrag();
       return;
     }
-    updates = [];
-    const addedNeighbors = new Set<number>();
-    for (const bbox of selectedBboxes) {
-      if (state.edge.type === 'col') {
-        updates.push({ cellIdx: bbox.cellIdx, widthDelta: deltaHwpUnit });
-        // 같은 행의 오른쪽 이웃 셀에 반대 delta
-        const neighbor = state.bboxes.find((b: any) =>
-          b.row === bbox.row && b.col === bbox.col + bbox.colSpan);
-        if (neighbor && !addedNeighbors.has(neighbor.cellIdx)) {
-          updates.push({ cellIdx: neighbor.cellIdx, widthDelta: -deltaHwpUnit });
-          addedNeighbors.add(neighbor.cellIdx);
-        }
-      } else {
-        updates.push({ cellIdx: bbox.cellIdx, heightDelta: deltaHwpUnit });
-        // 같은 열의 아래쪽 이웃 셀에 반대 delta
-        const neighbor = state.bboxes.find((b: any) =>
-          b.col === bbox.col && b.row === bbox.row + bbox.rowSpan);
-        if (neighbor && !addedNeighbors.has(neighbor.cellIdx)) {
-          updates.push({ cellIdx: neighbor.cellIdx, heightDelta: -deltaHwpUnit });
-          addedNeighbors.add(neighbor.cellIdx);
-        }
-      }
-    }
+    // 오른쪽 이웃 보상은 병합 셀이 걸친 모든 행을 쓸어야 한다 — 시작 행만 보상하면
+    // 행별 열 폭 합이 어긋나 표가 깨진다. (이 분기는 edge.type === 'col' 전용이다)
+    updates = buildCellSelectionColumnDragUpdates(selectedBboxes, state.bboxes, deltaHwpUnit);
     if (updates.length === 0) {
       this.cleanupResizeDrag();
       return;
@@ -916,25 +900,24 @@ export function finishResizeDrag(this: any, e: MouseEvent): void {
     const targetBboxes = state.affectedCellIndices
       .map((cellIdx: any) => state.bboxes.find((b: any) => b.cellIdx === cellIdx))
       .filter((b: any): b is CellBbox => b !== undefined);
-    const pairs: Array<{ targetCellIdx: number; neighborCellIdx: number | null }> =
+    const pairs: Array<{ targetCellIdx: number; neighborCellIdxs: number[] }> =
       targetBboxes.map((bbox: CellBbox) => ({
       targetCellIdx: bbox.cellIdx,
-      neighborCellIdx: findResizeCompensationNeighbor(state.edge, bbox, state.bboxes),
+      neighborCellIdxs: findResizeCompensationNeighbors(state.edge, bbox, state.bboxes)
+        .map(neighbor => neighbor.cellIdx),
     }));
     const pairBoxes = pairs
-      .map((pair: { targetCellIdx: number; neighborCellIdx: number | null }) => ({
+      .map((pair: { targetCellIdx: number; neighborCellIdxs: number[] }) => ({
         targetCellIdx: pair.targetCellIdx,
-        neighborCellIdx: pair.neighborCellIdx,
         targetBox: state.bboxes.find((b: CellBbox) => b.cellIdx === pair.targetCellIdx),
-        neighborBox: pair.neighborCellIdx === null
-          ? null
-          : state.bboxes.find((b: CellBbox) => b.cellIdx === pair.neighborCellIdx) ?? null,
+        neighborBoxes: pair.neighborCellIdxs
+          .map(cellIdx => state.bboxes.find((b: CellBbox) => b.cellIdx === cellIdx))
+          .filter((b): b is CellBbox => b !== undefined),
       }))
       .filter((pair): pair is {
         targetCellIdx: number;
-        neighborCellIdx: number | null;
         targetBox: CellBbox;
-        neighborBox: CellBbox | null;
+        neighborBoxes: CellBbox[];
       } => pair.targetBox !== undefined);
     const hasLocalHistory = hasLocalResizeHistory(this, state.tableRef);
     const delta = hasLocalHistory
@@ -973,25 +956,26 @@ export function finishResizeDrag(this: any, e: MouseEvent): void {
         );
         updatedCells.add(pair.targetCellIdx);
 
-        if (pair.neighborCellIdx !== null && pair.neighborBox && !updatedCells.has(pair.neighborCellIdx)) {
+        for (const neighborBox of pair.neighborBoxes) {
+          if (updatedCells.has(neighborBox.cellIdx)) continue;
           const neighborProps = this.wasm.getCellProperties(
             state.tableRef.sec,
             state.tableRef.ppi,
             state.tableRef.ci,
-            pair.neighborCellIdx,
+            neighborBox.cellIdx,
           );
           const neighborDesiredSize = Math.max(
             MIN_TABLE_CELL_SIZE_HWP,
-            getCellDisplaySize(pair.neighborBox, state.edge) - delta,
+            getCellDisplaySize(neighborBox, state.edge) - delta,
           );
           pushLocalResizeDisplayHint(
             updates,
             state.edge,
-            pair.neighborCellIdx,
+            neighborBox.cellIdx,
             neighborDesiredSize,
             neighborDesiredSize - getCellModelSize(neighborProps, state.edge),
           );
-          updatedCells.add(pair.neighborCellIdx);
+          updatedCells.add(neighborBox.cellIdx);
         }
       }
       for (const box of state.bboxes) {
@@ -1012,15 +996,17 @@ export function finishResizeDrag(this: any, e: MouseEvent): void {
       for (const pair of pairs) {
         if (state.edge.type === 'col') {
           updates.push({ cellIdx: pair.targetCellIdx, widthDelta: delta });
-          if (pair.neighborCellIdx !== null && !addedNeighbors.has(pair.neighborCellIdx)) {
-            updates.push({ cellIdx: pair.neighborCellIdx, widthDelta: -delta });
-            addedNeighbors.add(pair.neighborCellIdx);
+          for (const neighborCellIdx of pair.neighborCellIdxs) {
+            if (addedNeighbors.has(neighborCellIdx)) continue;
+            updates.push({ cellIdx: neighborCellIdx, widthDelta: -delta });
+            addedNeighbors.add(neighborCellIdx);
           }
         } else {
           updates.push({ cellIdx: pair.targetCellIdx, heightDelta: delta });
-          if (pair.neighborCellIdx !== null && !addedNeighbors.has(pair.neighborCellIdx)) {
-            updates.push({ cellIdx: pair.neighborCellIdx, heightDelta: -delta });
-            addedNeighbors.add(pair.neighborCellIdx);
+          for (const neighborCellIdx of pair.neighborCellIdxs) {
+            if (addedNeighbors.has(neighborCellIdx)) continue;
+            updates.push({ cellIdx: neighborCellIdx, heightDelta: -delta });
+            addedNeighbors.add(neighborCellIdx);
           }
         }
       }
@@ -1218,21 +1204,25 @@ export function finishImagePlacement(this: any, e: MouseEvent): void {
   // 개체 설명문 생성 (한컴 기본 패턴)
   const desc = `그림입니다.\r\n원본 그림의 이름: ${imgData.fileName}\r\n원본 그림의 크기: 가로 ${imgData.naturalWidth}pixel, 세로 ${imgData.naturalHeight}pixel`;
 
-  // WASM 호출
+  // WASM 호출 — 스냅샷으로 기록 (Undo 지원, pasteImage 경로와 동일 패턴)
   try {
-    const result = this.wasm.insertPicture(
-      sec, paraIdx, charOffset, cellPathJson, imgData.data,
-      wHwp, hHwp, imgData.naturalWidth, imgData.naturalHeight,
-      imgData.ext, desc,
-      paperOffsetXHu, paperOffsetYHu,
-    );
-    if (result.ok) {
-      this.eventBus.emit('document-changed');
-    } else {
-      const msg = (result as any).error || '삽입 위치 또는 이미지 정보를 확인할 수 없습니다.';
-      console.warn('[InputHandler] 그림 삽입 실패:', result);
+    let insertFailedMsg: string | null = null;
+    this.executeOperation({ kind: 'snapshot', operationType: 'insertPicture', operation: (wasm: WasmBridge) => {
+      const result = wasm.insertPicture(
+        sec, paraIdx, charOffset, cellPathJson, imgData.data,
+        wHwp, hHwp, imgData.naturalWidth, imgData.naturalHeight,
+        imgData.ext, desc,
+        paperOffsetXHu, paperOffsetYHu,
+      );
+      if (!result.ok) {
+        insertFailedMsg = (result as any).error || '삽입 위치 또는 이미지 정보를 확인할 수 없습니다.';
+        console.warn('[InputHandler] 그림 삽입 실패:', result);
+      }
+      return this.cursor.getPosition();
+    }});
+    if (insertFailedMsg) {
       showToast({
-        message: `그림 삽입에 실패했습니다.\n${msg}`,
+        message: `그림 삽입에 실패했습니다.\n${insertFailedMsg}`,
         durationMs: 6000,
       });
     }
@@ -1411,44 +1401,29 @@ export function finishMoveDrag(this: any): void {
   }
 }
 
-export function resizeCellByKeyboard(this: any, key: 'ArrowUp' | 'ArrowDown' | 'ArrowLeft' | 'ArrowRight'): void {
+/** 세 모드 공통: 셀 bbox 조회 → 빌더 → snapshot 라우팅. */
+function applyKeyboardResize(
+  this: any,
+  key: ResizeArrowKey,
+  operationType: string,
+  build: (bboxes: CellBbox[], range: CellSelectionRange, key: ResizeArrowKey) => LocalResizeUpdate[],
+): void {
   const ctx = this.cursor.getCellTableContext();
   const range = this.cursor.getSelectedCellRange();
   if (!ctx || !range) return;
 
-  const DELTA = 300; // 1 키스트로크 당 300 HWPUNIT (~1mm)
   let bboxes: CellBbox[];
   try {
     bboxes = this.wasm.getTableCellBboxes(ctx.sec, ctx.ppi, ctx.ci);
   } catch { return; }
 
-  // 선택 범위 내 셀 bbox 추출
-  const selectedBboxes = bboxes
-    .filter(b => b.row >= range.startRow && b.row <= range.endRow
-              && b.col >= range.startCol && b.col <= range.endCol);
-  if (selectedBboxes.length === 0) return;
-
-  const updates: Array<{ cellIdx: number; widthDelta?: number; heightDelta?: number }> = [];
-  const updatedCells = new Set<number>();
-  const isHoriz = (key === 'ArrowLeft' || key === 'ArrowRight');
-  const delta = (key === 'ArrowRight' || key === 'ArrowDown') ? DELTA : -DELTA;
-
-  // 선택 블록 내부 이웃에 반대 delta를 넣으면 전체 선택에서 첫 행/열만 변한다.
-  // 한컴처럼 선택된 셀들은 모두 같은 방향으로 크기를 조정한다.
-  for (const bbox of selectedBboxes) {
-    if (updatedCells.has(bbox.cellIdx)) continue;
-    updatedCells.add(bbox.cellIdx);
-    if (isHoriz) {
-      updates.push({ cellIdx: bbox.cellIdx, widthDelta: delta });
-    } else {
-      updates.push({ cellIdx: bbox.cellIdx, heightDelta: delta });
-    }
-  }
+  const updates = build(bboxes, range, key);
+  if (updates.length === 0) return;
 
   try {
     this.executeOperation({
       kind: 'snapshot',
-      operationType: 'resizeCellByKeyboard',
+      operationType,
       operation: (wasm: any) => {
         wasm.resizeTableCells(ctx.sec, ctx.ppi, ctx.ci, updates);
         return this.cursor.getPosition();
@@ -1456,8 +1431,23 @@ export function resizeCellByKeyboard(this: any, key: 'ArrowUp' | 'ArrowDown' | '
     });
     this.updateCellSelection();
   } catch (err) {
-    console.warn('[InputHandler] resizeCellByKeyboard 실패:', err);
+    console.warn(`[InputHandler] ${operationType} 실패:`, err);
   }
+}
+
+/** Ctrl/Cmd+방향키 — 칸/줄 전체 크기 조절 (한컴 table(size).htm). */
+export function resizeCellByKeyboard(this: any, key: ResizeArrowKey): void {
+  applyKeyboardResize.call(this, key, 'resizeCellByKeyboard', buildColumnResizeUpdates);
+}
+
+/** Alt+방향키 — 선택 칸/줄과 바로 오른쪽/아래 이웃을 반대로 조절 (한컴 table(size).htm). */
+export function resizeCellLocalByKeyboard(this: any, key: ResizeArrowKey): void {
+  applyKeyboardResize.call(this, key, 'resizeCellLocalByKeyboard', buildLocalResizeUpdates);
+}
+
+/** Shift+방향키 — 경계 이동, 이웃이 반대로 조절 (한컴 table(size).htm). */
+export function resizeCellBoundaryByKeyboard(this: any, key: ResizeArrowKey): void {
+  applyKeyboardResize.call(this, key, 'resizeCellBoundaryByKeyboard', buildBoundaryResizeUpdates);
 }
 
 /** 전체 표 비율 리사이즈 (phase 3, Ctrl+방향키) */

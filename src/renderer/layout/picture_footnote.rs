@@ -1,8 +1,8 @@
 //! 그림/캡션 레이아웃 + 각주 영역 레이아웃
 
-use super::super::composer::{compose_paragraph, ComposedParagraph};
+use super::super::composer::{compose_paragraph, ComposedLine, ComposedParagraph};
 use super::super::page_layout::LayoutRect;
-use super::super::pagination::{FootnoteRef, FootnoteSource};
+use super::super::pagination::{FootnoteFragment, FootnoteRef, FootnoteSource};
 use super::super::render_tree::*;
 use super::super::style_resolver::ResolvedStyleSet;
 use super::super::{
@@ -11,8 +11,10 @@ use super::super::{
 };
 use super::border_rendering::border_width_to_px;
 use super::text_measurement::{estimate_text_width, resolved_to_text_style};
-use super::utils::{extract_shape_transform, find_bin_data, picture_display_size_hu};
-use super::LayoutEngine;
+use super::utils::{
+    extract_shape_transform, find_bin_data_bytes, picture_data_is_unusable, picture_display_size_hu,
+};
+use super::{footnote_separator_length_px, LayoutEngine};
 use crate::model::bin_data::BinDataContent;
 use crate::model::control::Control;
 use crate::model::footnote::{FootnoteShape, NumberFormat};
@@ -20,13 +22,85 @@ use crate::model::paragraph::Paragraph;
 use crate::model::shape::{
     Caption, CaptionDirection, CommonObjAttr, HorzAlign, HorzRelTo, TextWrap, VertAlign, VertRelTo,
 };
-use crate::model::style::Alignment;
+use crate::model::style::{Alignment, LineSpacingType};
+
+fn fragment_line_bounds(fragment: Option<FootnoteFragment>, total_lines: usize) -> (usize, usize) {
+    match fragment {
+        Some(fragment) => {
+            let start = fragment.start_line.min(total_lines);
+            let end = fragment.end_line.clamp(start, total_lines);
+            (start, end)
+        }
+        None => (0, total_lines),
+    }
+}
+
+fn fragment_draws_separator(fragment: Option<FootnoteFragment>) -> bool {
+    fragment
+        .map(|fragment| fragment.draw_separator)
+        .unwrap_or(true)
+}
+
+fn fragment_draws_number(fragment: Option<FootnoteFragment>) -> bool {
+    fragment
+        .map(|fragment| fragment.draw_number)
+        .unwrap_or(true)
+}
+
+/// [#6034] 저장 LINE_SEG 가 없는 각주 문단은 45자 고정 휴리스틱(compose_lines
+/// 폴백) 대신 **각주 영역 폭**으로 재조판해 compose 한다. 한글 6.x 대 저장본은
+/// 각주 문단에 LINE_SEG 를 저장하지 않는데, 폴백 폭과 실제 영역 폭의 차가 각주
+/// 블록을 부풀려(2912735: rhwp 15줄 vs 한글 9줄) bottom-anchor 인 영역 상단이
+/// 본문 마지막 줄 위로 올라가 구분선이 글줄을 관통했다. 편집 경로
+/// (footnote_ops)의 reflow 계약과 같은 상자를 쓴다. LINE_SEG 가 있으면 종전
+/// 그대로 통과한다.
+fn compose_footnote_paragraph(
+    para: &Paragraph,
+    content_width_px: f64,
+    styles: &ResolvedStyleSet,
+    dpi: f64,
+) -> crate::renderer::composer::ComposedParagraph {
+    if para.line_segs.is_empty() && !para.text.is_empty() && content_width_px > 0.0 {
+        let para_style = styles.para_styles.get(para.para_shape_id as usize);
+        let margin_left = para_style.map(|s| s.margin_left).unwrap_or(0.0);
+        let margin_right = para_style.map(|s| s.margin_right).unwrap_or(0.0);
+        let final_width = (content_width_px - margin_left - margin_right).max(0.0);
+        if final_width > 0.0 {
+            let mut owned = para.clone();
+            crate::renderer::composer::reflow_line_segs(
+                &mut owned,
+                crate::renderer::composer::ParagraphBox::content_width_px(final_width, dpi),
+                styles,
+                dpi,
+            );
+            return compose_paragraph(&owned);
+        }
+    }
+    compose_paragraph(para)
+}
+
+fn footnote_composed_line_count(
+    paragraphs: &[Paragraph],
+    content_width_px: f64,
+    styles: &ResolvedStyleSet,
+    dpi: f64,
+) -> usize {
+    paragraphs
+        .iter()
+        .map(|paragraph| {
+            compose_footnote_paragraph(paragraph, content_width_px, styles, dpi)
+                .lines
+                .len()
+                .max(1)
+        })
+        .sum()
+}
 
 impl LayoutEngine {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn layout_picture(
         &self,
-        tree: &mut PageRenderTree,
+        tree: &mut PageLayoutContext,
         parent_node: &mut RenderNode,
         picture: &crate::model::image::Picture,
         container: &LayoutRect,
@@ -36,6 +110,8 @@ impl LayoutEngine {
         para_index: Option<usize>,
         control_index: Option<usize>,
         cell_ctx: Option<&crate::renderer::layout::CellContext>,
+        // [#6284] 캡션 문단 조판에 필요하다.
+        styles: &ResolvedStyleSet,
     ) {
         // [Task #825] 본문 picture 경로 — header_footer_ref = None
         self.layout_picture_full(
@@ -50,6 +126,7 @@ impl LayoutEngine {
             control_index,
             None,
             cell_ctx,
+            styles,
         );
     }
 
@@ -63,7 +140,7 @@ impl LayoutEngine {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn layout_picture_full(
         &self,
-        tree: &mut PageRenderTree,
+        tree: &mut PageLayoutContext,
         parent_node: &mut RenderNode,
         picture: &crate::model::image::Picture,
         container: &LayoutRect,
@@ -74,6 +151,8 @@ impl LayoutEngine {
         control_index: Option<usize>,
         header_footer_ref: Option<crate::renderer::render_tree::HeaderFooterImageRef>,
         cell_ctx: Option<&crate::renderer::layout::CellContext>,
+        // [#6284] 캡션 문단 조판에 필요하다.
+        styles: &ResolvedStyleSet,
     ) {
         // 그림 크기 (HWPUNIT → 픽셀)
         // 회전 picture에서 common.width/height는 한컴이 저장한 회전 후 외접 프레임이고
@@ -123,6 +202,50 @@ impl LayoutEngine {
             pic_width *= scale;
         }
 
+        // [#6284] 캡션 띠 — 그림이 차지하는 블록은 그림 + 캡션이다.
+        //
+        // 이 계약은 형제 함수 `layout_body_picture` 에 이미 있었는데, 본문 그림을
+        // 실제로 그리는 이 경로에는 없었다. 그래서 `side="TOP"` 캡션이 통째로
+        // 사라지고 그림이 캡션 띠만큼(≈15.6~20px) 위로 올라왔다
+        // (156562502: 캡션 17개 전부 TOP, 그림 9개가 3pt 초과로 어긋남).
+        let caption_band_height =
+            crate::renderer::composer::caption_height_px(&picture.caption, self.dpi);
+        let caption_spacing = picture
+            .caption
+            .as_ref()
+            .map(|c| hwpunit_to_px(c.spacing as i32, self.dpi))
+            .unwrap_or(0.0);
+        let (caption_top_offset, caption_left_offset, caption_band_width) =
+            match picture.caption.as_ref().map(|c| c.direction) {
+                Some(CaptionDirection::Top) => (caption_band_height + caption_spacing, 0.0, 0.0),
+                Some(CaptionDirection::Left) => {
+                    let cw = picture
+                        .caption
+                        .as_ref()
+                        .map(|c| hwpunit_to_px(c.width as i32, self.dpi))
+                        .unwrap_or(0.0);
+                    (0.0, cw + caption_spacing, cw + caption_spacing)
+                }
+                Some(CaptionDirection::Right) => {
+                    let cw = picture
+                        .caption
+                        .as_ref()
+                        .map(|c| hwpunit_to_px(c.width as i32, self.dpi))
+                        .unwrap_or(0.0);
+                    (0.0, 0.0, cw + caption_spacing)
+                }
+                _ => (0.0, 0.0, 0.0),
+            };
+        // Bottom 캡션은 그림을 밀지 않고 블록 높이만 늘린다.
+        let caption_block_extra_height = match picture.caption.as_ref().map(|c| c.direction) {
+            Some(CaptionDirection::Top) | Some(CaptionDirection::Bottom) => {
+                caption_band_height + caption_spacing
+            }
+            _ => 0.0,
+        };
+        let block_width = frame_width + caption_band_width;
+        let block_height = frame_height + caption_block_extra_height;
+
         // 그림 위치: non-TAC 이미지는 common 속성의 offset 적용
         // 머리말/꼬리말에서 vert=Paper는 상단여백(header area) 기준
         let (pic_x, pic_y) = if !picture.common.treat_as_char {
@@ -130,41 +253,64 @@ impl LayoutEngine {
             let v_offset = hwpunit_to_px(picture.common.vertical_offset as i32, self.dpi);
             let frame_x = match picture.common.horz_align {
                 HorzAlign::Left | HorzAlign::Inside => container.x + h_offset,
-                HorzAlign::Center => container.x + (container.width - frame_width) / 2.0 + h_offset,
+                HorzAlign::Center => container.x + (container.width - block_width) / 2.0 + h_offset,
                 HorzAlign::Right | HorzAlign::Outside => {
-                    container.x + container.width - frame_width - h_offset
+                    container.x + container.width - block_width - h_offset
                 }
             };
             let frame_y = match picture.common.vert_align {
                 VertAlign::Top | VertAlign::Inside => container.y + v_offset,
                 VertAlign::Center => {
-                    container.y + (container.height - frame_height) / 2.0 + v_offset
+                    container.y + (container.height - block_height) / 2.0 + v_offset
                 }
                 VertAlign::Bottom | VertAlign::Outside => {
-                    container.y + container.height - frame_height - v_offset
+                    container.y + container.height - block_height - v_offset
                 }
             };
             (
-                frame_x + (frame_width - pic_width) / 2.0,
-                frame_y + (frame_height - pic_height) / 2.0,
+                frame_x + caption_left_offset + (frame_width - pic_width) / 2.0,
+                frame_y + caption_top_offset + (frame_height - pic_height) / 2.0,
             )
         } else {
             let frame_x = match alignment {
                 Alignment::Center | Alignment::Distribute => {
-                    container.x + (container.width - frame_width).max(0.0) / 2.0
+                    container.x + (container.width - block_width).max(0.0) / 2.0
                 }
-                Alignment::Right => container.x + (container.width - frame_width).max(0.0),
+                Alignment::Right => container.x + (container.width - block_width).max(0.0),
                 _ => container.x,
             };
             (
-                frame_x + (frame_width - pic_width) / 2.0,
-                container.y + (frame_height - pic_height) / 2.0,
+                frame_x + caption_left_offset + (frame_width - pic_width) / 2.0,
+                container.y + caption_top_offset + (frame_height - pic_height) / 2.0,
             )
         };
 
         // BinData에서 이미지 데이터 찾기 (bin_data_id는 1-indexed 순번)
         let bin_data_id = picture.image_attr.bin_data_id;
-        let image_data = find_bin_data(bin_data_content, bin_data_id).map(|c| c.data.clone());
+        let image_data = find_bin_data_bytes(bin_data_content, bin_data_id);
+        // [Task #2225] 그림 미지정(bin 참조 실패 + 외부 경로 없음): 한컴은 편집기
+        // 에서만 점선 테두리+그림-없음 아이콘으로 표시하고 인쇄 등가 출력은
+        // 미출력 — 의미 노드(MissingPicture)로 방출해 백엔드별 분기를 일원화.
+        if picture_data_is_unusable(image_data.as_deref())
+            && picture.image_attr.external_path.is_none()
+        {
+            let ph_id = tree.next_id();
+            parent_node.children.push(RenderNode::new(
+                ph_id,
+                RenderNodeType::Placeholder(
+                    // [Task #2230] 문서 좌표 + 셀 경로 배선 — 편집 뷰 클릭
+                    // 선택·그림 지정의 대상 특정에 사용.
+                    crate::renderer::render_tree::PlaceholderNode::missing_picture(
+                        section_index,
+                        para_index,
+                        control_index,
+                        cell_ctx.cloned(),
+                    ),
+                ),
+                BoundingBox::new(pic_x, pic_y, pic_width, pic_height),
+            ));
+            return;
+        }
 
         // 그림 자르기: crop 좌표를 그대로 저장 (렌더러에서 이미지 px 크기와 비교)
         let crop = {
@@ -179,16 +325,8 @@ impl LayoutEngine {
             }
         };
 
-        // 원본 이미지 크기(HU) — crop 좌표 보정용
-        let original_size_hu =
-            if picture.shape_attr.original_width > 0 && picture.shape_attr.original_height > 0 {
-                Some((
-                    picture.shape_attr.original_width,
-                    picture.shape_attr.original_height,
-                ))
-            } else {
-                None
-            };
+        // crop 좌표 기준 범위(imgDim). orgSz는 개체 크기이므로 사용하지 않는다.
+        let original_size_hu = picture.crop_reference_size();
 
         // 이미지 노드 생성
         // [Task #1151 v7 항목 1] cell_ctx 의 3 필드 매핑은 CellContext::last_image_indices()
@@ -224,6 +362,65 @@ impl LayoutEngine {
         );
 
         parent_node.children.push(img_node);
+
+        // [#6284] 캡션 렌더링 — 기하는 위에서 예약한 띠와 같은 산식이다
+        // (`layout_body_picture` 의 캡션 방출부와 같은 규칙).
+        if let Some(ref caption) = picture.caption {
+            use crate::model::shape::CaptionVertAlign;
+            let (cap_x, cap_w, cap_y) = match caption.direction {
+                CaptionDirection::Top => (
+                    pic_x,
+                    pic_width,
+                    (pic_y - caption_top_offset).max(container.y),
+                ),
+                CaptionDirection::Bottom => {
+                    (pic_x, pic_width, pic_y + pic_height + caption_spacing)
+                }
+                CaptionDirection::Left | CaptionDirection::Right => {
+                    let cw = hwpunit_to_px(caption.width as i32, self.dpi);
+                    let cx = if caption.direction == CaptionDirection::Left {
+                        pic_x - caption_left_offset
+                    } else {
+                        pic_x + pic_width + caption_spacing
+                    };
+                    let cy = match caption.vert_align {
+                        CaptionVertAlign::Top => pic_y,
+                        CaptionVertAlign::Center => {
+                            pic_y + (pic_height - caption_band_height).max(0.0) / 2.0
+                        }
+                        CaptionVertAlign::Bottom => {
+                            pic_y + (pic_height - caption_band_height).max(0.0)
+                        }
+                    };
+                    (cx, cw, cy)
+                }
+            };
+            let caption_cell_ctx = cell_ctx.cloned().or_else(|| {
+                para_index.map(|pi| super::CellContext {
+                    in_textbox: false,
+                    parent_para_index: pi,
+                    path: vec![super::CellPathEntry {
+                        control_index: control_index.unwrap_or(0),
+                        cell_index: 0,
+                        cell_para_index: 0,
+                        text_direction: 0,
+                    }],
+                })
+            });
+            self.layout_caption(
+                tree,
+                parent_node,
+                caption,
+                styles,
+                container,
+                cap_x,
+                cap_w,
+                cap_y,
+                &mut self.auto_counter.borrow_mut(),
+                bin_data_content,
+                caption_cell_ctx,
+            );
+        }
 
         // [Task #1151 v4] tac=true 셀 안 picture 의 위치를 inline_shape_positions 에 등록 →
         // cursor_rect 의 hit-test 루프가 picture 클릭 인식. 셀 외부 / 본문 picture 는
@@ -344,7 +541,7 @@ impl LayoutEngine {
     /// 본문 그림(Picture) 개체를 레이아웃하고 업데이트된 y_offset을 반환한다.
     pub(crate) fn layout_body_picture(
         &self,
-        tree: &mut PageRenderTree,
+        tree: &mut PageLayoutContext,
         parent_node: &mut RenderNode,
         picture: &crate::model::image::Picture,
         container: &LayoutRect,
@@ -364,7 +561,8 @@ impl LayoutEngine {
         vpos_accounts_for_height: bool,
     ) -> f64 {
         // 그림 크기 (HWPUNIT → 픽셀)
-        let (pic_width_hu, pic_height_hu) = picture_display_size_hu(picture);
+        // [Issue #1230] 측면흐름 wrap 은 common(개체 틀) 프레임으로 그린다.
+        let (pic_width_hu, pic_height_hu) = super::utils::picture_flow_frame_size_hu(picture);
         let pic_width = hwpunit_to_px(pic_width_hu, self.dpi);
         let pic_height = hwpunit_to_px(pic_height_hu, self.dpi);
 
@@ -404,6 +602,26 @@ impl LayoutEngine {
             alignment,
         );
 
+        // [Issue #2032] restrictInPage(쪽 영역 안으로 제한, HWP5 attr bit 13 = HWPX pos@flowWithText):
+        // vert=Para floating 그림의 하단이 쪽 영역을 벗어나면 쪽 영역 안으로 끌어올린다.
+        // 미적용 시 앵커+offset 조합으로 좌표가 페이지 캔버스 밖이 되어 그림이 어느
+        // 페이지에서도 보이지 않는다 (완전 소실). floating 표 동등 로직
+        // (table_layout.rs compute_table_y 의 Para 클램프) 과 동일 시멘틱.
+        // 상단(top bleed) 은 한컴도 허용하는 사례가 있어 하단 초과만 교정한다
+        // (표의 allow_para_top_bleed 예외와 동일 취지).
+        // vpos_accounts_for_height(파일 vpos 가 그림 공간을 이미 반영) 이면 그림은
+        // base_y 위쪽 gap 안에 그려지므로 (frame 하단 = base_y) 클램프 비대상.
+        let base_y = if !picture.common.treat_as_char
+            && picture.common.flow_with_text
+            && !vpos_accounts_for_height
+            && matches!(picture.common.vert_rel_to, VertRelTo::Para)
+        {
+            let body_bottom = col_area.y + col_area.height - total_height;
+            base_y.min(body_bottom.max(col_area.y))
+        } else {
+            base_y
+        };
+
         // 캡션 방향에 따라 그림 위치 오프셋 계산
         let (caption_top_offset, caption_left_offset) = if let Some(ref caption) = picture.caption {
             match caption.direction {
@@ -418,7 +636,24 @@ impl LayoutEngine {
             (0.0, 0.0)
         };
 
-        let adjusted_pic_x = pic_x + caption_left_offset;
+        // HWP5 Square 그림의 horizontal offset은 outer frame의 시작점이다. 따라서
+        // left outer margin은 그림 ink/caption의 paint origin에 더해야 한다. 지금까지
+        // frame origin에 곧바로 paint하여 LINE_SEG가 끝나는 x와 그림 테두리가 겹쳤다
+        // (#3821 p156 그림 64). Right/Center/Paper/Para anchor에 전면 적용하면 저장된
+        // offset의 기준이 다른 기존 문서를 이동시키므로, native Column-left Square로
+        // 좁힌다. wrap exclusion은 이미 source LINE_SEG가 frame 기준으로 보유한다.
+        let square_left_paint_margin = if !picture.common.treat_as_char
+            && matches!(picture.common.text_wrap, TextWrap::Square)
+            && matches!(picture.common.horz_rel_to, HorzRelTo::Column)
+            && matches!(
+                picture.common.horz_align,
+                HorzAlign::Left | HorzAlign::Inside
+            ) {
+            hwpunit_to_px(picture.common.margin.left as i32, self.dpi)
+        } else {
+            0.0
+        };
+        let adjusted_pic_x = pic_x + caption_left_offset + square_left_paint_margin;
         // [Task #1079] already_accounted: 그림을 gap 안에 그림(바닥이 base_y=그림 para 줄에
         // 정렬되도록 total_height 만큼 위로). flow 진행은 아래 return 에서 생략.
         let vpos_shift = if vpos_accounts_for_height {
@@ -430,7 +665,14 @@ impl LayoutEngine {
 
         // BinData에서 이미지 데이터 찾기 (bin_data_id는 1-indexed 순번)
         let bin_data_id = picture.image_attr.bin_data_id;
-        let image_data = find_bin_data(bin_data_content, bin_data_id).map(|c| c.data.clone());
+        let image_data = find_bin_data_bytes(bin_data_content, bin_data_id);
+        // [Task #2225] 그림 미지정 — layout_picture_full 과 동일 분기.
+        //
+        // 여기서 곧장 되돌아가면(early return) 캡션 배치와 흐름 계산을 통째로 건너뛴다 —
+        // 캡션 글자가 사라지고, 반환값도 "후속 y" 가 아니라 "높이" 가 되어 뒤 문단이 그림
+        // 위로 올라탄다. 그래서 **노드만 바꿔 끼우고** 나머지 경로는 그대로 태운다.
+        let picture_missing = picture_data_is_unusable(image_data.as_deref())
+            && picture.image_attr.external_path.is_none();
 
         // 그림 자르기
         let crop = {
@@ -442,21 +684,21 @@ impl LayoutEngine {
             }
         };
 
-        // 원본 이미지 크기(HU)
-        let original_size_hu =
-            if picture.shape_attr.original_width > 0 && picture.shape_attr.original_height > 0 {
-                Some((
-                    picture.shape_attr.original_width,
-                    picture.shape_attr.original_height,
-                ))
-            } else {
-                None
-            };
+        let original_size_hu = picture.crop_reference_size();
 
-        // 이미지 노드 생성
+        // 이미지 노드 생성 (그림 미지정이면 같은 자리·같은 bbox 의 placeholder 노드)
         let img_id = tree.next_id();
-        let img_node = RenderNode::new(
-            img_id,
+        let node_type = if picture_missing {
+            RenderNodeType::Placeholder(
+                // [Task #2230] 본문 picture — 셀 경로 없음(None).
+                crate::renderer::render_tree::PlaceholderNode::missing_picture(
+                    Some(section_index),
+                    Some(para_index),
+                    Some(control_index),
+                    None,
+                ),
+            )
+        } else {
             RenderNodeType::Image(ImageNode {
                 section_index: Some(section_index),
                 para_index: Some(para_index),
@@ -471,7 +713,11 @@ impl LayoutEngine {
                 transform: extract_shape_transform(&picture.shape_attr),
                 external_path: picture.image_attr.external_path.clone(),
                 ..ImageNode::new(bin_data_id, image_data)
-            }),
+            })
+        };
+        let img_node = RenderNode::new(
+            img_id,
+            node_type,
             BoundingBox::new(adjusted_pic_x, pic_y, pic_width, pic_height),
         );
 
@@ -517,6 +763,7 @@ impl LayoutEngine {
             };
 
             let cell_ctx = super::CellContext {
+                in_textbox: false,
                 parent_para_index: para_index,
                 path: vec![super::CellPathEntry {
                     control_index,
@@ -535,6 +782,7 @@ impl LayoutEngine {
                 cap_w,
                 cap_y,
                 &mut self.auto_counter.borrow_mut(),
+                bin_data_content,
                 Some(cell_ctx),
             );
         }
@@ -563,45 +811,21 @@ impl LayoutEngine {
     }
 
     /// 캡션의 총 높이를 계산한다.
+    ///
+    /// 산식은 `composer::caption_height_px`가 단일 정의다(#4320) — height_measurer 의
+    /// `measure_caption`도 같은 함수를 호출한다.
     pub(crate) fn calculate_caption_height(
         &self,
         caption: &Option<Caption>,
         _styles: &ResolvedStyleSet,
     ) -> f64 {
-        let caption = match caption {
-            Some(c) => c,
-            None => return 0.0,
-        };
-
-        if caption.paragraphs.is_empty() {
-            return 0.0;
-        }
-
-        let mut total_height = 0.0;
-        for para in &caption.paragraphs {
-            let composed = compose_paragraph(para);
-            if composed.lines.is_empty() {
-                total_height += hwpunit_to_px(400, self.dpi); // 기본 줄 높이
-            } else {
-                for (i, line) in composed.lines.iter().enumerate() {
-                    let line_h = hwpunit_to_px(line.line_height, self.dpi);
-                    let spacing = if i < composed.lines.len() - 1 {
-                        hwpunit_to_px(line.line_spacing, self.dpi)
-                    } else {
-                        0.0 // 마지막 줄은 line_spacing 제외
-                    };
-                    total_height += line_h + spacing;
-                }
-            }
-        }
-
-        total_height
+        super::super::composer::caption_height_px(caption, self.dpi)
     }
 
     /// 캡션을 레이아웃한다.
     pub(crate) fn layout_caption(
         &self,
-        tree: &mut PageRenderTree,
+        tree: &mut PageLayoutContext,
         parent_node: &mut RenderNode,
         caption: &Caption,
         styles: &ResolvedStyleSet,
@@ -610,6 +834,7 @@ impl LayoutEngine {
         content_width: f64,
         y_start: f64,
         auto_counter: &mut AutoNumberCounter,
+        bin_data_content: &[BinDataContent],
         cell_ctx: Option<super::CellContext>,
     ) {
         if caption.paragraphs.is_empty() {
@@ -625,6 +850,7 @@ impl LayoutEngine {
 
         let mut para_y = y_start;
         for (pi, para) in caption.paragraphs.iter().enumerate() {
+            let para_y_before_layout = para_y;
             // 먼저 문단을 조합
             let mut composed = compose_paragraph(para);
 
@@ -651,16 +877,150 @@ impl LayoutEngine {
                 composed.lines.len(),
                 0,
                 0,
-                ctx,
+                ctx.clone(),
                 false,
                 false,
                 0.0,
                 None,
-                None,
-                None,
+                Some(para),
+                Some(bin_data_content),
                 None, // 캡션 컨텍스트 — wrap zone 무관
             );
+
+            self.layout_caption_topbottom_pictures(
+                tree,
+                parent_node,
+                para,
+                &caption_area,
+                para_y_before_layout,
+                bin_data_content,
+                ctx.as_ref(),
+                styles,
+            );
         }
+    }
+
+    fn layout_caption_topbottom_pictures(
+        &self,
+        tree: &mut PageLayoutContext,
+        parent_node: &mut RenderNode,
+        para: &Paragraph,
+        caption_area: &LayoutRect,
+        para_y: f64,
+        bin_data_content: &[BinDataContent],
+        cell_ctx: Option<&super::CellContext>,
+        // [#6284] 캡션 문단 조판에 필요하다.
+        styles: &ResolvedStyleSet,
+    ) {
+        let anchor_y = para
+            .line_segs
+            .first()
+            .filter(|seg| seg.vertical_pos >= 0)
+            .map(|seg| caption_area.y + hwpunit_to_px(seg.vertical_pos, self.dpi))
+            .unwrap_or(para_y);
+
+        for (ctrl_idx, ctrl) in para.controls.iter().enumerate() {
+            let Control::Picture(pic) = ctrl else {
+                continue;
+            };
+            if !matches!(pic.common.text_wrap, TextWrap::TopAndBottom) {
+                continue;
+            }
+            if tree
+                .get_inline_shape_position(0, 0, ctrl_idx, cell_ctx)
+                .is_some()
+            {
+                continue;
+            }
+
+            let (pic_width_hu, pic_height_hu) = picture_display_size_hu(pic);
+            let pic_width = hwpunit_to_px(pic_width_hu, self.dpi);
+            let pic_height = hwpunit_to_px(pic_height_hu, self.dpi);
+            let placement_area = LayoutRect {
+                x: caption_area.x,
+                y: anchor_y,
+                width: caption_area.width,
+                height: pic_height.max(caption_area.height),
+            };
+            let mut placement_common = pic.common.clone();
+            placement_common.treat_as_char = false;
+            let (pic_x, pic_y) = self.compute_object_position(
+                &placement_common,
+                pic_width,
+                pic_height,
+                &placement_area,
+                &placement_area,
+                &placement_area,
+                &placement_area,
+                anchor_y,
+                Alignment::Left,
+            );
+            let pic_area = LayoutRect {
+                x: pic_x,
+                y: pic_y,
+                width: pic_width,
+                height: pic_height,
+            };
+            let mut pic_for_layout = (**pic).clone();
+            pic_for_layout.common.treat_as_char = false;
+            pic_for_layout.common.horizontal_offset = 0;
+            pic_for_layout.common.vertical_offset = 0;
+            pic_for_layout.common.horz_align = HorzAlign::Left;
+            pic_for_layout.common.vert_align = VertAlign::Top;
+
+            self.layout_picture(
+                tree,
+                parent_node,
+                &pic_for_layout,
+                &pic_area,
+                bin_data_content,
+                Alignment::Left,
+                Some(0),
+                Some(0),
+                Some(ctrl_idx),
+                cell_ctx,
+                styles,
+            );
+
+            if pic.common.treat_as_char {
+                tree.set_inline_shape_position(0, 0, ctrl_idx, cell_ctx, pic_x, pic_y);
+            }
+        }
+    }
+
+    /// [#5708] 저장 LINE_SEG 가 없는 각주 문단의 합성 폴백 줄높이(400 HWPUNIT = 5.33px)를
+    /// 문단 줄간격 설정으로 보정한다.
+    ///
+    /// 폴백값을 그대로 쓰면 줄 전진(5.3px)이 글자 크기(9pt = 12px)보다 작아 각주 줄이 서로
+    /// 겹쳐 그려진다(00464 1쪽 하단 주석 8줄). 본문·표 경로는 #674 로 같은 보정을 이미
+    /// 하고 있고, 각주 경로만 빠져 있었다. `corrected_line_metrics` 는 `raw_lh < max_fs`
+    /// 일 때만 개입하므로 저장 LINE_SEG 를 가진 각주는 종전 그대로다(#2112 계약).
+    fn footnote_line_metrics(
+        &self,
+        comp_line: &ComposedLine,
+        para_style_id: u16,
+        styles: &ResolvedStyleSet,
+    ) -> (f64, f64) {
+        let raw_lh = hwpunit_to_px(comp_line.line_height, self.dpi);
+        let raw_ls = hwpunit_to_px(comp_line.line_spacing, self.dpi);
+        let max_fs = comp_line
+            .runs
+            .iter()
+            .map(|run| {
+                let ts = resolved_to_text_style(styles, run.char_style_id, run.lang_index);
+                if ts.font_size > 0.0 {
+                    ts.font_size
+                } else {
+                    12.0
+                }
+            })
+            .fold(0.0f64, f64::max);
+        let para_style = styles.para_styles.get(para_style_id as usize);
+        let ls_val = para_style.map(|s| s.line_spacing).unwrap_or(160.0);
+        let ls_type = para_style
+            .map(|s| s.line_spacing_type)
+            .unwrap_or(LineSpacingType::Percent);
+        crate::renderer::corrected_line_metrics(raw_lh, raw_ls, max_fs, ls_type, ls_val)
     }
 
     pub(crate) fn estimate_footnote_area_height(
@@ -668,26 +1028,56 @@ impl LayoutEngine {
         footnotes: &[FootnoteRef],
         paragraphs: &[Paragraph],
         shape: &FootnoteShape,
+        styles: &ResolvedStyleSet,
+        area_width: f64,
     ) -> f64 {
         if footnotes.is_empty() {
             return 0.0;
         }
         let mut total = 0.0;
 
-        // 구분선 위 여백 + 구분선 + 아래 여백
-        total += hwpunit_to_px(shape.separator_above_margin_hu() as i32, self.dpi);
-        total += border_width_to_px(shape.separator_line_width).max(0.5);
-        total += hwpunit_to_px(shape.separator_below_margin_hu() as i32, self.dpi);
+        // 연속 각주 tail은 다음 page에서 separator를 다시 그리지 않는다.
+        if footnotes
+            .iter()
+            .any(|footnote| fragment_draws_separator(footnote.fragment))
+        {
+            total += hwpunit_to_px(shape.separator_above_margin_hu() as i32, self.dpi);
+            total += border_width_to_px(shape.separator_line_width).max(0.5);
+            total += hwpunit_to_px(shape.separator_below_margin_hu() as i32, self.dpi);
+        }
 
-        // 각 각주의 문단 높이 (LineSeg.line_height는 HWP에서 줄간격 이미 반영됨)
+        // 실제 `layout_footnote_area`와 같은 줄 높이 산식을 사용한다. 저장 LineSeg의
+        // line_height만 더하면 renderer가 누적하는 trailing line_spacing이 빠져 긴
+        // 각주가 예약 영역(및 footer)을 넘을 수 있다. 마지막 각주 문단의 마지막 줄은
+        // layout 경로에서도 trailing spacing을 붙이지 않는다.
         for (i, fn_ref) in footnotes.iter().enumerate() {
             let fn_paras = get_footnote_paragraphs(fn_ref, paragraphs);
+            let (start_line, end_line) = fragment_line_bounds(
+                fn_ref.fragment,
+                footnote_composed_line_count(fn_paras, area_width, styles, self.dpi),
+            );
+            let mut flat_line = 0usize;
             for para in fn_paras {
-                if para.line_segs.is_empty() {
-                    total += hwpunit_to_px(400, self.dpi);
+                let composed = compose_footnote_paragraph(para, area_width, styles, self.dpi);
+                if composed.lines.is_empty() {
+                    if (start_line..end_line).contains(&flat_line) {
+                        total += hwpunit_to_px(400, self.dpi);
+                    }
+                    flat_line += 1;
                 } else {
-                    for seg in &para.line_segs {
-                        total += hwpunit_to_px(seg.line_height, self.dpi);
+                    for line in &composed.lines {
+                        let is_selected = (start_line..end_line).contains(&flat_line);
+                        if is_selected {
+                            // [#5708] layout 경로와 같은 보정 산식을 쓴다.
+                            let (line_height, line_spacing_px) =
+                                self.footnote_line_metrics(line, composed.para_style_id, styles);
+                            total += line_height;
+                            let is_last_selected_line = flat_line + 1 == end_line;
+                            if !is_last_selected_line {
+                                total += line_spacing_px;
+                            }
+                        }
+                        flat_line += 1;
                     }
                 }
             }
@@ -702,7 +1092,7 @@ impl LayoutEngine {
     /// 각주 영역 레이아웃 (구분선 + 각주 문단들)
     pub(crate) fn layout_footnote_area(
         &self,
-        tree: &mut PageRenderTree,
+        tree: &mut PageLayoutContext,
         fn_node: &mut RenderNode,
         footnotes: &[FootnoteRef],
         paragraphs: &[Paragraph],
@@ -712,23 +1102,20 @@ impl LayoutEngine {
     ) {
         let mut y = fn_area.y;
 
-        // (1) 구분선 위 여백
-        y += hwpunit_to_px(shape.separator_above_margin_hu() as i32, self.dpi);
+        if footnotes
+            .iter()
+            .any(|footnote| fragment_draws_separator(footnote.fragment))
+        {
+            // (1) 구분선 위 여백
+            y += hwpunit_to_px(shape.separator_above_margin_hu() as i32, self.dpi);
 
-        // (2) 구분선
-        let sep_length = if shape.separator_length > 0 {
-            // separator_length는 HWP 단위로 페이지 폭의 비율
-            let fraction = shape.separator_length as f64 / 50000.0;
-            fn_area.width * fraction.min(1.0)
-        } else {
-            fn_area.width / 3.0 // 기본값: 1/3 폭
-        };
-        let line_width = border_width_to_px(shape.separator_line_width).max(0.5);
+            // (2) 구분선
+            let sep_length =
+                footnote_separator_length_px(shape.separator_length, fn_area.width, self.dpi);
+            let line_width = border_width_to_px(shape.separator_line_width).max(0.5);
 
-        let sep_id = tree.next_id();
-        let sep_node = RenderNode::new(
-            sep_id,
-            RenderNodeType::Line(LineNode::new(
+            let sep_id = tree.next_id();
+            let sep_line = LineNode::new(
                 fn_area.x,
                 y,
                 fn_area.x + sep_length,
@@ -739,14 +1126,15 @@ impl LayoutEngine {
                     dash: StrokeDash::Solid,
                     ..Default::default()
                 },
-            )),
-            BoundingBox::new(fn_area.x, y - line_width / 2.0, sep_length, line_width),
-        );
-        fn_node.children.push(sep_node);
-        y += line_width;
+            );
+            let sep_bbox = sep_line.ink_bbox();
+            let sep_node = RenderNode::new(sep_id, RenderNodeType::Line(sep_line), sep_bbox);
+            fn_node.children.push(sep_node);
+            y += line_width;
 
-        // (3) 구분선 아래 여백
-        y += hwpunit_to_px(shape.separator_below_margin_hu() as i32, self.dpi);
+            // (3) 구분선 아래 여백
+            y += hwpunit_to_px(shape.separator_below_margin_hu() as i32, self.dpi);
+        }
 
         // (4) 각 각주 렌더링
         // 각주 TextRun에 마커를 인코딩하여 히트테스트에서 식별 가능하도록 함
@@ -760,9 +1148,15 @@ impl LayoutEngine {
                 shape.prefix_char,
                 shape.suffix_char,
             );
+            let (fragment_start, fragment_end) = fragment_line_bounds(
+                fn_ref.fragment,
+                footnote_composed_line_count(fn_paras, fn_area.width, styles, self.dpi),
+            );
+            let mut flat_line = 0usize;
+            let mut number_drawn = false;
 
             for (p_idx, para) in fn_paras.iter().enumerate() {
-                let composed = compose_paragraph(para);
+                let composed = compose_footnote_paragraph(para, fn_area.width, styles, self.dpi);
                 let marker_section = i; // footnote_index
                 let marker_para = usize::MAX - 2000 - p_idx; // 각주 내 문단 인덱스
                                                              // 각주 번호 스타일용 기본 char_shape_id (빈/비빈 문단 모두 동일)
@@ -772,13 +1166,19 @@ impl LayoutEngine {
                     .map(|cs| cs.char_shape_id as u32)
                     .unwrap_or(composed.para_style_id as u32);
 
-                // [Issue #483] 각주의 마지막 paragraph 는 trailing line_spacing 미적용
-                // — 다음 각주와의 간격은 between-notes 값이 책임. trailing ls 까지 합산하면
-                // 각주 사이 gap 이 line_spacing 만큼 부풀려짐.
-                let is_last_para_of_fn = p_idx + 1 == fn_paras.len();
+                let line_count = composed.lines.len().max(1);
+                let para_start = flat_line;
+                let para_end = flat_line + line_count;
+                let selected_start = fragment_start.saturating_sub(para_start).min(line_count);
+                let selected_end = fragment_end.saturating_sub(para_start).min(line_count);
+                flat_line = para_end;
+                if selected_start >= selected_end {
+                    continue;
+                }
+                let is_last_selected_line = para_start + selected_end == fragment_end;
 
-                if p_idx == 0 {
-                    // 첫 문단: 각주 번호를 텍스트 앞에 삽입
+                if fragment_draws_number(fn_ref.fragment) && !number_drawn {
+                    // 첫 fragment의 첫 선택 줄에만 각주 번호를 삽입한다.
                     y = self.layout_footnote_paragraph_with_number(
                         tree,
                         fn_node,
@@ -790,8 +1190,11 @@ impl LayoutEngine {
                         marker_section,
                         marker_para,
                         base_cs_id,
-                        is_last_para_of_fn,
+                        selected_start,
+                        selected_end,
+                        is_last_selected_line,
                     );
+                    number_drawn = true;
                 } else {
                     let returned_y = self.layout_composed_paragraph(
                         tree,
@@ -800,8 +1203,8 @@ impl LayoutEngine {
                         styles,
                         fn_area,
                         y,
-                        0,
-                        composed.lines.len(),
+                        selected_start,
+                        selected_end,
                         marker_section,
                         marker_para,
                         None,
@@ -813,13 +1216,11 @@ impl LayoutEngine {
                         None,
                         None, // 각주 컨텍스트 — wrap zone 무관
                     );
-                    if is_last_para_of_fn {
-                        // layout_composed_paragraph 가 마지막 line 의 trailing line_spacing 을
-                        // 포함시키므로, 각주 마지막 paragraph 에서는 그만큼 빼서 between-notes
-                        // 과의 이중 합산을 막는다.
+                    if is_last_selected_line {
+                        // fragment의 마지막 줄은 trailing line-spacing을 쓰지 않는다.
                         let trail_ls = composed
                             .lines
-                            .last()
+                            .get(selected_end.saturating_sub(1))
                             .map(|l| hwpunit_to_px(l.line_spacing, self.dpi))
                             .unwrap_or(0.0);
                         y = returned_y - trail_ls;
@@ -841,7 +1242,7 @@ impl LayoutEngine {
     /// base_cs_id: 번호 스타일 결정용 기본 char_shape_id (문단의 char_shapes[0])
     pub(crate) fn layout_footnote_paragraph_with_number(
         &self,
-        tree: &mut PageRenderTree,
+        tree: &mut PageLayoutContext,
         parent: &mut RenderNode,
         composed: &ComposedParagraph,
         styles: &ResolvedStyleSet,
@@ -851,16 +1252,35 @@ impl LayoutEngine {
         marker_section: usize,
         marker_para: usize,
         base_cs_id: u32,
-        // [Issue #483] true 면 각주의 마지막 paragraph — 마지막 line 의 trailing
-        // line_spacing 을 누적하지 않는다 (between-notes 와 이중 합산 방지).
-        is_last_para_of_fn: bool,
+        line_start: usize,
+        line_end: usize,
+        // fragment의 마지막 선택 줄은 trailing line_spacing을 누적하지 않는다.
+        is_last_selected_line: bool,
     ) -> f64 {
         let mut y = y_start;
+        // 분할 큐는 빈 각주 문단도 한 줄의 virtual fragment로 센다. 실제 composed
+        // 줄은 0개이므로 그 범위를 그대로 slice하면 panic 난다. 기존 비분할 경로처럼
+        // 빈 문단 fallback까지 흘려보내 번호/높이 계약을 보존한다.
+        let line_start = line_start.min(composed.lines.len());
+        let line_end = line_end.min(composed.lines.len()).max(line_start);
 
-        for (line_idx, comp_line) in composed.lines.iter().enumerate() {
-            // LineSeg.line_height는 HWP에서 줄간격이 이미 반영된 값
-            let line_height = hwpunit_to_px(comp_line.line_height, self.dpi);
-            let baseline = hwpunit_to_px(comp_line.baseline_distance, self.dpi);
+        for (offset, comp_line) in composed.lines[line_start..line_end].iter().enumerate() {
+            // LineSeg.line_height는 HWP에서 줄간격이 이미 반영된 값.
+            // [#5708] 저장 LINE_SEG 가 없는 문단의 폴백(400 HWPUNIT = 5.33px)은 글자보다
+            // 작아 줄이 겹치므로 문단 줄간격 설정으로 보정한다.
+            let (line_height, corrected_line_spacing) =
+                self.footnote_line_metrics(comp_line, composed.para_style_id, styles);
+            let raw_baseline = hwpunit_to_px(comp_line.baseline_distance, self.dpi);
+            // 베이스라인도 같은 비율로 따라간다 — 줄 상자만 키우면 글자가 상자 위로 뜬다.
+            let baseline = if line_height > 0.0
+                && raw_baseline > 0.0
+                && hwpunit_to_px(comp_line.line_height, self.dpi) > 0.0
+            {
+                (raw_baseline * line_height / hwpunit_to_px(comp_line.line_height, self.dpi))
+                    .min(line_height)
+            } else {
+                raw_baseline
+            };
 
             let line_id = tree.next_id();
             let mut line_node = RenderNode::new(
@@ -872,7 +1292,7 @@ impl LayoutEngine {
             let mut x = area.x;
 
             // 첫 줄에 각주 번호 삽입
-            if line_idx == 0 {
+            if offset == 0 {
                 // 각주 번호 스타일: 문단의 기본 char_shape로 고정 (크기 약간 축소)
                 // 빈/비빈 문단 모두 동일한 base_cs_id 사용 → 리렌더링 시 폰트·폭 변동 방지
                 let base_style = {
@@ -902,6 +1322,8 @@ impl LayoutEngine {
                         border_fill_id: 0,
                         baseline,
                         field_marker: FieldMarkerType::None,
+                        layout_positions: None,
+                        display_text: None,
                     }),
                     BoundingBox::new(x, y, num_width, line_height),
                 );
@@ -935,6 +1357,8 @@ impl LayoutEngine {
                         border_fill_id: 0,
                         baseline,
                         field_marker: FieldMarkerType::None,
+                        layout_positions: None,
+                        display_text: None,
                     }),
                     BoundingBox::new(x, y, width, line_height),
                 );
@@ -948,11 +1372,11 @@ impl LayoutEngine {
             // 단, 각주의 마지막 paragraph 의 마지막 line 에서는 trailing line_spacing 을
             // 누적하지 않는다 — 다음 각주와의 간격은 between-notes 값이 책임하므로
             // 이중 합산을 피하기 위함.
-            let is_last_line = line_idx + 1 >= composed.lines.len();
-            if is_last_para_of_fn && is_last_line {
+            let is_last_line = offset + 1 >= line_end - line_start;
+            if is_last_selected_line && is_last_line {
                 y += line_height;
             } else {
-                let line_spacing_px = hwpunit_to_px(comp_line.line_spacing, self.dpi);
+                let line_spacing_px = corrected_line_spacing;
                 y += line_height + line_spacing_px;
             }
         }
@@ -978,7 +1402,7 @@ impl LayoutEngine {
     /// 마지막 TextLine의 마지막 TextRun 우측에 윗첨자 번호를 추가한다.
     pub(crate) fn add_footnote_superscripts(
         &self,
-        tree: &mut PageRenderTree,
+        tree: &mut PageLayoutContext,
         parent: &mut RenderNode,
         para: &Paragraph,
         _styles: &ResolvedStyleSet,
@@ -994,8 +1418,8 @@ impl LayoutEngine {
         }
 
         // 각주/미주의 (번호, 텍스트 위치) 수집 — ComposedParagraph에서 미리 계산된 위치 사용
-        // 폴백: find_control_text_positions로 직접 계산
-        let ctrl_positions = crate::document_core::helpers::find_control_text_positions(para);
+        // 폴백: control_text_positions로 직접 계산
+        let ctrl_positions = para.control_text_positions();
         let mut footnotes: Vec<(String, usize)> = Vec::new();
         for (ci, ctrl) in para.controls.iter().enumerate() {
             let marker_text = match ctrl {
@@ -1134,6 +1558,8 @@ impl LayoutEngine {
                         border_fill_id: 0,
                         baseline: line_height,
                         field_marker: FieldMarkerType::None,
+                        layout_positions: None,
+                        display_text: None,
                     }),
                     BoundingBox::new(insert_x, line_y - sup_y_offset, width, line_height),
                 );
@@ -1305,7 +1731,7 @@ impl LayoutEngine {
     /// border_attr의 bit 0~5가 선 종류, border_width가 두께 (0이면 기본 0.1mm)
     pub(crate) fn render_picture_border(
         &self,
-        tree: &mut PageRenderTree,
+        tree: &mut PageLayoutContext,
         parent: &mut RenderNode,
         picture: &crate::model::image::Picture,
         x: f64,

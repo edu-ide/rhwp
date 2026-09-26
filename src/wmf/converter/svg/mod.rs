@@ -8,7 +8,7 @@ use crate::wmf::{
         svg::{
             device_context::DeviceContext,
             node::{Data, Node},
-            ternary_raster_operator::TernaryRasterOperator,
+            ternary_raster_operator::{BrushOnlyRopSequence, TernaryRasterOperator},
             util::{as_point_string, url_string, Fill, Stroke},
         },
         GraphicsObject, PlayError, SelectedGraphicsObject,
@@ -22,6 +22,8 @@ pub struct SVGPlayer {
     context_stack: Vec<DeviceContext>,
     context_current: DeviceContext,
     definitions: Vec<Node>,
+    /// [#6469] 브러시 전용 ROP 근사의 짧은 PATINVERT → DPA → PATINVERT 상태.
+    brush_only_rop_sequence: BrushOnlyRopSequence,
     elements: Vec<Node>,
     object_selected: SelectedGraphicsObject,
     current_clip_id: Option<String>,
@@ -69,6 +71,7 @@ impl crate::wmf::converter::Player for SVGPlayer {
         let Self {
             context_current,
             definitions,
+            brush_only_rop_sequence: _,
             elements,
             ..
         } = self;
@@ -215,12 +218,15 @@ impl crate::wmf::converter::Player for SVGPlayer {
             }
         };
 
-        let Some(elem) =
-            operator
-                .run(&mut self.definitions)
-                .map_err(|err| PlayError::InvalidRecord {
-                    cause: err.to_string(),
-                })?
+        let Some(elem) = operator
+            .run(
+                &mut self.definitions,
+                &mut self.brush_only_rop_sequence,
+                self.elements.len(),
+            )
+            .map_err(|err| PlayError::InvalidRecord {
+                cause: err.to_string(),
+            })?
         else {
             return Ok(self);
         };
@@ -290,12 +296,15 @@ impl crate::wmf::converter::Player for SVGPlayer {
             }
         };
 
-        let Some(elem) =
-            operator
-                .run(&mut self.definitions)
-                .map_err(|err| PlayError::InvalidRecord {
-                    cause: err.to_string(),
-                })?
+        let Some(elem) = operator
+            .run(
+                &mut self.definitions,
+                &mut self.brush_only_rop_sequence,
+                self.elements.len(),
+            )
+            .map_err(|err| PlayError::InvalidRecord {
+                cause: err.to_string(),
+            })?
         else {
             return Ok(self);
         };
@@ -375,12 +384,15 @@ impl crate::wmf::converter::Player for SVGPlayer {
             }
         };
 
-        let Some(elem) =
-            operator
-                .run(&mut self.definitions)
-                .map_err(|err| PlayError::InvalidRecord {
-                    cause: err.to_string(),
-                })?
+        let Some(elem) = operator
+            .run(
+                &mut self.definitions,
+                &mut self.brush_only_rop_sequence,
+                self.elements.len(),
+            )
+            .map_err(|err| PlayError::InvalidRecord {
+                cause: err.to_string(),
+            })?
         else {
             return Ok(self);
         };
@@ -474,12 +486,15 @@ impl crate::wmf::converter::Player for SVGPlayer {
             }
         };
 
-        let Some(elem) =
-            operator
-                .run(&mut self.definitions)
-                .map_err(|err| PlayError::InvalidRecord {
-                    cause: err.to_string(),
-                })?
+        let Some(elem) = operator
+            .run(
+                &mut self.definitions,
+                &mut self.brush_only_rop_sequence,
+                self.elements.len(),
+            )
+            .map_err(|err| PlayError::InvalidRecord {
+                cause: err.to_string(),
+            })?
         else {
             return Ok(self);
         };
@@ -523,12 +538,15 @@ impl crate::wmf::converter::Player for SVGPlayer {
             operator = operator.source_bitmap(dib);
         }
 
-        let Some(elem) =
-            operator
-                .run(&mut self.definitions)
-                .map_err(|err| PlayError::InvalidRecord {
-                    cause: err.to_string(),
-                })?
+        let Some(elem) = operator
+            .run(
+                &mut self.definitions,
+                &mut self.brush_only_rop_sequence,
+                self.elements.len(),
+            )
+            .map_err(|err| PlayError::InvalidRecord {
+                cause: err.to_string(),
+            })?
         else {
             return Ok(self);
         };
@@ -571,10 +589,13 @@ impl crate::wmf::converter::Player for SVGPlayer {
                 bottom,
             } = placeable.bounding_box;
 
+            // Placeable bounding-box coordinates are attacker-controlled i16
+            // values; `right - left` overflows on crafted bounds (DoS panic
+            // under debug overflow checks). Saturate the window extent.
             self.context_current = self
                 .context_current
                 .window_origin(left, top)
-                .window_ext(right - left, bottom - top);
+                .window_ext(right.saturating_sub(left), bottom.saturating_sub(top));
         }
 
         self.context_current = self
@@ -1328,6 +1349,14 @@ impl crate::wmf::converter::Player for SVGPlayer {
         let mut a_point: VecDeque<_> = record.poly_polygon.a_points.into();
         let mut current_point_index = 0;
 
+        // [#3363] MS-WMF 스펙상 META_POLYPOLYGON 은 전체 윤곽 집합을 현재 polyfill
+        // 모드(ALTERNATE/WINDING)로 채우는 **하나의 도형**이다. 윤곽별 <polygon> 으로
+        // 분리 방출하면 구멍 윤곽(글자 'ㅇ'·'ㅂ' 내부 등)이 독립 채움으로 덮여
+        // 검게 칠해진다 — 서브패스를 하나의 <path> 로 합쳐 fill-rule 이 구멍을
+        // 소거하게 한다 (한컴 글맵시 OLE WMF 실측: WINDING + 글꼴 관례의 반대 방향
+        // 구멍 윤곽).
+        let mut subpaths: Vec<String> = Vec::new();
+
         for i in 0..record.poly_polygon.number_of_polygons {
             let Some(points_of_polygon) = record.poly_polygon.a_points_per_polygon.get(i as usize)
             else {
@@ -1355,13 +1384,24 @@ impl crate::wmf::converter::Player for SVGPlayer {
                 current_point_index += 1;
             }
 
-            let polygon = Node::new("polygon")
+            if let Some((first, rest)) = points.split_first() {
+                let mut d = format!("M {}", first);
+                for p in rest {
+                    d.push_str(&format!(" L {}", p));
+                }
+                d.push_str(" Z");
+                subpaths.push(d);
+            }
+        }
+
+        if !subpaths.is_empty() {
+            let path = Node::new("path")
                 .set("fill", fill.as_str())
                 .set("fill-rule", fill_rule.as_str())
-                .set("points", points.join(" "));
-            let polygon = stroke.set_props(polygon);
+                .set("d", subpaths.join(" "));
+            let path = stroke.set_props(path);
 
-            self.push_element(record_number, polygon);
+            self.push_element(record_number, path);
         }
 
         Ok(self)

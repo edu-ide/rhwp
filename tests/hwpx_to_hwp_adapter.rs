@@ -9,7 +9,7 @@ use rhwp::document_core::converters::hwpx_to_hwp::{
 };
 use rhwp::document_core::DocumentCore;
 use rhwp::model::control::Control;
-use rhwp::model::document::Document;
+use rhwp::model::document::{Document, Section};
 use rhwp::model::paragraph::Paragraph;
 use rhwp::model::shape::{CommonObjAttr, ShapeObject};
 use rhwp::model::style::FillType;
@@ -352,7 +352,9 @@ fn task888_basic_table_materializes_hancom_table_attrs() {
         table.raw_table_record_attr, 0x0400_0006,
         "HWPX table record attr는 pageBreak/repeatHeader/noAdjust와 안쪽 여백 활성 계약 필드로 재구성한다"
     );
-    assert_eq!(report.table_record_row_sizes_materialized, 1);
+    // [#3062] row_sizes 는 이제 HWPX 파서가 셀 수로 직접 채우므로 어댑터
+    // materialize 는 no-op 이다 (attr 계열과 동일한 "파서가 이미 한다" 계약).
+    assert_eq!(report.table_record_row_sizes_materialized, 0);
     assert_eq!(table.row_sizes, vec![4, 4, 4]);
     assert!(table.raw_ctrl_data.len() >= 4);
     assert_eq!(
@@ -408,7 +410,8 @@ fn task888_expense_report_materializes_tac_table_ctrl_attrs() {
         report.table_ctrl_header_attr_materialized, 0,
         "HWPX 파서가 TAC table CTRL_HEADER attr를 이미 materialize한다"
     );
-    assert_eq!(report.table_record_row_sizes_materialized, 2);
+    // [#3062] row_sizes 는 파서가 직접 채우므로 어댑터 materialize 는 0 이다.
+    assert_eq!(report.table_record_row_sizes_materialized, 0);
 }
 
 #[test]
@@ -631,6 +634,29 @@ fn stage4_page_def_preserved_after_roundtrip() {
         orig_pd.margin_bottom, reload_pd.margin_bottom,
         "margin_bottom 보존"
     );
+}
+
+#[test]
+fn task1654_hide_empty_line_flag_preserved_after_hwp_export_reload() {
+    let mut section = Section::default();
+    section.section_def.hide_empty_line = true;
+    section.section_def.flags &= !0x0008_0000;
+    section.paragraphs.push(Paragraph::default());
+
+    let mut doc = Document {
+        sections: vec![section],
+        ..Default::default()
+    };
+
+    let report = convert_hwpx_to_hwp_ir(&mut doc);
+    assert_eq!(report.section_def_hide_empty_line_flag_materialized, 1);
+
+    let hwp_bytes = rhwp::serializer::serialize_hwp(&doc).expect("HWP 직렬화 실패");
+    let reloaded = DocumentCore::from_bytes(&hwp_bytes).expect("HWP 재로드 실패");
+    let section_def = &reloaded.document().sections[0].section_def;
+
+    assert!(section_def.hide_empty_line);
+    assert_ne!(section_def.flags & 0x0008_0000, 0);
 }
 
 /// Stage 4 핵심 게이트: 어댑터 적용 → 직렬화 → 재로드 시 페이지 수가 HWP 저장 기준과 일치.
@@ -6216,16 +6242,12 @@ struct Task903Stage52ParaPrInfo {
     auto_spacing_e_asian_num: String,
 }
 
-fn task903_stage52_local_name(name: &[u8]) -> &[u8] {
-    if let Some(pos) = name.iter().position(|&b| b == b':') {
-        &name[pos + 1..]
-    } else {
-        name
-    }
+fn task903_stage52_local_name(name: &str) -> &[u8] {
+    name.rsplit(':').next().unwrap_or(name).as_bytes()
 }
 
 fn task903_stage52_attr_value(attr: &quick_xml::events::attributes::Attribute) -> String {
-    String::from_utf8_lossy(attr.value.as_ref()).to_string()
+    attr.value.as_ref().to_string()
 }
 
 fn task903_stage52_read_header_xml() -> String {

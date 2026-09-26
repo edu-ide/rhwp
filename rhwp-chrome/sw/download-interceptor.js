@@ -1,5 +1,5 @@
 // 다운로드 관찰자 (Chrome)
-// - .hwp/.hwpx 다운로드 감지 → 뷰어로 열기
+// - .hwp/.hwpx/.hml 다운로드 감지 → 뷰어로 열기
 // - 사용자 설정(autoOpen)에 따라 동작
 //
 // #198 (chrome-fd-001): HWP 가 아닌 일반 파일 다운로드에는 suggest() 를 호출하지 않아
@@ -11,25 +11,27 @@
 //        경로 결정을 무효화하므로 filename 결정 단계에서 완전히 빠진다.
 
 import { openViewer } from './viewer-launcher.js';
-import { shouldInterceptDownload } from './download-interceptor-common.js';
+import { classifyDownload } from './download-interceptor-common.js';
+import { loadSettingsForAutomaticActions } from './settings-store.js';
+import {
+  DEFAULT_STATE_TTL_MS,
+  evaluateDownloadChanged,
+  evaluateDownloadCreated,
+  isDownloadStateExpired,
+  isTerminalDelta,
+  markDownloadHandled,
+  markDownloadTerminal,
+  shouldRecheckDownload,
+} from './download-observer-state.js';
 
-const handled = new Set();
-// #1498: onCreated 로 관측한 다운로드 id (= service worker 기동 이후 새로 시작된 다운로드).
-// onChanged 는 과거 다운로드 기록에도 발화할 수 있으므로, seen 에 있는 id 에 한해서만 재판정한다.
-// SW 재기동 후 과거 항목이 뷰어로 다발 열리던 회귀를 막는다 (#1471/#1480 회귀 정정).
-const seen = new Set();
+const STORAGE_PREFIX = 'rhwpDownloadState:';
+const TERMINAL_CLEANUP_MS = 30_000;
+const memoryStateFallback = new Map();
+const processingDownloadPromises = new Map();
 
 /** 다운로드 항목이 로컬 file:// 인지 판별. */
 function isLocalFileDownload(item) {
   return typeof item?.url === 'string' && item.url.startsWith('file:');
-}
-
-function isTerminalDelta(delta) {
-  return delta?.state?.current === 'complete' || delta?.state?.current === 'interrupted' || Boolean(delta?.error);
-}
-
-function shouldRecheckDownload(delta) {
-  return Boolean(delta?.filename?.current || delta?.finalUrl?.current || delta?.state?.current === 'complete');
 }
 
 /**
@@ -41,40 +43,89 @@ function shouldRecheckDownload(delta) {
  */
 export function setupDownloadInterceptor() {
   chrome.downloads.onCreated.addListener((item) => {
-    if (item) seen.add(item.id);
-    processDownloadItem(item);
+    void handleCreated(item);
   });
 
   chrome.downloads.onChanged.addListener(async (delta) => {
-    // #1498: onCreated 로 관측한(= 새로 시작된) 다운로드만 재판정한다. onChanged 단독으로
-    // 들어온 과거 기록 항목은 seen 에 없으므로 뷰어를 열지 않는다.
-    if (seen.has(delta.id) && !handled.has(delta.id) && shouldRecheckDownload(delta)) {
-      try {
-        const [item] = await chrome.downloads.search({ id: delta.id });
-        processDownloadItem(item);
-      } catch (err) {
-        console.error('[rhwp] 다운로드 항목 재조회 오류:', err);
-      }
-    }
-
-    if (isTerminalDelta(delta)) {
-      setTimeout(() => {
-        handled.delete(delta.id);
-        seen.delete(delta.id);
-      }, 30000);
-    }
+    await handleChanged(delta);
   });
 }
 
-function processDownloadItem(item) {
-  if (!item || handled.has(item.id)) return;
-  if (!shouldInterceptDownload(item)) return;
+async function handleCreated(item) {
+  const now = Date.now();
+  const previousState = await getDownloadState(item?.id, now);
+  const decision = evaluateDownloadCreated(item, previousState, now);
 
-  handled.add(item.id);
-  handleHwpDownload(item);
+  if (decision.action !== 'track') return;
+  await setDownloadState(decision.state);
+  await processDownloadCandidate(item, decision.state, { metadataFinalized: false });
+}
 
-  if (isLocalFileDownload(item)) {
-    suppressLocalDownload(item);
+async function handleChanged(delta) {
+  const now = Date.now();
+  let state = await getDownloadState(delta?.id, now);
+
+  if (state && !state.handledAt && shouldRecheckDownload(delta)) {
+    try {
+      const [item] = await chrome.downloads.search({ id: delta.id });
+      const decision = evaluateDownloadChanged(delta, item, state, now);
+      if (decision.action === 'candidate') {
+        state = decision.state;
+        state = await processDownloadCandidate(item, state, {
+          metadataFinalized: Boolean(delta.filename?.current || isTerminalDelta(delta)),
+        });
+      }
+    } catch (err) {
+      console.error('[rhwp] 다운로드 항목 재조회 오류:', err);
+    }
+  }
+
+  if (isTerminalDelta(delta)) {
+    const terminalState = markDownloadTerminal(state, now);
+    if (terminalState) {
+      await setDownloadState(terminalState);
+    }
+    scheduleRemoveDownloadState(delta.id);
+  }
+}
+
+async function processDownloadCandidate(item, state, context) {
+  if (!item || state?.handledAt) return state;
+  if (classifyDownload(item, context).action !== 'intercept') return state;
+  const existingProcessing = processingDownloadPromises.get(item.id);
+  if (existingProcessing) return existingProcessing;
+
+  const processing = processDownloadCandidateOnce(item, state);
+  processingDownloadPromises.set(item.id, processing);
+  try {
+    return await processing;
+  } finally {
+    if (processingDownloadPromises.get(item.id) === processing) {
+      processingDownloadPromises.delete(item.id);
+    }
+  }
+}
+
+async function processDownloadCandidateOnce(item, state) {
+  try {
+    const latestState = await getDownloadState(item.id);
+    if (latestState?.handledAt) return latestState;
+    const activeState = latestState || state;
+    const settings = await loadSettingsForAutomaticActions(chrome);
+    const reason = settings.autoOpen ? 'opened' : 'auto-open-disabled';
+    const handledState = markDownloadHandled(activeState, Date.now(), reason);
+    await setDownloadState(handledState);
+    if (!settings.autoOpen) return handledState;
+
+    handleHwpDownload(item);
+
+    if (isLocalFileDownload(item)) {
+      void suppressLocalDownload(item);
+    }
+    return handledState;
+  } catch (err) {
+    console.error('[rhwp] 다운로드 인터셉터 오류:', err);
+    return state;
   }
 }
 
@@ -97,21 +148,83 @@ async function suppressLocalDownload(item) {
   }
 }
 
-async function handleHwpDownload(item) {
-  try {
-    const settings = await chrome.storage.sync.get({ autoOpen: true });
-    if (!settings.autoOpen) return;
-
-    // 대용량 파일 경고 (50MB 초과)
-    if (item.fileSize > 50 * 1024 * 1024) {
-      console.warn(`[rhwp] 대용량 파일: ${item.filename} (${(item.fileSize / 1024 / 1024).toFixed(1)}MB)`);
-    }
-
-    openViewer({
-      url: item.url,
-      filename: item.filename,
-    });
-  } catch (err) {
-    console.error('[rhwp] 다운로드 인터셉터 오류:', err);
+function handleHwpDownload(item) {
+  // 대용량 파일 경고 (50MB 초과)
+  if (item.fileSize > 50 * 1024 * 1024) {
+    console.warn(`[rhwp] 대용량 파일: ${item.filename} (${(item.fileSize / 1024 / 1024).toFixed(1)}MB)`);
   }
+
+  openViewer({
+    url: item.url,
+    filename: item.filename,
+  });
+}
+
+function stateKey(id) {
+  return `${STORAGE_PREFIX}${id}`;
+}
+
+function getSessionStorage() {
+  return chrome.storage?.session || null;
+}
+
+async function getDownloadState(id, now = Date.now()) {
+  if (typeof id !== 'number') return null;
+
+  const key = stateKey(id);
+  const session = getSessionStorage();
+  let state = null;
+
+  if (session) {
+    const result = await session.get(key);
+    state = result?.[key] || null;
+  } else {
+    state = memoryStateFallback.get(id) || null;
+  }
+
+  if (state && isDownloadStateExpired(state, now, DEFAULT_STATE_TTL_MS)) {
+    await removeDownloadState(id);
+    return null;
+  }
+
+  return state;
+}
+
+async function setDownloadState(state) {
+  if (!state || typeof state.id !== 'number') return;
+
+  const session = getSessionStorage();
+  if (session) {
+    await session.set({ [stateKey(state.id)]: state });
+    return;
+  }
+
+  memoryStateFallback.set(state.id, state);
+}
+
+async function removeDownloadState(id) {
+  if (typeof id !== 'number') return;
+
+  const session = getSessionStorage();
+  if (session) {
+    await session.remove(stateKey(id));
+    return;
+  }
+
+  memoryStateFallback.delete(id);
+}
+
+function scheduleRemoveDownloadState(id) {
+  if (typeof id !== 'number') return;
+
+  const session = getSessionStorage();
+  const key = stateKey(id);
+  const timer = setTimeout(() => {
+    if (session) {
+      void session.remove(key);
+      return;
+    }
+    memoryStateFallback.delete(id);
+  }, TERMINAL_CLEANUP_MS);
+  if (typeof timer?.unref === 'function') timer.unref();
 }

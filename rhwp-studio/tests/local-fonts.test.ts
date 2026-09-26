@@ -5,12 +5,23 @@ import {
   clearStoredLocalFonts,
   detectLocalFonts,
   getDetectedLocalFonts,
+  getLocalFontRecords,
   getLocalFontState,
   getLocalFonts,
+  localFontFaceKey,
+  loadLocalFontBytes,
+  loadLocalFontBytesFor,
   loadStoredLocalFonts,
   resetLocalFontsForTests,
+  resolveLocalFont,
   type LocalFontSnapshot,
 } from '../src/core/local-fonts.ts';
+import { analyzeDocumentFonts } from '../src/core/document-font-status.ts';
+import { fontFamilyChainForDisplay } from '../src/core/font-substitution.ts';
+import {
+  rememberRawCanvasFontDescriptor,
+  resetRawCanvasFontDescriptorForTests,
+} from '../src/core/canvas-font-raw.ts';
 
 const STORAGE_KEY = 'rhwp-local-fonts';
 
@@ -127,6 +138,106 @@ function createProbeDocument(installedFamilies: readonly string[]): unknown {
   };
 }
 
+function createPatchedProbeDocument(installedFamilies: readonly string[]): {
+  document: unknown;
+  patchedSetCount: () => number;
+  rawSetCount: () => number;
+} {
+  const installed = new Set(installedFamilies);
+  let patchedSetCalls = 0;
+  let rawSetCalls = 0;
+  const context = {
+    rawFont: '',
+    measureText(text: string) {
+      const fallback = this.rawFont.split(',').pop()?.trim() ?? 'sans-serif';
+      const target = firstQuotedFontFamily(this.rawFont);
+      const fallbackWidth = fallback.includes('monospace') ? 12 : fallback.includes('serif') ? 10 : 11;
+      const width = target && installed.has(target) ? fallbackWidth + 3 : fallbackWidth;
+      return { width: text.length * width };
+    },
+  };
+  const rawDescriptor: PropertyDescriptor = {
+    configurable: true,
+    get(this: typeof context) {
+      return this.rawFont;
+    },
+    set(this: typeof context, value: string) {
+      rawSetCalls++;
+      this.rawFont = value;
+    },
+  };
+  rememberRawCanvasFontDescriptor(rawDescriptor);
+  Object.defineProperty(context, 'font', {
+    configurable: true,
+    get: rawDescriptor.get,
+    set(this: typeof context, value: string) {
+      patchedSetCalls++;
+      rawDescriptor.set!.call(this, value.replace(/"KoPub바탕체 Light"/u, 'monospace'));
+    },
+  });
+  return {
+    document: {
+      createElement(tagName: string) {
+        if (tagName !== 'canvas') return {};
+        return {
+          getContext(contextId: string) {
+            return contextId === '2d' ? context : null;
+          },
+        };
+      },
+    },
+    patchedSetCount: () => patchedSetCalls,
+    rawSetCount: () => rawSetCalls,
+  };
+}
+
+function utf16Be(value: string): Uint8Array {
+  const bytes = new Uint8Array(value.length * 2);
+  for (let index = 0; index < value.length; index += 1) {
+    const codeUnit = value.charCodeAt(index);
+    bytes[index * 2] = codeUnit >> 8;
+    bytes[index * 2 + 1] = codeUnit & 0xff;
+  }
+  return bytes;
+}
+
+function createSfntWithNameRecords(entries: ReadonlyArray<{
+  nameId: number;
+  value: string;
+  platformId?: number;
+  bytes?: Uint8Array;
+}>): Uint8Array {
+  const encoded = entries.map(entry => ({ ...entry, bytes: entry.bytes ?? utf16Be(entry.value) }));
+  const nameTableOffset = 12 + 16;
+  const stringsOffset = 6 + encoded.length * 12;
+  const nameTableLength = stringsOffset + encoded.reduce((sum, entry) => sum + entry.bytes.length, 0);
+  const bytes = new Uint8Array(nameTableOffset + nameTableLength);
+  const view = new DataView(bytes.buffer);
+
+  view.setUint32(0, 0x00010000, false);
+  view.setUint16(4, 1, false);
+  bytes.set([0x6e, 0x61, 0x6d, 0x65], 12);
+  view.setUint32(20, nameTableOffset, false);
+  view.setUint32(24, nameTableLength, false);
+
+  view.setUint16(nameTableOffset, 0, false);
+  view.setUint16(nameTableOffset + 2, encoded.length, false);
+  view.setUint16(nameTableOffset + 4, stringsOffset, false);
+  let stringCursor = 0;
+  encoded.forEach((entry, index) => {
+    const recordOffset = nameTableOffset + 6 + index * 12;
+    view.setUint16(recordOffset, entry.platformId ?? 3, false);
+    view.setUint16(recordOffset + 2, 1, false);
+    view.setUint16(recordOffset + 4, 0x0412, false);
+    view.setUint16(recordOffset + 6, entry.nameId, false);
+    view.setUint16(recordOffset + 8, entry.bytes.length, false);
+    view.setUint16(recordOffset + 10, stringCursor, false);
+    bytes.set(entry.bytes, nameTableOffset + stringsOffset + stringCursor);
+    stringCursor += entry.bytes.length;
+  });
+  return bytes;
+}
+
 test('저장된 localStorage snapshot 로드는 queryLocalFonts를 호출하지 않는다', async () => {
   const g = globalThis as TestGlobals;
   const originals = {
@@ -159,20 +270,76 @@ test('저장된 localStorage snapshot 로드는 queryLocalFonts를 호출하지 
     assert.equal(queryCount, 0);
     assert.deepEqual(getLocalFonts(), sortedKo(['로컬A', '로컬B']));
     assert.deepEqual(getDetectedLocalFonts(), sortedKo(['로컬A', '로컬B', '함초롬바탕']));
+    assert.equal(analyzeDocumentFonts(['새 문서 글꼴']).shouldPromptLocalAccess, true);
     assert.deepEqual(getLocalFontState(), {
       supported: true,
       method: 'local-font-access',
       loaded: true,
       stored: true,
       source: 'local-font-access',
-      complete: true,
+      complete: false,
       storage: 'local-storage',
       count: 3,
-      checkedFamilies: sortedKo(['로컬A', '로컬B', '함초롬바탕']),
+      checkedFamilies: [],
+      probedFamilies: [],
+      unresolvedFamilies: [],
       detectedAt: '2026-06-21T00:00:00.000Z',
       lastError: null,
     });
   } finally {
+    await clearStoredLocalFonts();
+    resetLocalFontsForTests();
+    restoreGlobals(originals);
+  }
+});
+
+test('저장된 v2 snapshot의 반복 별칭 해석은 전체 face를 다시 정규화하지 않는다', async () => {
+  const g = globalThis as TestGlobals;
+  const originals = {
+    browser: g.browser,
+    chrome: g.chrome,
+    document: g.document,
+    localStorage: g.localStorage,
+    queryLocalFonts: g.queryLocalFonts,
+  };
+  const records = Array.from({ length: 256 }, (_, index) => ({
+    family: `Family ${index}`,
+    fullName: `Family ${index} Regular`,
+    postscriptName: `Family${index}-Regular`,
+    style: 'Regular',
+    displayName: `글꼴 ${index}`,
+    aliases: [`Family ${index}`, `Family ${index} Regular`, `별칭 ${index}`],
+  }));
+  const snapshot: LocalFontSnapshot = {
+    version: 2,
+    detectedAt: '2026-07-12T00:00:00.000Z',
+    families: records.map(record => record.family),
+    fontRecords: records,
+    source: 'local-font-access',
+  };
+  const originalNormalize = String.prototype.normalize;
+  let normalizeCalls = 0;
+
+  resetLocalFontsForTests();
+  g.browser = undefined;
+  g.chrome = undefined;
+  g.localStorage = createStorage({ [STORAGE_KEY]: JSON.stringify(snapshot) });
+  g.queryLocalFonts = undefined;
+
+  try {
+    await loadStoredLocalFonts();
+    String.prototype.normalize = function(this: string, form?: string): string {
+      normalizeCalls++;
+      return originalNormalize.call(this, form);
+    };
+
+    for (let index = 0; index < 40; index++) {
+      assert.equal(resolveLocalFont('별칭 255')?.postscriptName, 'Family255-Regular');
+      assert.equal(resolveLocalFont('Family 128 Regular')?.family, 'Family 128');
+    }
+    assert.equal(normalizeCalls, 80);
+  } finally {
+    String.prototype.normalize = originalNormalize;
     await clearStoredLocalFonts();
     resetLocalFontsForTests();
     restoreGlobals(originals);
@@ -347,6 +514,308 @@ test('detectLocalFonts는 전체 snapshot을 저장하고 기본 반환은 웹 �
   }
 });
 
+test('SFNT 지역화 이름을 보존해 HWP 한글 full name을 영문 family로 해석한다', async () => {
+  const g = globalThis as TestGlobals;
+  const originals = {
+    browser: g.browser,
+    chrome: g.chrome,
+    document: g.document,
+    localStorage: g.localStorage,
+    queryLocalFonts: g.queryLocalFonts,
+  };
+  const storage = createStorage();
+
+  resetLocalFontsForTests();
+  g.browser = undefined;
+  g.chrome = undefined;
+  g.localStorage = storage;
+  g.queryLocalFonts = async () => [{
+    family: '08SeoulHangang',
+    fullName: '08SeoulHangang M',
+    postscriptName: 'SeoulHangangM',
+    style: 'M',
+    blob: async () => new Blob([createSfntWithNameRecords([
+      { nameId: 1, value: '08서울한강체' },
+      { nameId: 2, value: 'M' },
+      { nameId: 4, value: '08서울한강체 M' },
+      { nameId: 6, value: 'SeoulHangangM' },
+    ])]),
+  }];
+
+  try {
+    const fonts = await detectLocalFonts({ force: true, includeRegistered: true });
+    const record = resolveLocalFont('08서울한강체 M');
+    const englishRecord = resolveLocalFont('08SeoulHangang M');
+    const report = analyzeDocumentFonts(['08서울한강체 M']);
+    const cssChain = fontFamilyChainForDisplay('08서울한강체 M');
+    const stored = JSON.parse(storage.getItem(STORAGE_KEY) ?? '{}') as LocalFontSnapshot;
+
+    assert.deepEqual(fonts, ['08서울한강체 M']);
+    assert.equal(record?.family, '08SeoulHangang');
+    assert.equal(englishRecord?.postscriptName, 'SeoulHangangM');
+    assert.equal(record?.postscriptName, 'SeoulHangangM');
+    assert.ok(record?.aliases.includes('08서울한강체 M'));
+    assert.deepEqual(getLocalFontRecords().map(item => item.displayName), ['08서울한강체 M']);
+    assert.deepEqual(report.fonts.map(item => [item.fontName, item.status, item.source]), [
+      ['08서울한강체 M', 'available', 'local'],
+    ]);
+    assert.equal(firstQuotedFontFamily(cssChain), record?.fullName);
+    assert.equal(stored.version, 3);
+    assert.equal('blob' in (stored.fontRecords?.[0] ?? {}), false);
+  } finally {
+    await clearStoredLocalFonts();
+    resetLocalFontsForTests();
+    restoreGlobals(originals);
+  }
+});
+
+test('여러 style이 있는 local family는 요청 face의 full name을 Canvas chain 첫 항목으로 둔다', async () => {
+  const g = globalThis as TestGlobals;
+  const originals = {
+    browser: g.browser,
+    chrome: g.chrome,
+    document: g.document,
+    localStorage: g.localStorage,
+    queryLocalFonts: g.queryLocalFonts,
+  };
+  const storage = createStorage();
+
+  resetLocalFontsForTests();
+  g.browser = undefined;
+  g.chrome = undefined;
+  g.localStorage = storage;
+  g.queryLocalFonts = async () => [{
+    family: 'KoPub Batang',
+    fullName: 'KoPub Batang Light',
+    postscriptName: 'KoPubBatang-Light',
+    style: 'Light',
+    blob: async () => new Blob([createSfntWithNameRecords([
+      { nameId: 1, value: 'KoPub바탕체' },
+      { nameId: 2, value: 'Light' },
+      { nameId: 4, value: 'KoPub바탕체 Light' },
+      { nameId: 6, value: 'KoPubBatang-Light' },
+    ])]),
+  }];
+
+  try {
+    await detectLocalFonts({ force: true, includeRegistered: true });
+    const record = resolveLocalFont('KoPub바탕체 Light');
+    const chain = fontFamilyChainForDisplay('KoPub바탕체 Light');
+
+    assert.equal(record?.style, 'Light');
+    assert.equal(firstQuotedFontFamily(chain), record?.fullName);
+    assert.notEqual(firstQuotedFontFamily(chain), record?.family);
+  } finally {
+    await clearStoredLocalFonts();
+    resetLocalFontsForTests();
+    restoreGlobals(originals);
+  }
+});
+
+test('CanvasKit용 휴먼명조 조회는 대체 family가 아니라 정확한 local face bytes를 반환한다', async () => {
+  const g = globalThis as TestGlobals;
+  const originals = {
+    browser: g.browser,
+    chrome: g.chrome,
+    document: g.document,
+    localStorage: g.localStorage,
+    queryLocalFonts: g.queryLocalFonts,
+  };
+  const storage = createStorage();
+  const fontBytes = createSfntWithNameRecords([
+    { nameId: 1, value: '휴먼명조' },
+    { nameId: 2, value: 'Regular' },
+    { nameId: 4, value: '휴먼명조' },
+    { nameId: 6, value: '휴먼명조' },
+  ]);
+  const queryCalls: Array<string[] | undefined> = [];
+
+  resetLocalFontsForTests();
+  g.browser = undefined;
+  g.chrome = undefined;
+  g.localStorage = storage;
+  g.queryLocalFonts = async (options?: { postscriptNames?: string[] }) => {
+    queryCalls.push(options?.postscriptNames);
+    return [{
+      family: '휴먼명조',
+      fullName: '휴먼명조',
+      postscriptName: '휴먼명조',
+      style: 'Regular',
+      blob: async () => new Blob([fontBytes]),
+    }];
+  };
+
+  try {
+    await detectLocalFonts({ force: true, includeRegistered: true });
+    const record = resolveLocalFont('휴먼명조');
+    assert.equal(record?.family, '휴먼명조');
+    assert.equal(record?.fullName, '휴먼명조');
+    assert.equal(record?.postscriptName, '휴먼명조');
+
+    const bytesByFace = await loadLocalFontBytesFor(['휴먼명조']);
+    assert.deepEqual(
+      new Uint8Array(bytesByFace.get(localFontFaceKey(record!)) ?? new ArrayBuffer(0)),
+      fontBytes,
+    );
+    assert.deepEqual(queryCalls, [undefined, ['휴먼명조']]);
+  } finally {
+    await clearStoredLocalFonts();
+    resetLocalFontsForTests();
+    restoreGlobals(originals);
+  }
+});
+
+test('legacy Macintosh name record는 표시 이름에 섞지 않는다', async () => {
+  const g = globalThis as TestGlobals;
+  const originals = {
+    browser: g.browser,
+    chrome: g.chrome,
+    document: g.document,
+    localStorage: g.localStorage,
+    queryLocalFonts: g.queryLocalFonts,
+  };
+  const storage = createStorage();
+  resetLocalFontsForTests();
+  g.browser = undefined;
+  g.chrome = undefined;
+  g.localStorage = storage;
+  g.queryLocalFonts = async () => [{
+    family: 'Browser Font',
+    fullName: 'Browser Font Regular',
+    postscriptName: 'BrowserFont-Regular',
+    style: 'Regular',
+    blob: async () => new Blob([createSfntWithNameRecords([
+      { nameId: 1, value: '!legacy', platformId: 1, bytes: new TextEncoder().encode('!legacy') },
+      { nameId: 4, value: '!legacy display', platformId: 1, bytes: new TextEncoder().encode('!legacy display') },
+    ])]),
+  }];
+
+  try {
+    assert.deepEqual(await detectLocalFonts({ force: true }), ['Browser Font Regular']);
+  } finally {
+    await clearStoredLocalFonts();
+    resetLocalFontsForTests();
+    restoreGlobals(originals);
+  }
+});
+
+test('저장된 깨진 표시 이름은 브라우저 family 이름으로 복구한다', async () => {
+  const g = globalThis as TestGlobals;
+  const originals = {
+    browser: g.browser,
+    chrome: g.chrome,
+    document: g.document,
+    localStorage: g.localStorage,
+    queryLocalFonts: g.queryLocalFonts,
+  };
+  const snapshot: LocalFontSnapshot = {
+    version: 2,
+    detectedAt: '2026-07-12T00:00:00.000Z',
+    families: ['Browser Font'],
+    fontRecords: [{
+      family: 'Browser Font',
+      fullName: 'Browser Font Regular',
+      postscriptName: 'BrowserFont-Regular',
+      style: 'Regular',
+      displayName: '»Ã깨진 이름',
+      aliases: ['Browser Font', 'Browser Font Regular', '»Ã깨진 이름'],
+    }],
+    source: 'local-font-access',
+  };
+  const storage = createStorage({ [STORAGE_KEY]: JSON.stringify(snapshot) });
+  resetLocalFontsForTests();
+  g.browser = undefined;
+  g.chrome = undefined;
+  g.localStorage = storage;
+  g.queryLocalFonts = undefined;
+
+  try {
+    await loadStoredLocalFonts();
+    assert.deepEqual(getLocalFonts(), ['Browser Font Regular']);
+  } finally {
+    await clearStoredLocalFonts();
+    resetLocalFontsForTests();
+    restoreGlobals(originals);
+  }
+});
+
+test('CanvasKit용 SFNT 바이트는 여러 PostScript face를 일괄 조회하고 동시 요청만 공유한다', async () => {
+  const g = globalThis as TestGlobals;
+  const originals = {
+    browser: g.browser,
+    chrome: g.chrome,
+    document: g.document,
+    localStorage: g.localStorage,
+    queryLocalFonts: g.queryLocalFonts,
+  };
+  const storage = createStorage();
+  const nameTableBytes = createSfntWithNameRecords([
+    { nameId: 1, value: '08서울한강체' },
+    { nameId: 2, value: 'M' },
+    { nameId: 4, value: '08서울한강체 M' },
+    { nameId: 6, value: 'SeoulHangangM' },
+  ]);
+  const secondNameTableBytes = createSfntWithNameRecords([
+    { nameId: 1, value: '08서울한강체' },
+    { nameId: 2, value: 'L' },
+    { nameId: 4, value: '08서울한강체 L' },
+    { nameId: 6, value: 'SeoulHangangL' },
+  ]);
+  const fontBytes = new Uint8Array(nameTableBytes.length + 4);
+  fontBytes.set(nameTableBytes);
+  fontBytes.set([0xde, 0xad, 0xbe, 0xef], nameTableBytes.length);
+  const secondFontBytes = new Uint8Array(secondNameTableBytes.length + 4);
+  secondFontBytes.set(secondNameTableBytes);
+  secondFontBytes.set([0xca, 0xfe, 0xba, 0xbe], secondNameTableBytes.length);
+  const queryCalls: Array<string[] | undefined> = [];
+
+  resetLocalFontsForTests();
+  g.browser = undefined;
+  g.chrome = undefined;
+  g.localStorage = storage;
+  g.queryLocalFonts = async (options?: { postscriptNames?: string[] }) => {
+    queryCalls.push(options?.postscriptNames);
+    return [
+      {
+        family: '08SeoulHangang',
+        fullName: '08SeoulHangang M',
+        postscriptName: 'SeoulHangangM',
+        style: 'M',
+        blob: async () => new Blob([options ? fontBytes : nameTableBytes]),
+      },
+      {
+        family: '08SeoulHangang',
+        fullName: '08SeoulHangang L',
+        postscriptName: 'SeoulHangangL',
+        style: 'L',
+        blob: async () => new Blob([options ? secondFontBytes : secondNameTableBytes]),
+      },
+    ];
+  };
+
+  try {
+    await detectLocalFonts({ force: true, includeRegistered: true });
+    const [all, first] = await Promise.all([
+      loadLocalFontBytesFor(['08서울한강체 M', '08서울한강체 L']),
+      loadLocalFontBytes('08서울한강체 M'),
+    ]);
+    const hangangRecord = resolveLocalFont('08서울한강체 M');
+    const hangangLightRecord = resolveLocalFont('08서울한강체 L');
+
+    assert.deepEqual(new Uint8Array(all.get(localFontFaceKey(hangangRecord!)) ?? new ArrayBuffer(0)), fontBytes);
+    assert.deepEqual(new Uint8Array(all.get(localFontFaceKey(hangangLightRecord!)) ?? new ArrayBuffer(0)), secondFontBytes);
+    assert.deepEqual(new Uint8Array(first ?? new ArrayBuffer(0)), fontBytes);
+    assert.equal(resolveLocalFont('08SeoulHangang'), null);
+    assert.equal(queryCalls.length, 2);
+    assert.equal(queryCalls[0], undefined);
+    assert.deepEqual(new Set(queryCalls[1]), new Set(['SeoulHangangM', 'SeoulHangangL']));
+  } finally {
+    await clearStoredLocalFonts();
+    resetLocalFontsForTests();
+    restoreGlobals(originals);
+  }
+});
+
 test('저장소 읽기 실패는 빈 상태로 처리하고 오류 상태만 기록한다', async () => {
   const g = globalThis as TestGlobals;
   const originals = {
@@ -495,6 +964,102 @@ test('Local Font Access API가 없으면 문서 후보 글꼴만 probe snapshot�
     assert.equal(state.complete, false);
     assert.deepEqual(state.checkedFamilies, sortedKo(['문서로컬', '없는글꼴', '함초롬바탕']));
   } finally {
+    await clearStoredLocalFonts();
+    resetLocalFontsForTests();
+    restoreGlobals(originals);
+  }
+});
+
+test('Local Font Access가 문서 face를 누락하면 미해소 후보만 probe해 exact face를 보존한다', async () => {
+  const g = globalThis as TestGlobals;
+  const originals = {
+    browser: g.browser,
+    chrome: g.chrome,
+    document: g.document,
+    localStorage: g.localStorage,
+    queryLocalFonts: g.queryLocalFonts,
+  };
+  let storedSnapshot: LocalFontSnapshot | null = null;
+  let queryCount = 0;
+
+  resetLocalFontsForTests();
+  g.browser = undefined;
+  g.chrome = undefined;
+  g.localStorage = {
+    get length() {
+      return storedSnapshot ? 1 : 0;
+    },
+    clear() {
+      storedSnapshot = null;
+    },
+    getItem() {
+      return null;
+    },
+    key() {
+      return storedSnapshot ? STORAGE_KEY : null;
+    },
+    removeItem() {
+      storedSnapshot = null;
+    },
+    setItem(_key: string, value: string) {
+      storedSnapshot = JSON.parse(value) as LocalFontSnapshot;
+    },
+  } as Storage;
+  g.queryLocalFonts = async () => {
+    queryCount++;
+    return [{
+      family: '열거된 글꼴',
+      fullName: '열거된 글꼴 Regular',
+      postscriptName: 'Enumerated-Regular',
+      style: 'Regular',
+    }];
+  };
+  const patchedProbe = createPatchedProbeDocument(['KoPub바탕체 Light']);
+  g.document = patchedProbe.document;
+
+  try {
+    const fonts = await detectLocalFonts({
+      force: true,
+      includeRegistered: true,
+      candidateFamilies: ['열거된 글꼴 Regular', 'KoPub바탕체 Light', '없는글꼴'],
+    });
+    const state = getLocalFontState();
+    const chain = fontFamilyChainForDisplay('KoPub바탕체 Light');
+
+    assert.equal(queryCount, 1);
+    assert.equal(patchedProbe.patchedSetCount(), 0);
+    assert.ok(patchedProbe.rawSetCount() > 0);
+    assert.ok(patchedProbe.rawSetCount() <= 48);
+    assert.ok(fonts.includes('KoPub바탕체 Light'));
+    assert.equal(resolveLocalFont('KoPub바탕체 Light')?.fullName, 'KoPub바탕체 Light');
+    assert.equal(resolveLocalFont('KoPub바탕체 Light')?.detectionSource, 'font-presence-probe');
+    assert.equal(resolveLocalFont('열거된 글꼴 Regular')?.detectionSource, 'local-font-access');
+    assert.match(chain, /^"KoPub바탕체 Light"/u);
+    assert.deepEqual(
+      state.checkedFamilies,
+      sortedKo(['열거된 글꼴 Regular', 'KoPub바탕체 Light', '없는글꼴']),
+    );
+    assert.equal(storedSnapshot?.version, 3);
+    assert.deepEqual(storedSnapshot?.probedFamilies, ['KoPub바탕체 Light']);
+    assert.deepEqual(storedSnapshot?.unresolvedFamilies, ['없는글꼴']);
+    assert.deepEqual(state.probedFamilies, ['KoPub바탕체 Light']);
+    assert.deepEqual(state.unresolvedFamilies, ['없는글꼴']);
+    assert.equal(state.complete, false);
+
+    const rawSetCount = patchedProbe.rawSetCount();
+    assert.deepEqual(
+      await detectLocalFonts({
+        candidateFamilies: ['KoPub바탕체 Light'],
+        includeRegistered: true,
+      }),
+      fonts,
+    );
+    assert.equal(queryCount, 1);
+    assert.equal(patchedProbe.rawSetCount(), rawSetCount);
+    assert.equal(await loadLocalFontBytes('KoPub바탕체 Light'), null);
+    assert.equal(queryCount, 1);
+  } finally {
+    resetRawCanvasFontDescriptorForTests();
     await clearStoredLocalFonts();
     resetLocalFontsForTests();
     restoreGlobals(originals);

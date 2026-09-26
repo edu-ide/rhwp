@@ -311,7 +311,7 @@ impl<'a> TextShapeLowerer<'a> {
                             variant: glyph_variant,
                             paint_style: paint_style.clone(),
                             shape_key: shaped.shape_key.clone(),
-                            placement: fallback_placement(bbox, run),
+                            placement: text_run_placement(bbox, run),
                             glyph_ids: shaped.glyph_ids,
                             positions: shaped.positions,
                             advances: shaped.advances,
@@ -345,7 +345,7 @@ impl<'a> TextShapeLowerer<'a> {
     }
 }
 
-fn fallback_placement(bbox: BoundingBox, run: &TextRunNode) -> TextRunPlacement {
+pub(crate) fn text_run_placement(bbox: BoundingBox, run: &TextRunNode) -> TextRunPlacement {
     let radians = run.rotation.to_radians();
     let (sin, cos) = radians.sin_cos();
     let local_origin_x = -bbox.width / 2.0;
@@ -505,6 +505,8 @@ mod tests {
             border_fill_id: 0,
             baseline: 12.0,
             field_marker: crate::renderer::render_tree::FieldMarkerType::None,
+            layout_positions: None,
+            display_text: None,
         }
     }
 
@@ -513,10 +515,10 @@ mod tests {
         let root = LayerNode::leaf(
             BoundingBox::new(0.0, 0.0, 100.0, 100.0),
             None,
-            vec![PaintOp::TextRun {
-                bbox: BoundingBox::new(0.0, 0.0, 20.0, 20.0),
-                run: text_run("A"),
-            }],
+            vec![PaintOp::text_run(
+                BoundingBox::new(0.0, 0.0, 20.0, 20.0),
+                text_run("A"),
+            )],
         );
         let lowerer = TextShapeLowerer::diagnostics_only(&PortableResolver);
         let report = lowerer.analyze_root(&root);
@@ -539,10 +541,10 @@ mod tests {
         let mut root = LayerNode::leaf(
             BoundingBox::new(0.0, 0.0, 100.0, 100.0),
             None,
-            vec![PaintOp::TextRun {
-                bbox: BoundingBox::new(0.0, 0.0, 20.0, 20.0),
-                run: text_run("A"),
-            }],
+            vec![PaintOp::text_run(
+                BoundingBox::new(0.0, 0.0, 20.0, 20.0),
+                text_run("A"),
+            )],
         );
         let lowerer = TextShapeLowerer::new(&PortableResolver);
         let report = lowerer.lower_root(&mut root);
@@ -574,10 +576,10 @@ mod tests {
         let mut root = LayerNode::leaf(
             BoundingBox::new(0.0, 0.0, 100.0, 100.0),
             None,
-            vec![PaintOp::TextRun {
-                bbox: BoundingBox::new(0.0, 0.0, 20.0, 20.0),
-                run: text_run("A"),
-            }],
+            vec![PaintOp::text_run(
+                BoundingBox::new(0.0, 0.0, 20.0, 20.0),
+                text_run("A"),
+            )],
         );
         let lowerer = TextShapeLowerer::new(&EmittingResolver);
         let report = lowerer.lower_root(&mut root);
@@ -603,10 +605,10 @@ mod tests {
         let mut root = LayerNode::leaf(
             BoundingBox::new(0.0, 0.0, 100.0, 100.0),
             None,
-            vec![PaintOp::TextRun {
-                bbox: BoundingBox::new(0.0, 0.0, 20.0, 20.0),
-                run: text_run("A"),
-            }],
+            vec![PaintOp::text_run(
+                BoundingBox::new(0.0, 0.0, 20.0, 20.0),
+                text_run("A"),
+            )],
         );
         let lowerer = TextShapeLowerer::new(&EmittingResolver);
         let first_report = lowerer.lower_root(&mut root);
@@ -632,10 +634,10 @@ mod tests {
         let mut root = LayerNode::leaf(
             BoundingBox::new(0.0, 0.0, 100.0, 100.0),
             None,
-            vec![PaintOp::TextRun {
-                bbox: BoundingBox::new(0.0, 0.0, 20.0, 20.0),
+            vec![PaintOp::text_run(
+                BoundingBox::new(0.0, 0.0, 20.0, 20.0),
                 run,
-            }],
+            )],
         );
         let lowerer = TextShapeLowerer::new(&EmittingResolver);
         let report = lowerer.lower_root(&mut root);

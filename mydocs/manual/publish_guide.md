@@ -1,6 +1,16 @@
+---
+kind: guide
+status: active
+canonical: mydocs/manual/publish_guide.md
+last_verified: 2026-07-17
+---
+
 # 배포 가이드
 
 rhwp 프로젝트의 배포 대상과 절차를 정리한다.
+GitHub repository·Actions의 공통 권한, 승인, 적용 후 관찰과 rollback은
+[GitHub 저장소 운영 매뉴얼](github_operations.md)을 먼저 적용하고, 이 문서는 release·package·스토어별
+배포 절차를 담당한다.
 
 ---
 
@@ -9,6 +19,7 @@ rhwp 프로젝트의 배포 대상과 절차를 정리한다.
 | 대상 | 패키지명 | 배포 방식 | 트리거 |
 |------|---------|----------|--------|
 | GitHub Pages (데모) | — | CI/CD 자동 | main push 또는 태그 |
+| GitHub Release CLI | `rhwp` | CI/CD 자동 | `v*` 태그 push |
 | npm WASM 코어 | @rhwp/core | CI/CD 자동 | GitHub Release 생성 |
 | npm 에디터 | @rhwp/editor | CI/CD 자동 | GitHub Release 생성 |
 | VSCode Marketplace | rhwp-vscode | CI/CD 자동 | GitHub Release 생성 |
@@ -27,6 +38,7 @@ rhwp 프로젝트의 배포 대상과 절차를 정리한다.
 |------|--------|------|
 | `.github/workflows/ci.yml` | push/PR (main, devel) | cargo build + test + clippy 검증 |
 | `.github/workflows/deploy-pages.yml` | main push, 태그 | WASM 빌드 → rhwp-studio 빌드 → GitHub Pages 배포 |
+| `.github/workflows/release-binary.yml` | `v*` 태그, 수동 실행 | 5플랫폼 CLI 빌드 → archive·SHA-256을 GitHub Release에 첨부 |
 | `.github/workflows/npm-publish.yml` | **GitHub Release 생성** 또는 수동 실행 | WASM 빌드 → @rhwp/core + @rhwp/editor + VSCode/Open VSX 익스텐션 배포 |
 
 ### CI/CD 자동 배포 흐름
@@ -34,11 +46,13 @@ rhwp 프로젝트의 배포 대상과 절차를 정리한다.
 ```
 코드 작업 완료
   ↓
-devel push → CI 자동 실행 (build + test + clippy)
+devel 대상 PR merge → CI 자동 실행 (build + test + clippy)
   ↓
-main merge + push → GitHub Pages 자동 배포
+main 대상 release PR merge → GitHub Pages 자동 배포
   ↓
 GitHub Release 생성 (태그)
+  ↓ Release Binary가 Linux x86_64/AArch64, macOS x86_64/AArch64,
+    Windows x86_64 CLI archive와 SHA256SUMS.txt 첨부
   ↓ npm-publish.yml 자동 실행
   ├─ WASM 빌드
   ├─ npm @rhwp/core 배포
@@ -56,6 +70,34 @@ GitHub Release 생성 (태그)
 > 단, release workflow를 재실행하면서 이미 VS Code/Open VSX 배포가 끝난 경우에는
 > `workflow_dispatch`의 `publish_extensions=false` 입력으로 npm publish만 다시 시도한다.
 > Chrome/Edge/Firefox 브라우저 확장은 스토어 심사 흐름이 달라 현재 수동 업로드한다.
+
+### GitHub Release CLI target
+
+`release-binary.yml`은 다음 다섯 native target을 만든다.
+
+| 운영체제·architecture | Rust target | runner | archive suffix |
+| --- | --- | --- | --- |
+| Linux x86_64 | `x86_64-unknown-linux-gnu` | `ubuntu-latest` | `linux-x86_64` |
+| Linux AArch64 | `aarch64-unknown-linux-gnu` | `ubuntu-24.04-arm` | `linux-aarch64` |
+| macOS x86_64 | `x86_64-apple-darwin` | `macos-14` | `macos-x86_64` |
+| macOS AArch64 | `aarch64-apple-darwin` | `macos-14` | `macos-aarch64` |
+| Windows x86_64 | `x86_64-pc-windows-msvc` | `windows-latest` | `windows-x86_64` |
+
+Linux AArch64는 cross compile이나 self-hosted runner가 아니라 GitHub 표준 native ARM64 runner에서
+빌드하고 같은 runner에서 `rhwp --version`을 실행한다. runner label의 현재 지원 여부는
+[GitHub-hosted runners 정본](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)을
+확인한다.
+
+릴리즈 전 dry-run은 작업 브랜치 exact head에서 `workflow_dispatch`의 `tag=test`로 실행한다.
+이 값은 `v`로 시작하지 않으므로 release job은 실행되지 않고 build artifact만 만든다. Linux AArch64
+job이 성공하면 `rhwp-test-linux-aarch64.tar.gz`를 내려받아 다음을 확인한다.
+
+- archive 내부: `rhwp/rhwp`, `rhwp/LICENSE`, `rhwp/README.md`, `rhwp/README_EN.md`
+- 실행 파일: ELF 64-bit AArch64
+- Actions log: `rhwp --version` 종료 코드 0
+
+정식 `v*` 실행에서는 다섯 archive가 모두 성공한 뒤에만 release job이 `SHA256SUMS.txt`와 함께
+GitHub Release에 첨부한다.
 
 ### GitHub Secrets 설정
 
@@ -120,32 +162,27 @@ v{MAJOR}.{MINOR}.{PATCH}
 - @rhwp/editor 는 독자적으로 PATCH를 올릴 수 있다 (README 보강 등).
 - npm은 한 번 배포한 버전을 덮어쓸 수 없으므로, README만 수정해도 PATCH를 올려야 한다.
 
-### 브라우저 확장 버전 정책 (라이브러리와 이원화)
+### 브라우저 확장 버전 정책 (라이브러리와 통일)
 
-**rhwp-chrome / rhwp-edge / rhwp-firefox / rhwp-safari** 의 버전은 라이브러리(Cargo.toml) 와 **독립적으로 관리**한다.
+> **[2026-07-26 정책 전환, v0.8.0]** 종전 이원화(확장 0.2.x 독립 넘버링)를 종료하고,
+> **rhwp-chrome / rhwp-edge / rhwp-firefox / rhwp-safari 의 버전을 라이브러리
+> (Cargo.toml)와 동일하게 통일**한다. 확장만 재출시해야 하는 경우에는 PATCH 를 올리되
+> 다음 라이브러리 릴리즈에서 다시 동일 버전으로 수렴시킨다.
 
-| 영역 | 2026-05-26 현재 |
-|------|----------------|
-| 라이브러리 (Cargo.toml) | `0.7.13` |
-| rhwp-chrome / Edge | `0.2.3` |
-| rhwp-safari | `0.2.1` |
-| rhwp-firefox | `0.2.3` |
-
-#### 이원화 이유
-
-- **배포 주기 독립**: 라이브러리는 기능 추가·버그픽스 주기로, 확장은 스토어 심사 주기(Chrome/Edge/AMO) 로 별도 움직임
-- **스토어 요구사항**: 각 스토어가 manifest 의 `version` 을 자체 규칙으로 관리 요구 (예: 4자리, 재사용 불가)
-- **사용자 인지 버전**: 확장 사용자에게 보이는 버전은 "확장 버전"이고, 라이브러리 버전은 기술 내부 번호
+- 통일 이유: 사용자·스토어 심사자·이슈 리포트에서 확장 버전과 엔진 버전의 대응을
+  즉시 식별. 확장은 매 릴리즈 WASM 을 새로 번들링하므로 실질 내용도 라이브러리 버전을
+  따른다.
+- 스토어 제약(버전 재사용 불가)은 통일 정책과 충돌하지 않는다 — 단조 증가만 지키면 된다.
 
 #### 확장 버전 동기화 파일
 
 **rhwp-chrome/rhwp-edge** (한 코드베이스, 동일 버전):
 - `rhwp-chrome/manifest.json` — 스토어 심사 기준
 - `rhwp-chrome/package.json`
-- `rhwp-chrome/dev-tools-inject.js` 상수
-- `rhwp-chrome/content-script.js` 상수
 
-> manifest 하나만 바꾸고 다른 세 곳이 누락되면 UI 일관성 깨짐. v0.2.0 사이클에서 같은 실수가 발생해 hotfix v0.2.1 을 낸 이력 있음.
+> `dev-tools-inject.js`·`content-script.js` 는 `chrome.runtime.getManifest().version`
+> 런타임 참조로 리팩터링되어 별도 상수 갱신이 필요 없다 (v0.2.0 사이클의 4곳 수동
+> 동기화 사고 이력은 이 리팩터링으로 해소).
 
 **rhwp-firefox**:
 - `rhwp-firefox/manifest.json`
@@ -156,10 +193,10 @@ v{MAJOR}.{MINOR}.{PATCH}
 
 #### 확장 버전 올리기 기준
 
-- 스토어 심사 필요한 변경 → PATCH 이상
-- UI/동작 변경 없음 (dist 만 재빌드) → 버전 그대로 유지
-
-> 라이브러리 MINOR 업이 확장 버전 업을 강제하지는 않는다. 확장은 WASM을 새로 번들링해도 스토어 메타데이터 변경 필요 시에만 버전 업.
+- 라이브러리 릴리즈에 확장을 포함하면 라이브러리와 동일 버전으로 맞춘다.
+- 확장 단독 재출시(스토어 심사 필요한 확장 전용 변경)는 PATCH 를 올리고, 다음
+  라이브러리 릴리즈에서 동일 버전으로 재수렴한다.
+- UI/동작 변경 없음 (dist 만 재빌드) → 스토어 재제출이 없으면 버전 유지 가능.
 
 #### 확장 배포 빌드
 
@@ -179,7 +216,8 @@ cd dist
 zip -r ../rhwp-firefox-{version}.zip .
 
 cd ../..
-git archive --format=zip --prefix=rhwp-source/ --output=rhwp-firefox/rhwp-source-{version}-amo.zip HEAD Cargo.toml rust-toolchain.toml rustfmt.toml Dockerfile docker-compose.yml .env.docker.example LICENSE README.md README_EN.md CHANGELOG.md CHANGELOG_EN.md THIRD_PARTY_LICENSES.md src rhwp-studio rhwp-firefox rhwp-shared web/fonts scripts npm/README.md npm/editor
+git archive --format=zip --prefix=rhwp-source/ --output=rhwp-firefox/rhwp-source-{version}-amo.zip HEAD Cargo.toml Cargo.lock rust-toolchain.toml rustfmt.toml Dockerfile docker-compose.yml .env.docker.example LICENSE README.md README_EN.md CHANGELOG.md CHANGELOG_EN.md THIRD_PARTY_LICENSES.md llms.txt src rhwp-studio rhwp-firefox rhwp-shared assets/fonts assets/logo/logo-32.png saved/blank2010.hwp ttfs/opensource/NotoSansKR-Regular.ttf scripts npm/README.md npm/editor bindings/Native tools/rhwp-subsecond tools/batch-convert mydocs/manual/agent_knowledge_map.md mydocs/manual/agent_troubleshooting_guide.md mydocs/manual/recipes
+zip -d rhwp-firefox/rhwp-source-{version}-amo.zip "rhwp-source/rhwp-studio/public/samples/*"
 ```
 
 Firefox AMO 제출 시에는 확장 패키지와 함께 검토용 source zip을 업로드한다.
@@ -188,7 +226,8 @@ AMO source 업로드 제한은 200 MB 이므로 전체 Git tree를 압축하지 
 
 source zip은 확장 재빌드에 필요한 경로만 포함한다.
 
-- 포함: `src/`, `rhwp-studio/`, `rhwp-firefox/`, `rhwp-shared/`, `web/fonts/`, build scripts, manifest/package files
+- 포함: `src/`, `rhwp-studio/`, `rhwp-firefox/`, `rhwp-shared/`, workspace member,
+  `Cargo.lock`, build script와 production `include_str!`/`include_bytes!` 리소스
 - 제외: top-level `samples/`, `pdf-large/`, `output/`, `target/`, `node_modules/`, extension `dist/`
 
 #### 확장 스토어 제출 문서
@@ -245,7 +284,8 @@ docker compose --env-file .env.docker run --rm wasm   # WASM 빌드
 ```
 
 macOS 로컬에서 release 검증이 필요한 경우 `cargo test --release --tests` 대신
-`cargo test --profile release-test --tests` 를 사용한다. 이유와 실측치는
+고정 `target/pr-review`의 `cargo nextest run --cargo-profile release-test`를 사용한다.
+thread 수의 선택 기준과 이유·실측치는
 [개발환경 가이드](dev_environment_guide.md)의 "macOS 로컬 빌드/테스트 검증"을
 참조한다.
 
@@ -292,33 +332,36 @@ version = "0.8.0"
 | Trademark 면책 조항 | O | O | O |
 | Notice (한컴 공개 문서) | O | O | O |
 
-### 4단계: Git 커밋 + devel/main push
+### 4단계: 변경 PR과 `devel` → `main` 통합
 
 ```bash
-# 변경사항 커밋
+# release 준비 변경은 작업 브랜치에서 커밋하고 devel 대상 PR로 통합
 git add -A
 git commit -m "v0.7.3 릴리즈 준비"
 
-# local/devel → devel 검증 → origin/devel push
-git checkout devel
-git merge local/devel
+# merge된 최신 devel 검증
+git fetch upstream
+git switch devel
+git merge --ff-only upstream/devel
 cargo build
-cargo test
-# macOS release 통합 검증: cargo test --profile release-test --tests
-docker compose --env-file .env.docker run --rm wasm
-git push origin devel
+cargo nextest run \
+  --cargo-profile release-test \
+  --target-dir target/pr-review \
+  --tests --test-threads <현재_환경에_맞는_값> --no-fail-fast
+wasm-pack build --target web --out-dir pkg
 
-# devel → main merge → origin/main push
-git checkout main
-git merge devel
-git push origin main
+# release 시 devel → main PR 생성
+gh pr create --repo edwardkim/rhwp --base main --head devel \
+  --title "v0.7.3 릴리즈" --body-file <release-pr-body.md>
 ```
 
-> 이 PC의 기본 작업 흐름은 task branch → `local/devel` merge → `devel` merge/test → `origin/devel` push → `main` merge/push 순서다.
-> `local/devel`을 원격 `devel`로 직접 push하지 않는다.
-> `devel`에서 최소 compile/test/WASM 빌드를 확인한 뒤 원격으로 push한다.
+release 검증도 고정 thread 수를 복사하지 않는다. nextest 기본 동시성을 먼저 사용하고, release host의
+CPU·메모리·동시 작업을 기준으로 사용자가 필요할 때만 `--test-threads <현재 환경에 맞는 값>`을 지정한다.
+
+> release 준비 변경도 `upstream/devel`에 직접 push하지 않는다. 작업 브랜치 PR과 CI를 거쳐 통합하고,
+> 검증된 `devel`을 `main` 대상 release PR로 올린다.
 >
-> main push 시 CI/CD가 자동 실행된다:
+> main merge 시 CI/CD가 자동 실행된다:
 > - `ci.yml` → build + test + clippy 검증
 > - `deploy-pages.yml` → GitHub Pages 데모 사이트 자동 배포
 
@@ -412,11 +455,13 @@ GitHub Release 생성 후 Actions 탭에서 `Publish All Packages` 워크플로�
 - [ ] THIRD_PARTY_LICENSES.md 현행화
 - [ ] 확장 스토어 제출 문서 현행화 (`mydocs/feedback/`)
 - [ ] 배포 zip에 `.env`, 개인 폰트, token, `node_modules/`, `target/`, `dist/` 불포함 확인
+- [ ] Release Binary dry-run 5플랫폼 성공 및 Linux AArch64 archive·ELF architecture 확인
 
 ### 배포 순서
 
-- [ ] devel push → CI 통과 확인
-- [ ] main merge + push → GitHub Pages 배포 확인
+- [ ] devel 대상 PR merge → CI 통과 확인
+- [ ] main 대상 release PR merge → GitHub Pages 배포 확인
+- [ ] v0.8.6 Release Binary 5개 archive와 `SHA256SUMS.txt` 확인
 - [ ] GitHub Release 생성 → Actions 탭에서 `Publish All Packages` 실행 확인
 - [ ] @rhwp/core npm 배포 확인
 - [ ] @rhwp/editor npm 배포 확인

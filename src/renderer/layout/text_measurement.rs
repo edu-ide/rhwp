@@ -1,17 +1,16 @@
 //! 텍스트 폭 측정, 문자 클러스터 분할, CJK 판별 관련 함수
 
 use super::super::font_metrics_data;
+use super::super::kerning::{ExactFontSourceHandle, KerningRunMeasurement, KerningSourceSession};
 use super::super::style_resolver::ResolvedStyleSet;
-use super::super::{hwpunit_to_px, TabLeaderInfo, TabStop, TextStyle};
-use crate::model::style::UnderlineType;
+use super::super::{TabLeaderInfo, TabStop, TextStyle};
 
 // ── TextMeasurer trait ──────────────────────────────────────────────
 
 /// 텍스트 폭 측정 추상화 트레이트
 ///
-/// 플랫폼별 텍스트 측정 구현체를 추상화한다.
-/// - EmbeddedTextMeasurer: 내장 폰트 메트릭 기반 (모든 플랫폼)
-/// - WasmTextMeasurer: JS Canvas 브릿지 + 내장 메트릭 (WASM 전용)
+/// 텍스트 측정 구현체를 추상화한다.
+/// - EmbeddedTextMeasurer: 내장 폰트 메트릭 기반 (native/WASM 공통 기본값)
 pub trait TextMeasurer {
     /// 텍스트 전체 폭 추정 (px)
     fn estimate_text_width(&self, text: &str, style: &TextStyle) -> f64;
@@ -48,18 +47,43 @@ fn build_cluster_len(chars: &[char]) -> Vec<u8> {
     cluster_len
 }
 
+/// [#2279] 자간(%)의 픽셀 기여 — 한글은 자간을 **해당 글자의 진행폭 비례**로
+/// 적용한다 (fs-비례 아님). 무신축 Justify 마지막 줄 실측(36392557 pi34,
+/// 휴먼명조 '*' 14pt 자간 -9%/장평 96%: 0.44em = 0.5×0.96×0.91)으로 확정.
+/// 전각(1.0em) 글자는 fs-비례와 동일하므로 CJK 자간 동작은 불변이고,
+/// 반각/좁은 글자에서만 압축·확장이 글자폭에 비례해 정확해진다.
+/// style.letter_spacing 은 fs×% 로 저장되어 있으므로 (base/fs) 로 환산한다.
+#[inline]
+fn glyph_letter_spacing(letter_spacing_px: f64, glyph_base_px: f64, font_size: f64) -> f64 {
+    if font_size <= 0.0 {
+        return letter_spacing_px;
+    }
+    letter_spacing_px * (glyph_base_px / font_size)
+}
+
 /// 스타일에서 공통 파라미터 추출 (font_size, ratio, tab_w)
 fn style_params(style: &TextStyle) -> (f64, f64, f64) {
-    let font_size = if style.font_size > 0.0 {
+    let base_font_size = if style.font_size > 0.0 {
         style.font_size
     } else {
         12.0
+    };
+    // [#5756] 위/아래첨자 run 의 **전진폭**은 그리는 크기(0.7배)를 따른다.
+    // 한글 저장 lineseg 실측(156732409 3쪽): 위첨자 전진을 본문 크기로 재면
+    // 칸 안쪽 폭 327.95px 에 담긴 40글자가 382.9px 로 늘어 칸 오른쪽 괘선 밖
+    // 54.9px 에 찍힌다 — 0.7배로 재면 327.4px 로 저장 줄바꿈(textpos)과 정확히
+    // 맞는다. 자간/장평은 크기 비례라 함께 줄어든다. 탭 폭 기본값은 본문 크기
+    // 기준을 유지한다.
+    let font_size = if style.superscript || style.subscript {
+        base_font_size * crate::renderer::SCRIPT_FONT_SCALE
+    } else {
+        base_font_size
     };
     let ratio = if style.ratio > 0.0 { style.ratio } else { 1.0 };
     let tab_w = if style.default_tab_width > 0.0 {
         style.default_tab_width
     } else {
-        font_size * 4.0
+        base_font_size * 4.0
     };
     (font_size, ratio, tab_w)
 }
@@ -191,7 +215,8 @@ pub fn extract_tab_leaders(text: &str, positions: &[f64], style: &TextStyle) -> 
 }
 
 /// 탭 리더 추출 (tab_extended 지원)
-/// tab_extended: HWPX 인라인 탭 또는 HWP 탭 확장 데이터 (ext[1] = leader/fill_type)
+/// tab_extended: HWPX 인라인 탭 또는 HWP 탭 확장 데이터
+/// (ext[0..2] = 탭 폭(UINT32), ext[2] = (탭 종류 << 8) | 채움 종류)
 pub fn extract_tab_leaders_with_extended(
     text: &str,
     positions: &[f64],
@@ -220,9 +245,14 @@ pub fn extract_tab_leaders_with_extended(
                 None
             };
 
-            // 1. tab_extended에서 leader 가져오기 (HWPX 인라인 탭)
+            // 1. tab_extended 에서 채움 종류 가져오기 (HWP5/HWPX 인라인 탭)
+            // 인라인 탭 확장 레코드는 ext[0..2] = 탭 폭(UINT32 저/고워드),
+            // ext[2] = (탭 종류 << 8) | 채움 종류 다. 위치 계산부(`inline_tab_x` 의
+            // `fill_low = tab_type_raw & 0xFF`)와 같은 자리를 봐야 한다.
+            // ext[1] 은 탭 폭의 상위 16비트라 목차 탭 폭(수만 HWPUNIT)에서는 늘 0 →
+            // `leader` 가 붙은 탭도 채움 없음으로 읽혀 리더가 통째로 사라졌다 (#5799).
             let ext_fill = if tab_idx < tab_extended.len() {
-                tab_extended[tab_idx][1] as u8 // ext[1] = leader/fill_type
+                (tab_extended[tab_idx][2] & 0x00FF) as u8
             } else {
                 0
             };
@@ -288,77 +318,125 @@ pub fn extract_tab_leaders_with_extended(
 /// font_metrics_data의 582개 폰트 메트릭을 사용하여 문자 폭을 측정한다.
 /// 메트릭이 없는 폰트는 CJK=font_size, Latin=font_size×0.5 휴리스틱을 사용한다.
 /// 모든 플랫폼에서 동일하게 동작한다 (WASM 포함).
+/// [#2132] 공용 글자-워크 — Embedded/Wasm measurer 의 compute_char_positions 중복 소거.
+/// 폭 산출원(char_px_raw)과 인라인 탭 divergent 경로(inline_tab_x)만 measurer 별 훅.
+/// 나머지(특수문자, dash leader, 자간 클램프, 공백, 커스텀/기본 탭)는 1벌.
+fn compute_char_positions_walk(
+    text: &str,
+    style: &TextStyle,
+    inline_tab_x: &dyn Fn(usize, f64, &[u16; 7], &[char], &[u8], &dyn Fn(usize) -> f64) -> f64,
+) -> Vec<f64> {
+    let (_, _, tab_w) = style_params(style);
+    let chars: Vec<char> = text.chars().collect();
+    let char_count = chars.len();
+    let mut positions = Vec::with_capacity(char_count + 1);
+    let mut x = 0.0;
+    positions.push(x);
+
+    let cluster_len = build_cluster_len(&chars);
+    let has_custom_tabs = !style.tab_stops.is_empty() || style.auto_tab_right;
+
+    let char_width =
+        |i: usize| -> f64 { char_width_decision(&chars, &cluster_len, i, style).final_width_px };
+
+    let mut tab_char_idx = 0usize; // inline_tabs 인덱스
+    for i in 0..char_count {
+        let c = chars[i];
+        if cluster_len[i] == 0 {
+            positions.push(x);
+            continue;
+        }
+        if c == '\t' {
+            if tab_char_idx < style.inline_tabs.len() {
+                let ext = &style.inline_tabs[tab_char_idx];
+                x = inline_tab_x(i, x, ext, &chars, &cluster_len, &char_width);
+                tab_char_idx += 1;
+            } else if has_custom_tabs {
+                let has_more_tabs_after = chars[i + 1..].contains(&'\t');
+                if !has_more_tabs_after && tab_suffix_is_ascii_page_number(&chars, i + 1) {
+                    if let Some(target_rel) = right_leader_body_target_rel(style) {
+                        let seg_w = measure_segment_from(&chars, &cluster_len, i + 1, &char_width);
+                        x = (target_rel - seg_w).max(x);
+                        tab_char_idx += 1;
+                        positions.push(x);
+                        continue;
+                    }
+                }
+                let abs_x = style.line_x_offset + x;
+                let (tab_pos, tab_type, fill_type) = find_next_tab_stop(
+                    abs_x,
+                    &style.tab_stops,
+                    tab_w,
+                    style.auto_tab_right,
+                    style.available_width,
+                );
+                let rel_tab = tab_pos - style.line_x_offset;
+                // [Task #874] auto_tab_right / leader RIGHT 탭은 col-relative 우측 끝
+                // (= text_start_offset + available_width) 까지 정렬.
+                let effective_rel_tab = if tab_type == 1
+                    && style.available_width > 0.0
+                    && (fill_type != 0 || style.auto_tab_right)
+                {
+                    style.text_start_offset + style.available_width - style.line_x_offset
+                } else {
+                    rel_tab
+                };
+                match tab_type {
+                    1 => {
+                        // 오른쪽
+                        let seg_start = if fill_type != 0 {
+                            i + 1
+                        } else {
+                            let mut s = i + 1;
+                            while s < chars.len() && chars[s] == ' ' && cluster_len[s] != 0 {
+                                s += 1;
+                            }
+                            s
+                        };
+                        let seg_w =
+                            measure_segment_from(&chars, &cluster_len, seg_start, &char_width);
+                        x = (effective_rel_tab - seg_w).max(x);
+                    }
+                    2 => {
+                        // 가운데
+                        let seg_w = measure_segment_from(&chars, &cluster_len, i + 1, &char_width);
+                        x = (rel_tab - seg_w / 2.0).max(x);
+                    }
+                    _ => {
+                        // 왼쪽(0), 소수점(3)
+                        x = rel_tab.max(x);
+                    }
+                }
+                tab_char_idx += 1;
+            } else {
+                // 기본 등간격 탭: 라인 절대 위치(line_x_offset + x) 기준으로 계산.
+                let abs_x = style.line_x_offset + x;
+                let next_abs = ((abs_x / tab_w).floor() + 1.0) * tab_w;
+                x = (next_abs - style.line_x_offset).max(x);
+                tab_char_idx += 1;
+            }
+            positions.push(x);
+            continue;
+        }
+        x += char_width(i);
+        positions.push(x);
+    }
+
+    positions
+}
+
 pub struct EmbeddedTextMeasurer;
 
 impl TextMeasurer for EmbeddedTextMeasurer {
     fn estimate_text_width(&self, text: &str, style: &TextStyle) -> f64 {
-        let (font_size, ratio, tab_w) = style_params(style);
+        let (font_size, _, tab_w) = style_params(style);
         let chars: Vec<char> = text.chars().collect();
         let cluster_len = build_cluster_len(&chars);
         let char_count = chars.len();
         let has_custom_tabs = !style.tab_stops.is_empty() || style.auto_tab_right;
 
         let char_width = |i: usize| -> f64 {
-            let c = chars[i];
-            if c == '\u{2007}' {
-                return font_size * 0.5 * ratio + style.letter_spacing + style.extra_char_spacing;
-            }
-            // 인라인 객체 placeholder 는 실제 control node 가 따로 그리므로 텍스트 폭은 0.
-            if c == '\u{FFFC}' {
-                return 0.0;
-            }
-            // [Issue #677] HWP PUA 채움 문자 (U+F081C) — 시각 폭 0
-            // 한컴이 인라인 TAC 표/도형 앞에 삽입하는 placeholder 채움 문자.
-            // 한컴 PDF 정합 — 폭 0 으로 라인 inline x 에 영향 없음. fillers 가
-            // 표 너비만큼 (≈97 chars × 1 char width = table width) 채워져
-            // 표가 fillers 영역 위에 시각적으로 겹쳐 column-left 출력 패턴.
-            if c == '\u{F081C}' {
-                return 0.0;
-            }
-            let base_w_raw = if let Some(w) = measure_char_width_embedded(
-                &style.font_family,
-                style.bold,
-                style.italic,
-                c,
-                font_size,
-            ) {
-                w
-            } else if cluster_len[i] > 1 || is_cjk_char(c) || is_fullwidth_symbol(c) {
-                font_size
-            } else if is_narrow_punctuation(c) {
-                // Task #257: 콤마·중점 등은 실제 글리프 폭이 반각보다 뚜렷이
-                // 좁음. 폴백 경로에서 font_size * 0.5 를 쓰면 PDF 대비 뒤
-                // 글자가 2~3px 우측으로 밀림. 0.3 으로 분기.
-                font_size * 0.3
-            } else {
-                font_size * 0.5
-            };
-            // Task #352: 3+ 연속 dash 시퀀스(빈칸/leader) 는 좁은 폭으로 재산출.
-            // HY신명조 등 한글 폰트 메트릭의 ASCII '-' 폭(0.83 em) 부풀림 회피.
-            // 좁은 base 0.3 em 위에 paragraph_layout 가 라인 슬랙을 분배한
-            // extra_dash_advance 를 추가하여 PDF 의 elastic leader 동작 모방.
-            let is_leader = is_dash_leader_run(&chars, i);
-            let base_w = if is_leader {
-                base_w_raw.min(font_size * 0.3)
-            } else {
-                base_w_raw
-            };
-            let mut w = base_w * ratio + style.letter_spacing + style.extra_char_spacing;
-            if c == ' ' {
-                w += style.extra_word_spacing;
-            }
-            if is_leader {
-                w += style.extra_dash_advance;
-            }
-            // 음수 자간(letter_spacing + extra_char_spacing < 0) 시
-            // per-char 최소 advance = base*ratio*0.5 로 클램프하여 narrow
-            // glyph(콤마/마침표 등) 이 뒷 글자와 역진 겹침되는 것을 방지한다.
-            // 문서 CharShape 의 음수 자간 및 paragraph_layout 의 압축 모두 포함.
-            if style.letter_spacing + style.extra_char_spacing < 0.0 {
-                let min_w = base_w * ratio * 0.5;
-                w = w.max(min_w);
-            }
-            w
+            char_width_decision(&chars, &cluster_len, i, style).final_width_px
         };
 
         let mut total = 0.0;
@@ -505,995 +583,177 @@ impl TextMeasurer for EmbeddedTextMeasurer {
     }
 
     fn compute_char_positions(&self, text: &str, style: &TextStyle) -> Vec<f64> {
-        let (font_size, ratio, tab_w) = style_params(style);
-        let chars: Vec<char> = text.chars().collect();
-        let char_count = chars.len();
-        let mut positions = Vec::with_capacity(char_count + 1);
-        let mut x = 0.0;
-        positions.push(x);
-
-        let cluster_len = build_cluster_len(&chars);
-        let has_custom_tabs = !style.tab_stops.is_empty() || style.auto_tab_right;
-
-        let char_width = |i: usize| -> f64 {
-            let c = chars[i];
-            if c == '\u{2007}' {
-                return font_size * 0.5 * ratio + style.letter_spacing + style.extra_char_spacing;
-            }
-            // 인라인 객체 placeholder 는 실제 control node 가 따로 그리므로 텍스트 폭은 0.
-            if c == '\u{FFFC}' {
-                return 0.0;
-            }
-            // [Issue #677] HWP PUA 채움 문자 (U+F081C) — 시각 폭 0
-            // 한컴이 인라인 TAC 표/도형 앞에 삽입하는 placeholder 채움 문자.
-            // 한컴 PDF 정합 — 폭 0 으로 라인 inline x 에 영향 없음. fillers 가
-            // 표 너비만큼 (≈97 chars × 1 char width = table width) 채워져
-            // 표가 fillers 영역 위에 시각적으로 겹쳐 column-left 출력 패턴.
-            if c == '\u{F081C}' {
-                return 0.0;
-            }
-            let base_w_raw = if let Some(w) = measure_char_width_embedded(
-                &style.font_family,
-                style.bold,
-                style.italic,
-                c,
-                font_size,
-            ) {
-                w
-            } else if cluster_len[i] > 1 || is_cjk_char(c) || is_fullwidth_symbol(c) {
-                font_size
-            } else if is_narrow_punctuation(c) {
-                // Task #257: 콤마·중점 등 narrow glyph 폴백 폭 (0.5 → 0.3).
-                font_size * 0.3
+        let (font_size, _ratio, _tab_w) = style_params(style);
+        // [#2132] 인라인 탭 divergent 경로 훅 — HWP5 raw ext 인코딩 legacy 해석 유지
+        // (Issue #630 Stage 4/6, Task #874 계열 — 원본 무변경 이동).
+        let inline_tab_x = |i: usize,
+                            x_in: f64,
+                            ext: &[u16; 7],
+                            chars: &[char],
+                            cluster_len: &[u8],
+                            char_width: &dyn Fn(usize) -> f64|
+         -> f64 {
+            let mut x = x_in;
+            let tab_width_px = ext[0] as f64 * 96.0 / 7200.0;
+            let tab_type_raw = ext[2];
+            let tab_target = x + tab_width_px;
+            // [Task #874] auto_tab_right paragraph + 단일 tab: ext[0] = Hancom의
+            // right-tab 결과 위치 (= 우측 끝 - 한컴_seg_w). 우리 폰트의 seg_w 와 차이
+            // 가 있으면 좌측 이탈. col-relative right edge - our_seg_w 로 override.
+            let has_more_tabs_after = chars[i + 1..].contains(&'\t');
+            // [Task #874 #10] ext[2] high-byte 가 명시적 LEFT(1)/DECIMAL(4) 면
+            // auto_tab_right paragraph 라도 override 금지 — exam_math.hwp p7
+            // item 18 (Task #290) 의 inline LEFT tab 회귀 차단.
+            let inline_type_hi = ((tab_type_raw >> 8) & 0xFF) as u8;
+            let inline_is_explicit_left = inline_type_hi == 1 || inline_type_hi == 4;
+            let override_to_right = style.auto_tab_right
+                && !has_more_tabs_after
+                && style.available_width > 0.0
+                && !inline_is_explicit_left;
+            // [Issue #630 Stage 6] HWP5 inline tab `ext[2]` 인코딩 = `(enum+1)<<8 | fill`
+            // 이므로 high-byte 추출이 정확. 단, RIGHT(high-byte=2) + leader(fill≠0)
+            // 의 경우 한컴 ext[0] 가 이미 "(우측 끝 - 한컴_seg_w)" 까지의 거리로
+            // 저장 (Stage 4 검증).
+            let body_right_text_rel = if style.available_width > 0.0 {
+                style.text_start_offset + style.available_width - style.line_x_offset
             } else {
-                font_size * 0.5
+                f64::INFINITY
             };
-            // Task #352: 3+ 연속 dash leader 좁은 base 0.3 em + 라인 슬랙
-            // 분배(extra_dash_advance) 로 PDF elastic leader 모방.
-            let is_leader = is_dash_leader_run(&chars, i);
-            let base_w = if is_leader {
-                base_w_raw.min(font_size * 0.3)
+            let body_right_legacy = if style.available_width > 0.0 {
+                style.available_width - style.line_x_offset
             } else {
-                base_w_raw
+                f64::INFINITY
             };
-            let mut w = base_w * ratio + style.letter_spacing + style.extra_char_spacing;
-            if c == ' ' {
-                w += style.extra_word_spacing;
-            }
-            if is_leader {
-                w += style.extra_dash_advance;
-            }
-            // 음수 자간(letter_spacing + extra_char_spacing < 0) 시 per-char 최소
-            // advance 를 base_w*ratio*0.5 로 클램프하여 narrow glyph(콤마/마침표 등)
-            // 이 뒷 글자와 역진 겹침되는 것을 방지한다. 문서 CharShape 의 음수 자간
-            // 및 paragraph_layout 의 overflow/Justify/Distribute 압축 모두 포함.
-            if style.letter_spacing + style.extra_char_spacing < 0.0 {
-                let min_w = base_w * ratio * 0.5;
-                w = w.max(min_w);
-            }
-            w
-        };
-
-        let mut tab_char_idx = 0usize; // inline_tabs 인덱스
-        for i in 0..char_count {
-            let c = chars[i];
-            if cluster_len[i] == 0 {
-                positions.push(x);
-                continue;
-            }
-            if c == '\t' {
-                // HWPX 인라인 탭: inline_tabs에서 width/type 사용
-                // 네이티브 경로의 ext[2] 인코딩: (tab_type << 8) | fill_type.
-                // 상위 바이트가 tab_type (1=LEFT, 2=RIGHT, 3=CENTER, 4=DECIMAL).
-                // [Issue #630 Stage 4 검증] HWP5 의 `ext[0]` 가 이미 right-tab 결과 위치
-                // (= 우측 끝 - 한컴_seg_w) 로 저장되어 있어 LEFT fallback 이 인코딩 의도와
-                // 정합. estimate_text_width 와 동일한 raw u16 해석 유지.
-                if tab_char_idx < style.inline_tabs.len() {
-                    let ext = &style.inline_tabs[tab_char_idx];
-                    let tab_width_px = ext[0] as f64 * 96.0 / 7200.0;
-                    let tab_type_raw = ext[2];
-                    let tab_target = x + tab_width_px;
-                    // [Task #874] auto_tab_right paragraph + 단일 tab: ext[0] = Hancom의
-                    // right-tab 결과 위치 (= 우측 끝 - 한컴_seg_w). 우리 폰트의 seg_w 와 차이
-                    // 가 있으면 좌측 이탈. col-relative right edge - our_seg_w 로 override.
-                    let has_more_tabs_after = chars[i + 1..].contains(&'\t');
-                    // [Task #874 #10] ext[2] high-byte 가 명시적 LEFT(1)/DECIMAL(4) 면
-                    // auto_tab_right paragraph 라도 override 금지 — exam_math.hwp p7
-                    // item 18 (Task #290) 의 inline LEFT tab 회귀 차단.
-                    let inline_type_hi = ((tab_type_raw >> 8) & 0xFF) as u8;
-                    let inline_is_explicit_left = inline_type_hi == 1 || inline_type_hi == 4;
-                    let override_to_right = style.auto_tab_right
-                        && !has_more_tabs_after
-                        && style.available_width > 0.0
-                        && !inline_is_explicit_left;
-                    // [Issue #630 Stage 6] HWP5 inline tab `ext[2]` 인코딩 = `(enum+1)<<8 | fill`
-                    // 이므로 high-byte 추출이 정확. 단, RIGHT(high-byte=2) + leader(fill≠0)
-                    // 의 경우 한컴 ext[0] 가 이미 "(우측 끝 - 한컴_seg_w)" 까지의 거리로
-                    // 저장 (Stage 4 검증).
-                    let body_right_text_rel = if style.available_width > 0.0 {
-                        style.text_start_offset + style.available_width - style.line_x_offset
-                    } else {
-                        f64::INFINITY
-                    };
-                    let body_right_legacy = if style.available_width > 0.0 {
-                        style.available_width - style.line_x_offset
-                    } else {
-                        f64::INFINITY
-                    };
-                    if override_to_right {
-                        // [Task #874 #2] lang split 후속 run 합산 override.
-                        let seg_w = if let Some(w) = style.right_tab_block_width_override {
-                            w
-                        } else {
-                            let seg_start = {
-                                let mut s = i + 1;
-                                while s < chars.len() && chars[s] == ' ' && cluster_len[s] != 0 {
-                                    s += 1;
-                                }
-                                s
-                            };
-                            measure_segment_from(&chars, &cluster_len, seg_start, &char_width)
-                        };
-                        x = (body_right_text_rel - seg_w).max(x);
-                    } else if inline_type_hi == 0
-                        && !has_more_tabs_after
-                        && tab_suffix_is_ascii_page_number(&chars, i + 1)
-                    {
-                        if let Some(target_rel) = right_leader_tab_target_rel(style, font_size) {
-                            let seg_w =
-                                measure_segment_from(&chars, &cluster_len, i + 1, &char_width);
-                            x = (target_rel - seg_w).max(x);
-                        } else {
-                            x = tab_target.max(x);
-                        }
-                    } else {
-                        let high_byte = (tab_type_raw >> 8) & 0xFF;
-                        let fill_low = tab_type_raw & 0xFF;
-                        match (high_byte, tab_type_raw) {
-                            (_, 1) => {
-                                // 기존 raw 1 (LEFT 또는 잘못된 RIGHT 1) — 호환 유지
-                                let seg_start = {
-                                    let mut s = i + 1;
-                                    while s < chars.len() && chars[s] == ' ' && cluster_len[s] != 0
-                                    {
-                                        s += 1;
-                                    }
-                                    s
-                                };
-                                let seg_w = measure_segment_from(
-                                    &chars,
-                                    &cluster_len,
-                                    seg_start,
-                                    &char_width,
-                                );
-                                x = (tab_target - seg_w).max(x);
-                            }
-                            (_, 2) => {
-                                // 기존 raw 2 — 호환 유지
-                                let seg_w =
-                                    measure_segment_from(&chars, &cluster_len, i + 1, &char_width);
-                                x = (tab_target - seg_w / 2.0).max(x);
-                            }
-                            (2, _) if fill_low != 0 => {
-                                // [Task #874 후속] 단일-run RIGHT + leader (목차 페이지번호) —
-                                // Task #874 는 cross-run RIGHT+leader 의 text_start_offset
-                                // 미포함 본질을 fix (body_right_text_rel +
-                                // right_tab_block_width_override). 단일-run 케이스는
-                                // 여전히 body_right_legacy (= available_width - line_x_offset)
-                                // 사용 → text_start_offset 미포함 으로 cell right inner
-                                // (= text_start_offset + available_width) 미달. 또한 leading
-                                // space skip 으로 seg_w 가 space 폭만큼 과소 → digit right
-                                // edge 가 cell right inner 보다 좌측에 위치 (정렬 미달).
-                                //
-                                // Fix: \t 뒤 content 가 있는 단일-run 은 cell_right_run_rel
-                                // (= text_start_offset + available_width - line_x_offset) 정렬
-                                // + seg_w_full (i+1 부터, leading space 포함). content 없는
-                                // trailing space / 끝 케이스 (= cross-run 직전) 는 원본 path
-                                // 유지 (다음 run 의 pending_right_tab 분기가 처리).
-                                let seg_start_skipped = {
-                                    let mut s = i + 1;
-                                    while s < chars.len() && chars[s] == ' ' && cluster_len[s] != 0
-                                    {
-                                        s += 1;
-                                    }
-                                    s
-                                };
-                                let has_content_after = seg_start_skipped < chars.len();
-                                if has_content_after {
-                                    let seg_w_full = measure_segment_from(
-                                        &chars,
-                                        &cluster_len,
-                                        i + 1,
-                                        &char_width,
-                                    );
-                                    let cell_right_run_rel = style.text_start_offset
-                                        + style.available_width
-                                        - style.line_x_offset;
-                                    x = (cell_right_run_rel - seg_w_full).max(x);
-                                } else {
-                                    let seg_w = measure_segment_from(
-                                        &chars,
-                                        &cluster_len,
-                                        seg_start_skipped,
-                                        &char_width,
-                                    );
-                                    x = (body_right_legacy - seg_w).max(x);
-                                }
-                            }
-                            (2, _) => {
-                                // RIGHT 인라인 탭 (no leader): 한컴 metrics 차이 흡수.
-                                let seg_start = {
-                                    let mut s = i + 1;
-                                    while s < chars.len() && chars[s] == ' ' && cluster_len[s] != 0
-                                    {
-                                        s += 1;
-                                    }
-                                    s
-                                };
-                                let seg_w = measure_segment_from(
-                                    &chars,
-                                    &cluster_len,
-                                    seg_start,
-                                    &char_width,
-                                );
-                                x = (body_right_legacy - seg_w).max(x);
-                            }
-                            _ => {
-                                x = tab_target.max(x);
-                            }
-                        }
-                    }
-                    tab_char_idx += 1;
-                } else if has_custom_tabs {
-                    let has_more_tabs_after = chars[i + 1..].contains(&'\t');
-                    if !has_more_tabs_after && tab_suffix_is_ascii_page_number(&chars, i + 1) {
-                        if let Some(target_rel) = right_leader_body_target_rel(style) {
-                            let seg_w =
-                                measure_segment_from(&chars, &cluster_len, i + 1, &char_width);
-                            x = (target_rel - seg_w).max(x);
-                            tab_char_idx += 1;
-                            positions.push(x);
-                            continue;
-                        }
-                    }
-                    let abs_x = style.line_x_offset + x;
-                    let (tab_pos, tab_type, fill_type) = find_next_tab_stop(
-                        abs_x,
-                        &style.tab_stops,
-                        tab_w,
-                        style.auto_tab_right,
-                        style.available_width,
-                    );
-                    let rel_tab = tab_pos - style.line_x_offset;
-                    // [Task #874] auto_tab_right / leader RIGHT 탭은 col-relative 우측 끝
-                    // (= text_start_offset + available_width) 까지 정렬.
-                    let effective_rel_tab = if tab_type == 1
-                        && style.available_width > 0.0
-                        && (fill_type != 0 || style.auto_tab_right)
-                    {
-                        style.text_start_offset + style.available_width - style.line_x_offset
-                    } else {
-                        rel_tab
-                    };
-                    match tab_type {
-                        1 => {
-                            // 오른쪽
-                            let seg_start = if fill_type != 0 {
-                                i + 1
-                            } else {
-                                let mut s = i + 1;
-                                while s < chars.len() && chars[s] == ' ' && cluster_len[s] != 0 {
-                                    s += 1;
-                                }
-                                s
-                            };
-                            let seg_w =
-                                measure_segment_from(&chars, &cluster_len, seg_start, &char_width);
-                            x = (effective_rel_tab - seg_w).max(x);
-                        }
-                        2 => {
-                            // 가운데
-                            let seg_w =
-                                measure_segment_from(&chars, &cluster_len, i + 1, &char_width);
-                            x = (rel_tab - seg_w / 2.0).max(x);
-                        }
-                        _ => {
-                            // 왼쪽(0), 소수점(3)
-                            x = rel_tab.max(x);
-                        }
-                    }
-                    tab_char_idx += 1;
+            if override_to_right {
+                // [Task #874 #2] lang split 후속 run 합산 override.
+                let seg_w = if let Some(w) = style.right_tab_block_width_override {
+                    w
                 } else {
-                    // 기본 등간격 탭
-                    let abs_x = style.line_x_offset + x;
-                    let next_abs = ((abs_x / tab_w).floor() + 1.0) * tab_w;
-                    x = (next_abs - style.line_x_offset).max(x);
-                    tab_char_idx += 1;
+                    let seg_start = {
+                        let mut s = i + 1;
+                        while s < chars.len() && chars[s] == ' ' && cluster_len[s] != 0 {
+                            s += 1;
+                        }
+                        s
+                    };
+                    measure_segment_from(&chars, &cluster_len, seg_start, &char_width)
+                };
+                x = (body_right_text_rel - seg_w).max(x);
+            } else if inline_type_hi == 0
+                && !has_more_tabs_after
+                && tab_suffix_is_ascii_page_number(&chars, i + 1)
+            {
+                if let Some(target_rel) = right_leader_tab_target_rel(style, font_size) {
+                    let seg_w = measure_segment_from(&chars, &cluster_len, i + 1, &char_width);
+                    x = (target_rel - seg_w).max(x);
+                } else {
+                    x = tab_target.max(x);
                 }
-                positions.push(x);
-                continue;
+            } else {
+                let high_byte = (tab_type_raw >> 8) & 0xFF;
+                let fill_low = tab_type_raw & 0xFF;
+                match (high_byte, tab_type_raw) {
+                    (_, 1) => {
+                        // 기존 raw 1 (LEFT 또는 잘못된 RIGHT 1) — 호환 유지
+                        let seg_start = {
+                            let mut s = i + 1;
+                            while s < chars.len() && chars[s] == ' ' && cluster_len[s] != 0 {
+                                s += 1;
+                            }
+                            s
+                        };
+                        let seg_w =
+                            measure_segment_from(&chars, &cluster_len, seg_start, &char_width);
+                        x = (tab_target - seg_w).max(x);
+                    }
+                    (_, 2) => {
+                        // 기존 raw 2 — 호환 유지
+                        let seg_w = measure_segment_from(&chars, &cluster_len, i + 1, &char_width);
+                        x = (tab_target - seg_w / 2.0).max(x);
+                    }
+                    (2, _) if fill_low != 0 => {
+                        // [Task #874 후속] 단일-run RIGHT + leader (목차 페이지번호) —
+                        // Task #874 는 cross-run RIGHT+leader 의 text_start_offset
+                        // 미포함 본질을 fix (body_right_text_rel +
+                        // right_tab_block_width_override). 단일-run 케이스는
+                        // 여전히 body_right_legacy (= available_width - line_x_offset)
+                        // 사용 → text_start_offset 미포함 으로 cell right inner
+                        // (= text_start_offset + available_width) 미달. 또한 leading
+                        // space skip 으로 seg_w 가 space 폭만큼 과소 → digit right
+                        // edge 가 cell right inner 보다 좌측에 위치 (정렬 미달).
+                        //
+                        // Fix: \t 뒤 content 가 있는 단일-run 은 cell_right_run_rel
+                        // (= text_start_offset + available_width - line_x_offset) 정렬
+                        // + seg_w_full (i+1 부터, leading space 포함). content 없는
+                        // trailing space / 끝 케이스 (= cross-run 직전) 는 원본 path
+                        // 유지 (다음 run 의 pending_right_tab 분기가 처리).
+                        let seg_start_skipped = {
+                            let mut s = i + 1;
+                            while s < chars.len() && chars[s] == ' ' && cluster_len[s] != 0 {
+                                s += 1;
+                            }
+                            s
+                        };
+                        let has_content_after = seg_start_skipped < chars.len();
+                        if has_content_after {
+                            let seg_w_full =
+                                measure_segment_from(&chars, &cluster_len, i + 1, &char_width);
+                            let cell_right_run_rel = style.text_start_offset
+                                + style.available_width
+                                - style.line_x_offset;
+                            x = (cell_right_run_rel - seg_w_full).max(x);
+                        } else {
+                            let seg_w = measure_segment_from(
+                                &chars,
+                                &cluster_len,
+                                seg_start_skipped,
+                                &char_width,
+                            );
+                            x = (body_right_legacy - seg_w).max(x);
+                        }
+                    }
+                    // [#5872] leader 없는 RIGHT 탭이 **줄 중간**에 있으면 그것은
+                    // 쪽번호 정렬 탭이 아니라 줄 앞머리의 정렬 탭이다(목차 개요번호:
+                    // `\tI.\t총 칙\t 1`). 뒤에 탭이 더 있는데도 본문 우측 끝으로
+                    // 끌어가면 로마숫자가 쪽번호 자리에 겹친다(113424 6쪽 7줄:
+                    // I@709.3 ↔ 한글 I@101.0). 한컴이 저장한 `width` 는 정렬을 이미
+                    // 마친 전진 거리이므로 그대로 쓰면 좌표가 재현된다
+                    // (본문 좌단 75.6 + 1911HU/25.5px = 101.1 ↔ 한글 101.0).
+                    // 줄 끝의 RIGHT 탭(뒤에 탭 없음)은 종전대로 우측 끝 정렬.
+                    (2, _) if has_more_tabs_after => {
+                        x = tab_target.max(x);
+                    }
+                    (2, _) => {
+                        // RIGHT 인라인 탭 (no leader): 한컴 metrics 차이 흡수.
+                        let seg_start = {
+                            let mut s = i + 1;
+                            while s < chars.len() && chars[s] == ' ' && cluster_len[s] != 0 {
+                                s += 1;
+                            }
+                            s
+                        };
+                        let seg_w =
+                            measure_segment_from(&chars, &cluster_len, seg_start, &char_width);
+                        x = (body_right_legacy - seg_w).max(x);
+                    }
+                    _ => {
+                        x = tab_target.max(x);
+                    }
+                }
             }
-            x += char_width(i);
-            positions.push(x);
-        }
-
-        positions
+            x
+        };
+        compute_char_positions_walk(text, style, &inline_tab_x)
     }
 }
 
-// ── WASM 전용 내부 코드 ─────────────────────────────────────────────
+// ── 기본 측정기 선택 ────────────────────────────────────────────────
 //
-// JS Canvas measureText 브릿지, LRU 캐시, HWP 단위 양자화 등
-// WASM 빌드에서만 컴파일된다.
+// native/WASM 공통으로 EmbeddedTextMeasurer 를 사용한다. 종전 WASM 전용
+// WasmTextMeasurer 는 폴백 사다리 비대칭으로 native 와 SVG 좌표가 발산해
+// 제거했다 (#4046). native↔WASM byte 패리티는
+// scripts/svg_native_wasm_diff.mjs 로 검증한다.
 
-#[cfg(target_arch = "wasm32")]
-mod wasm_internals {
-    use crate::renderer::TextStyle;
-    use std::cell::RefCell;
-    use wasm_bindgen::prelude::*;
-
-    // globalThis.measureTextWidth(font, text) → width in pixels
-    // editor.html/index.html의 <head>에 정의된 글로벌 함수를 호출한다.
-    #[wasm_bindgen]
-    extern "C" {
-        #[wasm_bindgen(js_namespace = globalThis, js_name = "measureTextWidth")]
-        fn js_measure_text_width(font: &str, text: &str) -> f64;
-    }
-
-    // ── JS measureText 결과 LRU 캐시 ──
-    //
-    // js_measure_text_width()는 항상 1000px 고정 크기로 측정하므로
-    // (measure_font, char) 쌍을 키로 캐싱하면 모든 font_size에서 재사용 가능하다.
-    // WASM은 단일 스레드이므로 thread_local + RefCell로 충분하다.
-
-    /// Vec 기반 LRU 캐시 (256 엔트리)
-    ///
-    /// 용량 ≤ 256이므로 선형 탐색(수 μs)이 JS 브릿지 호출(~50μs)보다 빠르다.
-    /// 용량 초과 시 가장 오래된 25%를 제거한다 (webhwp 방식).
-    struct MeasureCache {
-        entries: Vec<(u64, f64)>, // (key_hash, raw_px) — 접근 순서 (최근이 뒤)
-        capacity: usize,
-    }
-
-    impl MeasureCache {
-        fn new(capacity: usize) -> Self {
-            Self {
-                entries: Vec::with_capacity(capacity),
-                capacity,
-            }
-        }
-
-        fn get(&mut self, key: u64) -> Option<f64> {
-            if let Some(idx) = self.entries.iter().position(|(k, _)| *k == key) {
-                let entry = self.entries.remove(idx);
-                let val = entry.1;
-                self.entries.push(entry); // MRU로 이동
-                Some(val)
-            } else {
-                None
-            }
-        }
-
-        fn insert(&mut self, key: u64, value: f64) {
-            if self.entries.len() >= self.capacity {
-                // 가장 오래된 25% 제거
-                let remove_count = self.capacity / 4;
-                self.entries.drain(0..remove_count);
-            }
-            self.entries.push((key, value));
-        }
-    }
-
-    thread_local! {
-        static JS_MEASURE_CACHE: RefCell<MeasureCache> = RefCell::new(MeasureCache::new(256));
-    }
-
-    /// 캐시 키 생성: hash(measure_font + char)
-    fn measure_cache_key(measure_font: &str, c: char) -> u64 {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut h = DefaultHasher::new();
-        measure_font.hash(&mut h);
-        c.hash(&mut h);
-        h.finish()
-    }
-
-    /// JS measureText 캐싱 래퍼
-    ///
-    /// 캐시 히트 시 WASM↔JS 브릿지 호출 없이 즉시 반환.
-    /// 미스 시 js_measure_text_width() 호출 후 결과를 캐시에 저장.
-    fn cached_js_measure(measure_font: &str, c: char) -> f64 {
-        let key = measure_cache_key(measure_font, c);
-        JS_MEASURE_CACHE.with(|cache| {
-            if let Some(val) = cache.borrow_mut().get(key) {
-                return val;
-            }
-            let val = js_measure_text_width(measure_font, &c.to_string());
-            cache.borrow_mut().insert(key, val);
-            val
-        })
-    }
-
-    /// 1000pt 측정용 CSS font 문자열 생성
-    pub(super) fn build_1000pt_font_string(style: &TextStyle) -> String {
-        let font_weight = if style.bold { "bold " } else { "" };
-        let font_style = if style.italic { "italic " } else { "" };
-        let font_family = if style.font_family.is_empty() {
-            "sans-serif".to_string()
-        } else {
-            let fallback = crate::renderer::generic_fallback(&style.font_family);
-            format!("\"{}\", {}", style.font_family, fallback)
-        };
-        format!("{}{}1000px {}", font_style, font_weight, font_family)
-    }
-
-    /// 한컴 webhwp 방식 문자 폭 측정 (HWP 단위 양자화)
-    ///
-    /// 파이프라인: 내장 메트릭 → JS 1000px 측정 → font_size/1000 스케일링 → HWP 단위(×75) → 정수 반올림 → px
-    pub(super) fn measure_char_width_hwp(
-        measure_font: &str,
-        font_family: &str,
-        bold: bool,
-        italic: bool,
-        c: char,
-        hangul_width_hwp: i32,
-        font_size: f64,
-    ) -> f64 {
-        // 1차: 내장 메트릭 (JS 브릿지 호출 불필요)
-        if let Some(w) = super::measure_char_width_embedded(font_family, bold, italic, c, font_size)
-        {
-            return w;
-        }
-
-        // 2차: 한글 음절 → '가' 대리 측정값 재사용 (이미 HWP 단위)
-        if c >= '\u{AC00}' && c <= '\u{D7A3}' {
-            return hangul_width_hwp as f64 / 75.0;
-        }
-
-        // 좁은 구두점 폴백 — native EmbeddedTextMeasurer 와 동기화.
-        // measure_char_width_embedded 의 is_narrow_punctuation 분기 (0.3 em) 가
-        // 적용되지 못한 미등록 폰트 케이스 (예: 휴먼명조 U+2027) 에서 JS Canvas
-        // 측정값 (~0.5 em) 이 그대로 들어가지 않도록 동일 폴백 적용.
-        if super::is_narrow_punctuation(c) {
-            return font_size * 0.3;
-        }
-
-        // [Task #977] 미등록 폰트 폴백을 native EmbeddedTextMeasurer 와 동기화한다.
-        // 종전(PR #1026 이전)은 JS Canvas `measureText` 실측값을 사용했으나, 미등록
-        // 폰트는 브라우저 fallback 폰트로 측정되어 폰트별로 폭이 달라(예: 나눔바른
-        // 고딕 ≠ 맑은 고딕) 목차 페이지의 선두 공백 CharShape 가 인접 문단과 다를 때
-        // 개요번호 시작 x 가 ~9~10px 어긋났다. native compute_char_positions 와 동일한
-        // 휴리스틱(공백·일반 0.5em, CJK·fullwidth em, narrow_punct 0.3em)으로 폰트 무관
-        // 통일한다. PR #1026 의 narrow_punct 분기는 위에서 이미 처리(보존).
-        if super::is_cjk_char(c) || super::is_fullwidth_symbol(c) {
-            return font_size;
-        }
-        font_size * 0.5
-    }
-
-    /// 한글 '가' 대리 측정값 (HWP 단위, 정수)
-    /// 내장 메트릭이 있으면 JS 호출 없이 반환.
-    ///
-    /// [Task #977 v3] 미등록 폰트의 한글 폭은 native `EmbeddedTextMeasurer`
-    /// 폴백(`font_size`, 1.0 em CJK 휴리스틱)과 동기화한다. 종전 JS `cached_js_measure('가')`
-    /// 폴백은 브라우저의 폰트 대체 결과(폰트별 ≠ 한컴 metrics)를 폭으로 채택해
-    /// 한컴 저장값(tab_extended[0] = "tab_pos - 한컴_선행텍스트폭")과 합산 시 오차가
-    /// 누적, 목차 페이지번호의 디지트 x 좌표가 행별로 어긋났다.
-    /// 미등록 한글 폰트(나눔바른고딕 등)에서도 native 와 일관된 폭으로 폴백한다.
-    pub(super) fn measure_hangul_width_hwp(
-        _measure_font: &str,
-        font_family: &str,
-        bold: bool,
-        italic: bool,
-        font_size: f64,
-    ) -> i32 {
-        if let Some(w) =
-            super::measure_char_width_embedded(font_family, bold, italic, '\u{AC00}', font_size)
-        {
-            return (w * 75.0).round() as i32;
-        }
-        // native EmbeddedTextMeasurer 동기화: 미등록 폰트의 한글(CJK)은 font_size (1.0 em).
-        (font_size * 75.0).round() as i32
-    }
-}
-
-// ── WasmTextMeasurer ────────────────────────────────────────────────
-
-/// JS Canvas 브릿지 기반 텍스트 측정기 (WASM 전용)
-///
-/// 1000pt 측정 + HWP 단위 양자화로 한컴과 동일한 정밀도를 확보한다.
-/// 내장 메트릭 우선, 미등록 폰트만 JS 브릿지 사용 (LRU 캐시 256 엔트리).
-#[cfg(target_arch = "wasm32")]
-pub struct WasmTextMeasurer;
-
-#[cfg(target_arch = "wasm32")]
-impl TextMeasurer for WasmTextMeasurer {
-    fn estimate_text_width(&self, text: &str, style: &TextStyle) -> f64 {
-        let (font_size, ratio, tab_w) = style_params(style);
-        let measure_font = wasm_internals::build_1000pt_font_string(style);
-        let hangul_hwp = wasm_internals::measure_hangul_width_hwp(
-            &measure_font,
-            &style.font_family,
-            style.bold,
-            style.italic,
-            font_size,
-        );
-
-        let chars: Vec<char> = text.chars().collect();
-        let cluster_len = build_cluster_len(&chars);
-        let char_count = chars.len();
-        let has_custom_tabs = !style.tab_stops.is_empty() || style.auto_tab_right;
-
-        let char_width = |i: usize| -> f64 {
-            let c = chars[i];
-            if c == '\u{2007}' {
-                return font_size * 0.5 * ratio + style.letter_spacing + style.extra_char_spacing;
-            }
-            // 인라인 객체 placeholder 는 실제 control node 가 따로 그리므로 텍스트 폭은 0.
-            if c == '\u{FFFC}' {
-                return 0.0;
-            }
-            // [Issue #677] HWP PUA 채움 문자 (U+F081C) — 시각 폭 0
-            // 한컴이 인라인 TAC 표/도형 앞에 삽입하는 placeholder 채움 문자.
-            // 한컴 PDF 정합 — 폭 0 으로 라인 inline x 에 영향 없음. fillers 가
-            // 표 너비만큼 (≈97 chars × 1 char width = table width) 채워져
-            // 표가 fillers 영역 위에 시각적으로 겹쳐 column-left 출력 패턴.
-            if c == '\u{F081C}' {
-                return 0.0;
-            }
-            let char_px_raw = if cluster_len[i] > 1 {
-                hangul_hwp as f64 / 75.0
-            } else {
-                wasm_internals::measure_char_width_hwp(
-                    &measure_font,
-                    &style.font_family,
-                    style.bold,
-                    style.italic,
-                    c,
-                    hangul_hwp,
-                    font_size,
-                )
-            };
-            // Task #352: dash leader 좁은 base 0.3 em + extra_dash_advance.
-            let is_leader = is_dash_leader_run(&chars, i);
-            let char_px = if is_leader {
-                char_px_raw.min(font_size * 0.3)
-            } else {
-                char_px_raw
-            };
-            let mut w = char_px * ratio + style.letter_spacing + style.extra_char_spacing;
-            if c == ' ' {
-                w += style.extra_word_spacing;
-            }
-            if is_leader {
-                w += style.extra_dash_advance;
-            }
-            // 음수 자간(letter_spacing + extra_char_spacing < 0) 시
-            // per-char 최소 advance 클램프로 narrow glyph 역진 방지.
-            if style.letter_spacing + style.extra_char_spacing < 0.0 {
-                let min_w = char_px * ratio * 0.5;
-                w = w.max(min_w);
-            }
-            w
-        };
-
-        let mut total = 0.0;
-        let mut tab_char_idx = 0usize; // [Task #296] inline_tabs 인덱스
-        for i in 0..char_count {
-            let c = chars[i];
-            if cluster_len[i] == 0 {
-                continue;
-            }
-            if c == '\t' {
-                // [Task #296] 인라인 탭 (HWP tab_extended / HWPX 인라인 탭) 을
-                // WASM Canvas 경로에서도 존중. 네이티브 EmbeddedTextMeasurer 와 동일 구조.
-                if tab_char_idx < style.inline_tabs.len() {
-                    let ext = &style.inline_tabs[tab_char_idx];
-                    let tab_width_px = ext[0] as f64 * 96.0 / 7200.0;
-                    let tab_type = inline_tab_type(ext);
-                    let tab_target = total + tab_width_px;
-                    // [Task #874] auto_tab_right paragraph + 단일 tab: native 와 동일.
-                    let has_more_tabs_after = chars[i + 1..].iter().any(|c| *c == '\t');
-                    // [Issue #900] Task #874 #10 와 동일 — ext[2] high-byte 가 명시적
-                    // LEFT(1)/DECIMAL(4) 면 auto_tab_right paragraph 라도 override 금지.
-                    // exam_math.hwp pi=0 ("1.\t의 값은? [2점]") 의 inline LEFT tab 이
-                    // WASM 에서 right-align 되어 equation/text 가 column 우측으로 밀리는
-                    // 회귀 차단. EmbeddedTextMeasurer (native) 는 이미 가드 적용.
-                    let inline_is_explicit_left = tab_type == 1 || tab_type == 4;
-                    let override_to_right = style.auto_tab_right
-                        && !has_more_tabs_after
-                        && style.available_width > 0.0
-                        && !inline_is_explicit_left;
-                    if override_to_right {
-                        // [Task #874 #2] lang split 후속 run 합산 override (native 와 동일).
-                        let seg_w = style.right_tab_block_width_override.unwrap_or_else(|| {
-                            measure_segment_from(&chars, &cluster_len, i + 1, &char_width)
-                        });
-                        let right_edge_rel =
-                            style.text_start_offset + style.available_width - style.line_x_offset;
-                        total = (right_edge_rel - seg_w).max(total);
-                    } else if tab_type == 0
-                        && !has_more_tabs_after
-                        && tab_suffix_is_ascii_page_number(&chars, i + 1)
-                    {
-                        if let Some(target_rel) = right_leader_tab_target_rel(style, font_size) {
-                            let seg_w =
-                                measure_segment_from(&chars, &cluster_len, i + 1, &char_width);
-                            total = (target_rel - seg_w).max(total);
-                        } else {
-                            total = tab_target.max(total);
-                        }
-                    } else {
-                        match tab_type {
-                            2 => {
-                                // RIGHT
-                                let seg_w =
-                                    measure_segment_from(&chars, &cluster_len, i + 1, &char_width);
-                                total = (tab_target - seg_w).max(total);
-                            }
-                            3 => {
-                                // CENTER
-                                let seg_w =
-                                    measure_segment_from(&chars, &cluster_len, i + 1, &char_width);
-                                total = (tab_target - seg_w / 2.0).max(total);
-                            }
-                            _ => {
-                                // LEFT(0/1), DECIMAL(4), 기타
-                                total = tab_target.max(total);
-                            }
-                        }
-                    }
-                    tab_char_idx += 1;
-                } else if has_custom_tabs {
-                    let has_more_tabs_after = chars[i + 1..].iter().any(|c| *c == '\t');
-                    if !has_more_tabs_after && tab_suffix_is_ascii_page_number(&chars, i + 1) {
-                        if let Some(target_rel) = right_leader_body_target_rel(style) {
-                            let seg_w =
-                                measure_segment_from(&chars, &cluster_len, i + 1, &char_width);
-                            total = (target_rel - seg_w).max(total);
-                            tab_char_idx += 1;
-                            continue;
-                        }
-                    }
-                    let abs_x = style.line_x_offset + total;
-                    let (tab_pos, tab_type, fill_type) = find_next_tab_stop(
-                        abs_x,
-                        &style.tab_stops,
-                        tab_w,
-                        style.auto_tab_right,
-                        style.available_width,
-                    );
-                    let rel_tab = tab_pos - style.line_x_offset;
-                    // [Task #874] auto_tab_right / leader RIGHT 탭은 col-relative 우측 끝
-                    // (= text_start_offset + available_width) 까지 정렬.
-                    let effective_rel_tab = if tab_type == 1
-                        && style.available_width > 0.0
-                        && (fill_type != 0 || style.auto_tab_right)
-                    {
-                        style.text_start_offset + style.available_width - style.line_x_offset
-                    } else {
-                        rel_tab
-                    };
-                    match tab_type {
-                        1 => {
-                            let seg_w =
-                                measure_segment_from(&chars, &cluster_len, i + 1, &char_width);
-                            total = (effective_rel_tab - seg_w).max(total);
-                        }
-                        2 => {
-                            let seg_w =
-                                measure_segment_from(&chars, &cluster_len, i + 1, &char_width);
-                            total = (rel_tab - seg_w / 2.0).max(total);
-                        }
-                        _ => {
-                            total = rel_tab.max(total);
-                        }
-                    }
-                    tab_char_idx += 1;
-                } else {
-                    // 기본 등간격 탭: 라인 절대 위치(line_x_offset + total) 기준으로 계산
-                    let abs_x = style.line_x_offset + total;
-                    let next_abs = ((abs_x / tab_w).floor() + 1.0) * tab_w;
-                    total = (next_abs - style.line_x_offset).max(total);
-                    tab_char_idx += 1;
-                }
-                continue;
-            }
-            total += char_width(i);
-        }
-        total
-    }
-
-    fn compute_char_positions(&self, text: &str, style: &TextStyle) -> Vec<f64> {
-        let (font_size, ratio, tab_w) = style_params(style);
-        let chars: Vec<char> = text.chars().collect();
-        let char_count = chars.len();
-        let mut positions = Vec::with_capacity(char_count + 1);
-        let mut x = 0.0;
-        positions.push(x);
-
-        let cluster_len = build_cluster_len(&chars);
-        let has_custom_tabs = !style.tab_stops.is_empty() || style.auto_tab_right;
-
-        let measure_font = wasm_internals::build_1000pt_font_string(style);
-        let hangul_hwp = wasm_internals::measure_hangul_width_hwp(
-            &measure_font,
-            &style.font_family,
-            style.bold,
-            style.italic,
-            font_size,
-        );
-
-        let char_width = |i: usize| -> f64 {
-            let c = chars[i];
-            if c == '\u{2007}' {
-                return font_size * 0.5 * ratio + style.letter_spacing + style.extra_char_spacing;
-            }
-            // 인라인 객체 placeholder 는 실제 control node 가 따로 그리므로 텍스트 폭은 0.
-            if c == '\u{FFFC}' {
-                return 0.0;
-            }
-            // [Issue #677] HWP PUA 채움 문자 (U+F081C) — 시각 폭 0
-            // 한컴이 인라인 TAC 표/도형 앞에 삽입하는 placeholder 채움 문자.
-            // 한컴 PDF 정합 — 폭 0 으로 라인 inline x 에 영향 없음. fillers 가
-            // 표 너비만큼 (≈97 chars × 1 char width = table width) 채워져
-            // 표가 fillers 영역 위에 시각적으로 겹쳐 column-left 출력 패턴.
-            if c == '\u{F081C}' {
-                return 0.0;
-            }
-            let char_px_raw = if cluster_len[i] > 1 {
-                hangul_hwp as f64 / 75.0
-            } else {
-                wasm_internals::measure_char_width_hwp(
-                    &measure_font,
-                    &style.font_family,
-                    style.bold,
-                    style.italic,
-                    c,
-                    hangul_hwp,
-                    font_size,
-                )
-            };
-            // Task #352: dash leader 좁은 base 0.3 em + extra_dash_advance.
-            let is_leader = is_dash_leader_run(&chars, i);
-            let char_px = if is_leader {
-                char_px_raw.min(font_size * 0.3)
-            } else {
-                char_px_raw
-            };
-            let mut w = char_px * ratio + style.letter_spacing + style.extra_char_spacing;
-            if c == ' ' {
-                w += style.extra_word_spacing;
-            }
-            if is_leader {
-                w += style.extra_dash_advance;
-            }
-            // 음수 자간(letter_spacing + extra_char_spacing < 0) 시
-            // per-char 최소 advance 클램프로 narrow glyph 역진 방지.
-            if style.letter_spacing + style.extra_char_spacing < 0.0 {
-                let min_w = char_px * ratio * 0.5;
-                w = w.max(min_w);
-            }
-            w
-        };
-
-        let mut tab_char_idx = 0usize; // [Task #296] inline_tabs 인덱스
-        for i in 0..char_count {
-            let c = chars[i];
-            if cluster_len[i] == 0 {
-                positions.push(x);
-                continue;
-            }
-            if c == '\t' {
-                // [Task #296] 인라인 탭 (HWP tab_extended / HWPX 인라인 탭) 을
-                // WASM Canvas 경로에서도 존중. 네이티브 EmbeddedTextMeasurer 와 동일 구조.
-                if tab_char_idx < style.inline_tabs.len() {
-                    let ext = &style.inline_tabs[tab_char_idx];
-                    let tab_width_px = ext[0] as f64 * 96.0 / 7200.0;
-                    let tab_type = inline_tab_type(ext);
-                    let fill_low = (ext[2] & 0xFF) as u8;
-                    let tab_target = x + tab_width_px;
-                    // [Task #874] auto_tab_right paragraph + 단일 tab: native 와 동일.
-                    let has_more_tabs_after = chars[i + 1..].iter().any(|c| *c == '\t');
-                    // [Issue #900] Task #874 #10 와 동일 가드 — 인라인 LEFT(1)/DECIMAL(4)
-                    // 탭은 auto_tab_right 라도 right-align 금지. estimate_text_width 와
-                    // 동일 처리 — pi=0 의 tab 위치 정합 (equation/text 가 column 우측으로
-                    // 밀리는 회귀 차단).
-                    let inline_is_explicit_left = tab_type == 1 || tab_type == 4;
-                    let override_to_right = style.auto_tab_right
-                        && !has_more_tabs_after
-                        && style.available_width > 0.0
-                        && !inline_is_explicit_left;
-                    // [Issue #630 Stage 6] RIGHT + leader (fill ≠ 0): ')' 끝이 본문
-                    // 우측 끝까지 정렬.
-                    let body_right_text_rel = if style.available_width > 0.0 {
-                        style.text_start_offset + style.available_width - style.line_x_offset
-                    } else {
-                        f64::INFINITY
-                    };
-                    let body_right_legacy = if style.available_width > 0.0 {
-                        style.available_width - style.line_x_offset
-                    } else {
-                        f64::INFINITY
-                    };
-                    if override_to_right {
-                        // [Task #874 #2] lang split 후속 run 합산 override (native 와 동일).
-                        let seg_w = if let Some(w) = style.right_tab_block_width_override {
-                            w
-                        } else {
-                            let seg_start = {
-                                let mut s = i + 1;
-                                while s < chars.len() && chars[s] == ' ' && cluster_len[s] != 0 {
-                                    s += 1;
-                                }
-                                s
-                            };
-                            measure_segment_from(&chars, &cluster_len, seg_start, &char_width)
-                        };
-                        x = (body_right_text_rel - seg_w).max(x);
-                    } else if tab_type == 0
-                        && !has_more_tabs_after
-                        && tab_suffix_is_ascii_page_number(&chars, i + 1)
-                    {
-                        if let Some(target_rel) = right_leader_tab_target_rel(style, font_size) {
-                            let seg_w =
-                                measure_segment_from(&chars, &cluster_len, i + 1, &char_width);
-                            x = (target_rel - seg_w).max(x);
-                        } else {
-                            x = tab_target.max(x);
-                        }
-                    } else {
-                        match tab_type {
-                            2 if fill_low != 0 => {
-                                // [Task #874 후속] 단일-run RIGHT + leader (목차 페이지번호).
-                                // EmbeddedTextMeasurer 영역 정합 (text_measurement.rs 위쪽 동일
-                                // 분기 본문 참조). \t 뒤 content 가 있는 단일-run 은
-                                // cell_right_run_rel (= text_start_offset + available_width -
-                                // line_x_offset) 정렬 + seg_w_full (leading space 포함).
-                                // content 없는 trailing space / 끝 케이스는 원본 path 유지.
-                                let seg_start_skipped = {
-                                    let mut s = i + 1;
-                                    while s < chars.len() && chars[s] == ' ' && cluster_len[s] != 0
-                                    {
-                                        s += 1;
-                                    }
-                                    s
-                                };
-                                let has_content_after = seg_start_skipped < chars.len();
-                                if has_content_after {
-                                    let seg_w_full = measure_segment_from(
-                                        &chars,
-                                        &cluster_len,
-                                        i + 1,
-                                        &char_width,
-                                    );
-                                    let cell_right_run_rel = style.text_start_offset
-                                        + style.available_width
-                                        - style.line_x_offset;
-                                    x = (cell_right_run_rel - seg_w_full).max(x);
-                                } else {
-                                    let seg_w = measure_segment_from(
-                                        &chars,
-                                        &cluster_len,
-                                        seg_start_skipped,
-                                        &char_width,
-                                    );
-                                    x = (body_right_legacy - seg_w).max(x);
-                                }
-                            }
-                            2 => {
-                                // RIGHT (no leader)
-                                let seg_start = {
-                                    let mut s = i + 1;
-                                    while s < chars.len() && chars[s] == ' ' && cluster_len[s] != 0
-                                    {
-                                        s += 1;
-                                    }
-                                    s
-                                };
-                                let seg_w = measure_segment_from(
-                                    &chars,
-                                    &cluster_len,
-                                    seg_start,
-                                    &char_width,
-                                );
-                                x = (tab_target - seg_w).max(x);
-                            }
-                            3 => {
-                                // CENTER
-                                let seg_w =
-                                    measure_segment_from(&chars, &cluster_len, i + 1, &char_width);
-                                x = (tab_target - seg_w / 2.0).max(x);
-                            }
-                            _ => {
-                                // LEFT(0/1), DECIMAL(4), 기타
-                                x = tab_target.max(x);
-                            }
-                        }
-                    }
-                    tab_char_idx += 1;
-                } else if has_custom_tabs {
-                    let has_more_tabs_after = chars[i + 1..].iter().any(|c| *c == '\t');
-                    if !has_more_tabs_after && tab_suffix_is_ascii_page_number(&chars, i + 1) {
-                        if let Some(target_rel) = right_leader_body_target_rel(style) {
-                            let seg_w =
-                                measure_segment_from(&chars, &cluster_len, i + 1, &char_width);
-                            x = (target_rel - seg_w).max(x);
-                            tab_char_idx += 1;
-                            positions.push(x);
-                            continue;
-                        }
-                    }
-                    let abs_x = style.line_x_offset + x;
-                    let (tab_pos, tab_type, fill_type) = find_next_tab_stop(
-                        abs_x,
-                        &style.tab_stops,
-                        tab_w,
-                        style.auto_tab_right,
-                        style.available_width,
-                    );
-                    let rel_tab = tab_pos - style.line_x_offset;
-                    // [Task #874] auto_tab_right / leader RIGHT 탭은 col-relative 우측 끝
-                    // (= text_start_offset + available_width) 까지 정렬.
-                    let effective_rel_tab = if tab_type == 1
-                        && style.available_width > 0.0
-                        && (fill_type != 0 || style.auto_tab_right)
-                    {
-                        style.text_start_offset + style.available_width - style.line_x_offset
-                    } else {
-                        rel_tab
-                    };
-                    match tab_type {
-                        1 => {
-                            let seg_start = if fill_type != 0 {
-                                i + 1
-                            } else {
-                                let mut s = i + 1;
-                                while s < chars.len() && chars[s] == ' ' && cluster_len[s] != 0 {
-                                    s += 1;
-                                }
-                                s
-                            };
-                            let seg_w =
-                                measure_segment_from(&chars, &cluster_len, seg_start, &char_width);
-                            x = (effective_rel_tab - seg_w).max(x);
-                        }
-                        2 => {
-                            let seg_w =
-                                measure_segment_from(&chars, &cluster_len, i + 1, &char_width);
-                            x = (rel_tab - seg_w / 2.0).max(x);
-                        }
-                        _ => {
-                            x = rel_tab.max(x);
-                        }
-                    }
-                    tab_char_idx += 1;
-                } else {
-                    // 기본 등간격 탭: 라인 절대 위치(line_x_offset + x) 기준으로 계산
-                    let abs_x = style.line_x_offset + x;
-                    let next_abs = ((abs_x / tab_w).floor() + 1.0) * tab_w;
-                    x = (next_abs - style.line_x_offset).max(x);
-                    tab_char_idx += 1;
-                }
-                positions.push(x);
-                continue;
-            }
-            x += char_width(i);
-            positions.push(x);
-        }
-
-        positions
-    }
-}
-
-// ── 플랫폼별 기본 측정기 선택 ───────────────────────────────────────
-
-#[cfg(target_arch = "wasm32")]
-fn default_measurer() -> WasmTextMeasurer {
-    WasmTextMeasurer
-}
-
-#[cfg(not(target_arch = "wasm32"))]
 fn default_measurer() -> EmbeddedTextMeasurer {
     EmbeddedTextMeasurer
 }
@@ -1514,7 +774,11 @@ pub(crate) fn resolved_to_text_style(
             italic: cs.italic,
             underline: cs.underline,
             strikethrough: cs.strikethrough,
-            letter_spacing: cs.letter_spacing_for_lang(lang_index),
+            kerning: cs.kerning,
+            // 단일 출처: 줄 나눔 고속 경로(resolved_letter_spacing)와 같은 식을 쓴다.
+            // 두 경로 동등성 시험(구 letter_spacing_matches_full_style_resolution)을
+            // 이 호출이 구조적으로 대체한다.
+            letter_spacing: resolved_letter_spacing(styles, char_style_id, lang_index),
             ratio: cs.ratio_for_lang(lang_index),
             default_tab_width: 0.0,
             tab_stops: Vec::new(),
@@ -1549,6 +813,26 @@ pub(crate) fn resolved_to_text_style(
     }
 }
 
+/// `resolved_to_text_style(..).letter_spacing` 와 같은 값을 `TextStyle` 을 만들지 않고 읽는다.
+///
+/// [#5678] 줄 나눔이 문단의 **글자마다** 자간을 필요로 하는데, 종전에는 그때마다
+/// `resolved_to_text_style` 을 불러 `String` 하나와 `Vec` 셋을 포함한 `TextStyle` 을
+/// 통째로 만들었다 — 대부분의 문서에서 `0.0` 인 `f64` 하나를 읽으려고.
+///
+/// 두 경로가 같은 값을 낸다는 것은 `letter_spacing_matches_full_style_resolution` 이 잡는다.
+pub(crate) fn resolved_letter_spacing(
+    styles: &ResolvedStyleSet,
+    char_style_id: u32,
+    lang_index: usize,
+) -> f64 {
+    styles
+        .char_styles
+        .get(char_style_id as usize)
+        .map(|cs| cs.letter_spacing_for_lang(lang_index))
+        // 스타일이 없을 때의 값은 위 함수의 `TextStyle::default()` 갈래와 같아야 한다.
+        .unwrap_or_else(|| TextStyle::default().letter_spacing)
+}
+
 // ── 내장 폰트 메트릭 측정 ───────────────────────────────────────────
 
 /// 폰트가 고정폭(monospace)인지 판정한다.
@@ -1581,10 +865,381 @@ fn is_monospace_metric(metric: &font_metrics_data::FontMetric) -> bool {
     count >= 16
 }
 
+/// 요청 폰트의 내장 메트릭 DB 등록 여부.
+///
+/// `compute_char_positions` 의 advance 가 실제 글리프 폭(메트릭 DB)에서
+/// 나온 값인지, 아니면 DB 미등록 폰트의 휴리스틱 폴백(`font_size * 0.5`
+/// 등)인지 구분하는 데 쓴다. WASM 캔버스 렌더러는 메트릭이 없는(=브라우저
+/// 대체 폰트로 치환되는) 폰트에 대해 글리프별 가로 스케일링(per-glyph
+/// x-scale)을 적용하면 안 된다 — 치환 폰트의 실제 advance 와 어긋나
+/// l/i/t 같은 좁은 글리프가 과도하게 늘어나기 때문이다 (한컴 바겐세일 M
+/// → Pretendard 치환 시 Vocabulary 열 왜곡).
+pub(crate) fn font_family_has_metrics(font_family: &str, bold: bool, italic: bool) -> bool {
+    let primary_name = font_family.split(',').next().unwrap_or(font_family).trim();
+    font_metrics_data::find_metric(primary_name, bold, italic).is_some()
+}
+
 /// 내장 폰트 메트릭으로 문자 폭 측정 (em 단위 → px 변환)
 ///
 /// 내장 메트릭이 있으면 JS 브릿지 호출 없이 즉시 반환.
 /// 없으면 None을 반환하여 폴백 경로를 사용하게 한다.
+fn quantize_hwp_px(px: f64) -> f64 {
+    let hwp = (px * 75.0) as i32;
+    hwp as f64 / 75.0
+}
+
+fn kopub_char_width(primary_name: &str, c: char, font_size: f64) -> Option<f64> {
+    let lower = primary_name.to_lowercase();
+    let is_dotum = primary_name.contains("KoPub돋움체") || lower.contains("kopub dotum");
+    let is_batang = primary_name.contains("KoPub바탕체") || lower.contains("kopub batang");
+    if !is_dotum && !is_batang {
+        return None;
+    }
+
+    if c == ' ' {
+        return Some(quantize_hwp_px(font_size * 0.5));
+    }
+    if is_narrow_punctuation(c) {
+        return Some(quantize_hwp_px(font_size * 0.3));
+    }
+    // [#2239] 괄호 — KoPub 경로는 86712 한컴 PDF 글리프 직독 실측(13px 문서
+    // 괄호 4px ≈ 0.3em, #2195 stage23)으로 narrow 유지. is_narrow_punctuation
+    // 의 괄호가 폰트 한정(is_narrow_paren_for_font)으로 빠지면서 여기서 보존.
+    if matches!(c, '(' | ')') {
+        return Some(quantize_hwp_px(font_size * 0.3));
+    }
+    if c.is_ascii() {
+        return Some(quantize_hwp_px(font_size * 0.5));
+    }
+    if is_cjk_char(c) || is_fullwidth_symbol(c) {
+        // [#6389] KoPub돋움체 한글 전각은 872/1000em — 편람 kopub 오라클 PDF 의
+        // 임베드 서브셋 CIDFont /W 직독(Light 601·Medium 319·Bold 283 글리프
+        // 전원 872). 재구성도 맞는다: 한글 줄폭 = 872×장평0.98−자간 = 825HU/자
+        // ≈ 오라클 잉크 실측 829. 종전 1.0 은 #2195 stage57 이 86712 한컴 PDF
+        // 에서 실측한 값인데, 그 PDF 는 KoPub 미설치 환경이라 한글이 바탕으로
+        // **치환해** 그린 것 — 치환 글꼴(전각 1.0em)의 폭이 KoPub face 상수로
+        // 들어와 있었다. 치환 환경 문서군의 폭은 face 상수가 아니라 치환 경로가
+        // 소유해야 한다. 그보다 전의 0.84 도 실물(0.872)과 미세하게 어긋나
+        // r27 을 -11줄 과소시켰다. 바탕체 0.94 는 같은 방법 실측 936/1000 과
+        // 사실상 일치해 유지한다.
+        let factor = if is_dotum { 0.872 } else { 0.94 };
+        return Some(quantize_hwp_px(font_size * factor));
+    }
+
+    None
+}
+
+/// #3820 `76076_regulatory_analysis` 한컴 PDF p35의 한양중고딕 공백 advance.
+///
+/// HWP의 일반적인 U+0020 반각 규약(`em/2`)과 달리, 원명 `한양중고딕`으로
+/// 작성된 표 본문은 한컴 PDF의 p35 line decision에 맞춘 550/1024em advance가 필요하다. p35의
+/// 107자 무-`LINE_SEG` 셀에서 한글 advance와 cell 폭은 RHWP와 일치하지만, 이
+/// 공백 차이(약 2.17px/space)가 누적되어 `…반죽된` 뒤 `용` 한 글자가 잘못
+/// 앞줄에 남는다. 자동 생성 TTF hmtx 테이블은 바꾸지 않고 PDF의 line-decision
+/// 보정만 이 원명에 국한한다. `HY중고딕`은 별 face이므로 반각 규약을 유지한다.
+const HANYANG_JUNGGOTHIC_PDF_SPACE_UNITS: u16 = 550;
+
+fn hanyang_junggothic_pdf_space_width(primary_name: &str) -> Option<u16> {
+    (primary_name == "한양중고딕").then_some(HANYANG_JUNGGOTHIC_PDF_SPACE_UNITS)
+}
+
+/// #3820 `76076_regulatory_analysis` 한컴 PDF p81의 한양신명조 공백 advance.
+///
+/// HWP 원본은 `한양신명조`를 지정하지만 기준 PDF의 실제 word gap은
+/// 411/1024em(14pt에서 약 5.64pt)이다. 임베드 HFT의 U+0020 hmtx(518/1024em)를
+/// 그대로 쓰면 p81의 중첩 표에서 여덟 공백마다 차이가 누적되어 `좌석안전`의
+/// `전`이 다음 줄로 밀리고, 뒤의 간접편익 표가 p82로 넘어간다. 글리프·셀 폭·
+/// 저장 510HU margin은 PDF와 일치하므로 이 standard-body 원명 U+0020 line-decision만
+/// 보정한다.
+///
+/// 같은 원명이라도 10pt 접수증은 기준 PDF에서 일반 반각을 쓴다. face 이름만으로
+/// 411/1024em을 적용하면 날짜의 누적 공백이 줄어 `㊞`이 도장 원 밖으로 밀린다.
+const HANYANG_SHINMYEONGJO_PDF_SPACE_UNITS: u16 = 411;
+/// `issue1949` HWPX standard-body는 12pt, #3820 p81 표는 14pt다. 두 문서 모두
+/// 411/1024em line-decision을 쓰지만, 10pt 접수증은 일반 반각이다.
+const HANYANG_SHINMYEONGJO_PDF_SPACE_MIN_FONT_SIZE_PX: f64 = 16.0; // 12pt
+
+fn hanyang_shinmyeongjo_pdf_space_width(primary_name: &str, font_size: f64) -> Option<u16> {
+    (primary_name == "한양신명조"
+        && font_size + 0.01 >= HANYANG_SHINMYEONGJO_PDF_SPACE_MIN_FONT_SIZE_PX)
+        .then_some(HANYANG_SHINMYEONGJO_PDF_SPACE_UNITS)
+}
+
+fn hancom_pdf_space_width(primary_name: &str, font_size: f64) -> Option<u16> {
+    hanyang_junggothic_pdf_space_width(primary_name)
+        .or_else(|| hanyang_shinmyeongjo_pdf_space_width(primary_name, font_size))
+}
+
+/// [#2070] ㆍ(U+318D) 폭은 SYMBOL 폰트별: 한양신명조 = 전각(사다리 v3 실측),
+/// 명조(HY견명조 치환) 등 여타 = 반각 (80168 개정안{{7}} p9/p13 '시ㆍ도조례'
+/// 1줄 오라클, 개정안{{1}} P21 마크와 반각 양립 검증). embedded 메트릭
+/// (HY견명조 수록분)이 전각이라 룩업보다 앞서 판정하되, 함초롬(HCR) 계열은
+/// embedded 메트릭을 신뢰한다 (None 반환). [#2279] 한컴바탕/한컴돋움
+/// (Haansoft 실메트릭, ㆍ=1.0em)도 동일하게 embedded 메트릭을 신뢰한다.
+pub(crate) fn area_dot_fallback_width(font_family: &str, font_size: f64) -> Option<f64> {
+    let fam = font_family.split(',').next().unwrap_or("").trim();
+    if fam.contains("함초롬")
+        || fam.contains("HCR")
+        || fam.contains("한컴")
+        || fam.contains("Haansoft")
+    {
+        return None;
+    }
+    Some(if fam.contains("한양신명조") {
+        font_size
+    } else {
+        font_size * 0.5
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CharWidthDecision<'a> {
+    pub(crate) width_source: &'static str,
+    pub(crate) base_width_px: f64,
+    pub(crate) final_width_px: f64,
+    pub(crate) metric: Option<font_metrics_data::MetricLookupDecision<'a>>,
+    pub(crate) character_match: &'static str,
+    pub(crate) dash_leader: bool,
+    pub(crate) negative_spacing_clamped: bool,
+}
+
+/// 측정이 전각 글리프를 반각 advance 로 눌렀을 때의 `width_source`.
+///
+/// 페인트(`forces_halfwidth_cjk_quote`)가 같은 판정을 되묻는 데 쓰므로 문자열
+/// literal 로 흩어 두지 않는다.
+const HALFWIDTH_PUNCTUATION_WIDTH_SOURCE: &str = "metricHalfwidthPunctuationOverlay";
+
+#[derive(Debug, Clone, Copy)]
+struct EmbeddedWidthDecision<'a> {
+    width_px: Option<f64>,
+    width_source: &'static str,
+    metric: Option<font_metrics_data::MetricLookupDecision<'a>>,
+    character_match: &'static str,
+}
+
+fn measure_char_width_embedded_decision<'a>(
+    font_family: &'a str,
+    bold: bool,
+    italic: bool,
+    c: char,
+    font_size: f64,
+) -> EmbeddedWidthDecision<'a> {
+    let primary_name = font_family
+        .split(',')
+        .next()
+        .unwrap_or(font_family)
+        .trim()
+        .trim_matches('\'')
+        .trim_matches('"');
+    if let Some(w) = kopub_char_width(primary_name, c, font_size) {
+        return EmbeddedWidthDecision {
+            width_px: Some(w),
+            width_source: "kopubTable",
+            metric: None,
+            character_match: "hit",
+        };
+    }
+    let Some(mm) = font_metrics_data::find_metric_decision(primary_name, bold, italic) else {
+        return EmbeddedWidthDecision {
+            width_px: None,
+            width_source: "metricMiss",
+            metric: None,
+            character_match: "notApplicable",
+        };
+    };
+    // HWP 반각 처리: space 및 한컴이 반각으로 처리하는 구두점/기호.
+    let (w, width_source) = if c == ' ' {
+        if let Some(width) = hancom_pdf_space_width(primary_name, font_size) {
+            (width, "metricSpaceOverlay")
+        } else {
+            (mm.metric.em_size / 2, "metricHalfSpace")
+        }
+    } else {
+        let Some(glyph_w) = mm.metric.get_width(c) else {
+            return EmbeddedWidthDecision {
+                width_px: None,
+                width_source: "metricCharacterMiss",
+                metric: Some(mm),
+                character_match: "miss",
+            };
+        };
+        let is_halfwidth_punct = matches!(c, '\u{2018}'..='\u{2027}');
+        let is_narrow_unicode_punct = matches!(c, '\u{2018}' | '\u{2019}' | '\u{2027}');
+        let is_b7_notdef_artifact =
+            c == '\u{00B7}' && glyph_w >= mm.metric.em_size && !is_monospace_metric(mm.metric);
+        if (is_narrow_unicode_punct && glyph_w >= mm.metric.em_size) || is_b7_notdef_artifact {
+            (
+                (mm.metric.em_size as f64 * 0.3) as u16,
+                "metricNarrowPunctuationOverlay",
+            )
+        } else if is_halfwidth_punct && glyph_w >= mm.metric.em_size {
+            (mm.metric.em_size / 2, HALFWIDTH_PUNCTUATION_WIDTH_SOURCE)
+        } else {
+            (glyph_w, "embeddedMetric")
+        }
+    };
+    EmbeddedWidthDecision {
+        width_px: Some(quantize_hwp_px(
+            w as f64 * font_size / mm.metric.em_size as f64,
+        )),
+        width_source,
+        metric: Some(mm),
+        character_match: "hit",
+    }
+}
+
+pub(crate) fn char_width_decision<'a>(
+    chars: &[char],
+    cluster_len: &[u8],
+    i: usize,
+    style: &'a TextStyle,
+) -> CharWidthDecision<'a> {
+    let (font_size, ratio, _) = style_params(style);
+    let c = chars[i];
+    if cluster_len[i] == 0 {
+        return CharWidthDecision {
+            width_source: "clusterContinuation",
+            base_width_px: 0.0,
+            final_width_px: 0.0,
+            metric: None,
+            character_match: "notApplicable",
+            dash_leader: false,
+            negative_spacing_clamped: false,
+        };
+    }
+    if c == '\u{FFFC}' || c == '\u{F081C}' {
+        return CharWidthDecision {
+            width_source: if c == '\u{FFFC}' {
+                "inlineObjectPlaceholder"
+            } else {
+                "hwpPuaFiller"
+            },
+            base_width_px: 0.0,
+            final_width_px: 0.0,
+            metric: None,
+            character_match: "notApplicable",
+            dash_leader: false,
+            negative_spacing_clamped: false,
+        };
+    }
+    if c == '\u{2007}' {
+        let base_width_px = font_size * 0.5;
+        let final_width_px = base_width_px * ratio
+            + glyph_letter_spacing(style.letter_spacing, base_width_px * ratio, font_size)
+            + style.extra_char_spacing;
+        return CharWidthDecision {
+            width_source: "figureSpace",
+            base_width_px,
+            final_width_px,
+            metric: None,
+            character_match: "notApplicable",
+            dash_leader: false,
+            negative_spacing_clamped: false,
+        };
+    }
+
+    let (base_width_raw, width_source, metric, character_match) = if let Some(w) = (c == '\u{318D}')
+        .then(|| area_dot_fallback_width(&style.font_family, font_size))
+        .flatten()
+    {
+        (w, "areaDotFallback", None, "notApplicable")
+    } else {
+        // [#6172] 사각 안 숫자 PUA(U+F02B0~F02C4) 는 폰트 글리프가 아니라 렌더러가
+        // 사각형+숫자로 합성해 그린다(#6127 / PR #6137, `boxed_pua_number`).
+        // 그러면 전진폭도 폰트의 (있을 수도 없을 수도 있는) PUA 글리프가 아니라 **합성물이
+        // 닮은 `□`(U+25A1) 의 전진폭**으로 재야, 같은 줄에 이어지는 진짜 `□` 와 상자
+        // 간격이 균일해진다. 종전에는 이 대역이 아래 어느 분기에도 안 걸려 마지막
+        // 폴백(0.5em)으로 떨어졌고, 상자 폭(0.72em)보다 전진폭이 좁아 상자끼리
+        // 4.4pt 씩 겹쳤다 — 2599643 1쪽 "󰊲󰊰󰊰□-□□□" (20pt 에서 10.00pt vs □ 20.04pt).
+        let c = if crate::renderer::boxed_pua_number(c).is_some() {
+            '\u{25A1}'
+        } else {
+            c
+        };
+        let embedded = measure_char_width_embedded_decision(
+            &style.font_family,
+            style.bold,
+            style.italic,
+            c,
+            font_size,
+        );
+        if let Some(w) = embedded.width_px {
+            (
+                w,
+                embedded.width_source,
+                embedded.metric,
+                embedded.character_match,
+            )
+        } else if cluster_len[i] <= 1 && is_unicode_halfwidth_form(c) {
+            // [#6023] Halfwidth and Fullwidth Forms 블록(FF00–FFEF)에서
+            // FF61–FFDC(｡｢｣､･·반각 가타카나·반각 한글 자모)와 FFE8–FFEE 는
+            // 정의상 **반각**이다. is_cjk_char 의 블록 블랭킷이 이들을 전각
+            // (1em)으로 오분류해 반각 낫표 ｢｣ 뒤가 전각 공백처럼 벌어졌다
+            // (30269 1쪽 한글 2020 PDF 실측: ｢ 전진 7.9pt = 0.5em @ 15.95pt,
+            // rhwp 16.0pt). 메트릭 DB 에 항목이 있으면 위 embedded 가 이긴다.
+            (
+                font_size * 0.5,
+                "heuristicHalfwidthForm",
+                embedded.metric,
+                embedded.character_match,
+            )
+        } else if cluster_len[i] > 1 || is_cjk_char(c) || is_fullwidth_symbol(c) {
+            (
+                font_size,
+                "heuristicFullwidth",
+                embedded.metric,
+                embedded.character_match,
+            )
+        } else if is_narrow_punctuation(c) || is_narrow_paren_for_font(&style.font_family, c) {
+            (
+                font_size * 0.3,
+                "heuristicNarrow",
+                embedded.metric,
+                embedded.character_match,
+            )
+        } else {
+            (
+                font_size * 0.5,
+                "heuristicHalfwidth",
+                embedded.metric,
+                embedded.character_match,
+            )
+        }
+    };
+    let dash_leader = is_dash_leader_run(chars, i);
+    let base_width_px = if dash_leader {
+        base_width_raw.min(font_size * 0.3)
+    } else {
+        base_width_raw
+    };
+    let mut final_width_px = base_width_px * ratio
+        + glyph_letter_spacing(style.letter_spacing, base_width_px * ratio, font_size)
+        + style.extra_char_spacing;
+    if c == ' ' {
+        final_width_px += style.extra_word_spacing;
+    }
+    if dash_leader {
+        final_width_px += style.extra_dash_advance;
+    }
+    let mut negative_spacing_clamped = false;
+    if style.letter_spacing + style.extra_char_spacing < 0.0 {
+        let min_width = base_width_px * ratio * 0.5;
+        if final_width_px < min_width {
+            final_width_px = min_width;
+            negative_spacing_clamped = true;
+        }
+    }
+    CharWidthDecision {
+        width_source,
+        base_width_px,
+        final_width_px,
+        metric,
+        character_match,
+        dash_leader,
+        negative_spacing_clamped,
+    }
+}
+
 fn measure_char_width_embedded(
     font_family: &str,
     bold: bool,
@@ -1592,70 +1247,15 @@ fn measure_char_width_embedded(
     c: char,
     font_size: f64,
 ) -> Option<f64> {
-    // CSS font-family 체인에서 첫 번째 폰트명으로 메트릭 조회
-    let primary_name = font_family.split(',').next().unwrap_or(font_family).trim();
-    let mm = font_metrics_data::find_metric(primary_name, bold, italic)?;
-    // HWP 반각 처리: space 및 한컴이 반각으로 처리하는 구두점/기호
-    let w = if c == ' ' {
-        mm.metric.em_size / 2
-    } else {
-        let glyph_w = mm.metric.get_width(c)?;
-        // 한컴은 스마트 따옴표 등을 반각으로 처리.
-        // 폰트 메트릭에서 전각(em_size)으로 기록되어 있어도 em/2로 강제.
-        // [Issue #630] U+00B7 (가운뎃점) 은 본 분기에서 제외 — 한컴 저장본의
-        // tab_extended 가 전각 측정 기반으로 산출되므로 반각 강제 시 right-tab
-        // 정렬이 8.67px 좌측 이탈. 폰트 메트릭 그대로 사용 (전각).
-        let is_halfwidth_punct = matches!(
-            c,
-            '\u{2018}'..='\u{2027}' // ''‚‛""„‟†‡•‣․‥…‧ 구두점/기호
-        );
-        // 휴먼명조/HY중고딕/HY신명조/HY견명조 등 일부 폰트 DB 가 U+2018/U+2019/
-        // U+2027 을 fullwidth (1.0 em) 로 잘못 기록한 케이스 정정. em/2 (0.5 em)
-        // 강제 시 한컴 대비 약 4px (font-size 20px 기준, 0.5→0.3 em 차) 과대.
-        // glyph_w 가 비정상 fullwidth (>= em_size) 일 때만 0.3 em 강제 — 함초롬
-        // 바탕 (0.32) / Pretendard (0.22) 등 정상 DB 값은 조건 미충족으로 영향 없음.
-        let is_narrow_unicode_punct = matches!(c, '\u{2018}' | '\u{2019}' | '\u{2027}');
-        // [U+00B7 .notdef 위장값 정정] 비례폰트(휴먼명조 등)가 `·` (가운뎃점)
-        // 글리프를 갖지 않으면 cmap 이 .notdef(glyph 0) 로 매핑돼 advance 가
-        // em_size(전각) 로 기록된다. 한컴은 이 경우 점 글리프를 가진 대체
-        // 폰트(바탕 ≈0.33em 등)로 `·` 를 렌더하므로 전각 advance 는 PDF 대비
-        // 과대 (시·군 점 좌우 공백 큼). 비례폰트에서 U+00B7 이 전각이면 위장값
-        // 으로 보고 0.3em 으로 정정한다. 고정폭(monospace) 폰트(돋움체 등)는
-        // 모든 글리프가 em_size 이므로 제외 — 해당 `·` 는 진짜 전각이다
-        // (Issue #630, aift 목차 right-tab 정합 보존).
-        let is_b7_notdef_artifact =
-            c == '\u{00B7}' && glyph_w >= mm.metric.em_size && !is_monospace_metric(mm.metric);
-        if (is_narrow_unicode_punct && glyph_w >= mm.metric.em_size) || is_b7_notdef_artifact {
-            (mm.metric.em_size as f64 * 0.3) as u16
-        } else if is_halfwidth_punct && glyph_w >= mm.metric.em_size {
-            mm.metric.em_size / 2
-        } else {
-            glyph_w
-        }
-    };
-    // em 단위 → px: w / em_size * font_size, 그 후 HWP 양자화
-    let em = mm.metric.em_size as f64;
-    let mut actual_px = w as f64 * font_size / em;
-
-    // Bold 폴백: Regular 메트릭으로 폴백된 경우
-    // 한컴은 faux bold(합성 Bold) 시 렌더링만 획을 두껍게 하고,
-    // 텍스트 메트릭(폭 계산)에는 Regular 폭을 그대로 사용한다.
-    // bold_fallback 보정을 적용하면 Justify 정렬에서 공백이 축소됨.
-    // (26글자 × 1.02px/글자 = 26.5px 과대 → 공백 소멸)
-
-    // 한컴과 동일한 HWPUNIT 정수 변환: w * base_size / em (내림)
-    // round가 아닌 truncate (as i32)로 처리하여 한컴 정수 나눗셈과 일치
-    let hwp = (actual_px * 75.0) as i32;
-    Some(hwp as f64 / 75.0)
+    measure_char_width_embedded_decision(font_family, bold, italic, c, font_size).width_px
 }
 
 // ── 호환 래퍼 (기존 호출부 변경 없음) ──────────────────────────────
 
 /// 텍스트 폭 추정
 ///
-/// 플랫폼별 기본 TextMeasurer를 자동 선택하여 위임한다.
-/// WASM: WasmTextMeasurer (JS Canvas + HWP 양자화)
-/// 네이티브: EmbeddedTextMeasurer (내장 메트릭 + 휴리스틱)
+/// 기본 TextMeasurer(EmbeddedTextMeasurer, 내장 메트릭 + 휴리스틱)에 위임한다.
+/// native/WASM 공통 — SVG byte 패리티의 전제다 (#4046).
 pub(crate) fn estimate_text_width(text: &str, style: &TextStyle) -> f64 {
     default_measurer().estimate_text_width(text, style)
 }
@@ -1666,59 +1266,13 @@ pub(crate) fn estimate_text_width(text: &str, style: &TextStyle) -> f64 {
 /// 한컴은 HWPUNIT 정수로 폭을 누적하므로, round 없이 px를 합산한 뒤
 /// 줄바꿈 비교 시점에서 available_width와 비교하는 것이 더 정확하다.
 pub(crate) fn estimate_text_width_unrounded(text: &str, style: &TextStyle) -> f64 {
-    let measurer = EmbeddedTextMeasurer;
-    let (font_size, ratio, tab_w) = style_params(style);
+    let (_, _, tab_w) = style_params(style);
     let chars: Vec<char> = text.chars().collect();
     let cluster_len = build_cluster_len(&chars);
     let char_count = chars.len();
 
-    let char_width = |i: usize| -> f64 {
-        let c = chars[i];
-        if c == '\u{2007}' {
-            return font_size * 0.5 * ratio + style.letter_spacing + style.extra_char_spacing;
-        }
-        // 인라인 객체 placeholder 는 실제 control node 가 따로 그리므로 텍스트 폭은 0.
-        if c == '\u{FFFC}' {
-            return 0.0;
-        }
-        // [Issue #677] HWP PUA 채움 문자 (U+F081C) — 시각 폭 0
-        if c == '\u{F081C}' {
-            return 0.0;
-        }
-        let base_w_raw = if let Some(w) =
-            measure_char_width_embedded(&style.font_family, style.bold, style.italic, c, font_size)
-        {
-            w
-        } else if cluster_len[i] > 1 || is_cjk_char(c) || is_fullwidth_symbol(c) {
-            font_size
-        } else if is_narrow_punctuation(c) {
-            // Task #257: 콤마·중점 등 narrow glyph 폴백 폭 (0.5 → 0.3).
-            font_size * 0.3
-        } else {
-            font_size * 0.5
-        };
-        // Task #352: 3+ 연속 dash leader 좁은 base 0.3 em + 라인 슬랙 분배.
-        let is_leader = is_dash_leader_run(&chars, i);
-        let base_w = if is_leader {
-            base_w_raw.min(font_size * 0.3)
-        } else {
-            base_w_raw
-        };
-        let mut w = base_w * ratio + style.letter_spacing + style.extra_char_spacing;
-        if c == ' ' {
-            w += style.extra_word_spacing;
-        }
-        if is_leader {
-            w += style.extra_dash_advance;
-        }
-        // 음수 자간(letter_spacing + extra_char_spacing < 0) 시
-        // per-char 최소 advance 클램프로 narrow glyph 역진 방지.
-        if style.letter_spacing + style.extra_char_spacing < 0.0 {
-            let min_w = base_w * ratio * 0.5;
-            w = w.max(min_w);
-        }
-        w
-    };
+    let char_width =
+        |i: usize| -> f64 { char_width_decision(&chars, &cluster_len, i, style).final_width_px };
 
     let mut total = 0.0;
     for i in 0..char_count {
@@ -1737,12 +1291,91 @@ pub(crate) fn estimate_text_width_unrounded(text: &str, style: &TextStyle) -> f6
     total // round 없이 반환
 }
 
+/// 한컴이 폭 변경 뒤 LINE_SEG를 다시 만들 때 쓰는 공백 advance.
+///
+/// 저장본은 글꼴 고유 공백 폭을 보존할 수 있지만, 한컴의 새 재조판은 반각 공백을
+/// 사용한다. 이 규칙을 전역 측정에 넣으면 원본 저장 LINE_SEG의 정합이 깨지므로,
+/// stale cell 복구나 LINE_SEG 부재 재조판처럼 새 줄을 만드는 경로만 opt-in한다.
+///
+/// 저장 metric과 재조판 metric이 같은 style에는 `None`을 반환해 별도 보정이 없도록
+/// 한다. 따라서 글꼴명이나 고정 글자 크기에 의존하지 않는다.
+pub(crate) fn hancom_regenerated_space_width(style: &TextStyle) -> Option<f64> {
+    let (font_size, ratio, _) = style_params(style);
+    let base_w = font_size * 0.5;
+    let mut width = base_w * ratio
+        + glyph_letter_spacing(style.letter_spacing, base_w * ratio, font_size)
+        + style.extra_char_spacing
+        + style.extra_word_spacing;
+    if style.letter_spacing + style.extra_char_spacing < 0.0 {
+        width = width.max(base_w * ratio * 0.5);
+    }
+    let stored_width = estimate_text_width_unrounded(" ", style);
+    (width > stored_width + f64::EPSILON).then_some(width)
+}
+
 /// 글자별 X 위치 경계값 계산
 ///
 /// N글자 → N+1개 경계값을 반환한다 (0번째는 0.0, N번째는 전체 폭).
 /// run 내부 상대 좌표이며, 절대 좌표는 run.bbox.x + charX[i]로 계산한다.
 pub(crate) fn compute_char_positions(text: &str, style: &TextStyle) -> Vec<f64> {
     default_measurer().compute_char_positions(text, style)
+}
+
+/// 기존 문자 경계값과 exact-font pair positioning을 한 번만 계산하는 공통 진입점.
+///
+/// R4C의 line/token 소비자와 R4D의 backend replay가 같은 owned measurement를
+/// 공유하기 위한 경계다. K0와 exact source 부재에서는 기존
+/// [`compute_char_positions`] 결과를 그대로 보존한다.
+pub(crate) fn compute_kerning_run_measurement(
+    text: &str,
+    style: &TextStyle,
+    source_handle: Option<&ExactFontSourceHandle>,
+    session: &mut KerningSourceSession<'_>,
+) -> KerningRunMeasurement {
+    let (effective_font_size_px, width_ratio, _) = style_params(style);
+    let base_positions = compute_char_positions(text, style);
+    super::super::kerning::compute_kerning_run_measurement(
+        text,
+        style.kerning,
+        base_positions,
+        effective_font_size_px,
+        width_ratio,
+        source_handle,
+        session,
+    )
+}
+
+/// 실제 글자 위치 계산과 같은 경로를 사용해 관측 가능한 폭 결정을 반환한다.
+/// 탭은 문맥 의존 advance이므로 최종 위치 차이를 정답으로 기록한다.
+pub(crate) fn trace_char_width_decisions<'a>(
+    text: &str,
+    style: &'a TextStyle,
+) -> Vec<CharWidthDecision<'a>> {
+    let chars: Vec<char> = text.chars().collect();
+    let cluster_len = build_cluster_len(&chars);
+    let positions = compute_char_positions(text, style);
+    chars
+        .iter()
+        .enumerate()
+        .map(|(i, &ch)| {
+            let mut decision = char_width_decision(&chars, &cluster_len, i, style);
+            if ch == '\t' {
+                let advance = positions
+                    .get(i + 1)
+                    .zip(positions.get(i))
+                    .map(|(after, before)| after - before)
+                    .unwrap_or(0.0);
+                decision.width_source = "tabAdvance";
+                decision.base_width_px = advance;
+                decision.final_width_px = advance;
+                decision.metric = None;
+                decision.character_match = "notApplicable";
+                decision.dash_leader = false;
+                decision.negative_spacing_clamped = false;
+            }
+            decision
+        })
+        .collect()
 }
 
 // ── 문자 분류 함수 ──────────────────────────────────────────────────
@@ -1775,8 +1408,77 @@ fn is_narrow_punctuation(c: char) -> bool {
         '\u{00B7}' |  // · MIDDLE DOT
         '\u{2018}' |  // ' LEFT SINGLE QUOTATION MARK
         '\u{2019}' |  // ' RIGHT SINGLE QUOTATION MARK
-        '\u{2027}' // ‧ HYPHENATION POINT
+        '\u{2027}' |  // ‧ HYPHENATION POINT
+        // [Task #1735] 한글 방점. 렌더 경로에서 좁은 가운데 점(·)으로 치환되므로
+        // 측정 폭도 narrow 로 맞춰 측정-렌더 폭 정합 유지(0.5em 기본 폴백 방지).
+        '\u{302E}' |  // 〮 HANGUL SINGLE DOT TONE MARK (방점)
+        '\u{302F}' // 〯 HANGUL DOUBLE DOT TONE MARK (쌍방점)
     )
+}
+
+/// [#2239] 괄호 '(' ')' narrow 폭(0.3em) — 사다리 실측 폰트 한정.
+///
+/// 통제 사다리 실측(#2195 stage30/31): 휴먼명조 '(' = 0.31em(embedded 정합),
+/// 한양중고딕 '(' <= 317HU(0.29em) — fallback 0.5em 은 과대
+/// (76076 표325 r0 '(정량)영향집단명' 11pt: 8800>8642 로 2줄, 한글 1줄).
+/// 단 HY신명조·바탕 계열은 0.5em(#2156 ASCII 폭 표 정합)이므로 폰트 무관
+/// `is_narrow_punctuation` 전역 분류는 금지 — 실측된 폰트에서만 좁힌다.
+/// (KoPub 계열은 `kopub_char_width` 자체 분기에서 별도 실측 근거로 유지.)
+fn is_narrow_paren_for_font(font_family: &str, c: char) -> bool {
+    if !matches!(c, '(' | ')') {
+        return false;
+    }
+    let primary = font_family.split(',').next().unwrap_or(font_family).trim();
+    primary.contains("휴먼명조") || primary.contains("한양중고딕") || primary.contains("HY중고딕")
+}
+
+/// [#6023] Halfwidth and Fullwidth Forms 블록의 **반각** 구간.
+///
+/// FF00–FF60(전각 ASCII 변형)·FFE0–FFE6(전각 기호)은 전각이 맞지만,
+/// FF61–FFDC(｡｢｣､･, 반각 가타카나, 반각 한글 자모)와 FFE8–FFEE(반각 기호)는
+/// 유니코드 정의상 반각이다. 폴백 폭 분류에서 이 구간을 전각 블랭킷보다
+/// 먼저 가른다.
+fn is_unicode_halfwidth_form(c: char) -> bool {
+    ('\u{FF61}'..='\u{FFDC}').contains(&c) || ('\u{FFE8}'..='\u{FFEE}').contains(&c)
+}
+
+/// 한컴이 수평 조판에서 반각 advance 로 처리하는 CJK 낫표.
+///
+/// 일부 등록 폰트는 `「」` glyph advance 를 전각으로 제공하지만, 한컴 PDF 기준
+/// 본문 조판에서는 법령명 낫표 뒤에 전각 공백처럼 보이는 간격이 생기지 않는다
+/// (#2020 돋움체 여권신청서).
+///
+/// 다만 휴먼명조·HY헤드라인M 에서는 한글이 전폭을 쓴다 (#6060). 메트릭 DB 의
+/// 「 폭은 두 계열 모두 `em_size` 이므로 일괄 반각 오버레이가 아니라 글꼴별로
+/// 갈라야 한다.
+pub(crate) fn is_halfwidth_cjk_quote(c: char) -> bool {
+    matches!(c, '\u{300C}' | '\u{300D}')
+}
+
+/// 페인트가 「」 글리프를 반각 공간에 눌러 그려야 하는지 — **측정과 같은 판정**이어야 한다.
+///
+/// 측정은 고정폭 메트릭(`is_monospace_metric`)이고 글리프 advance 가 `em_size` 이상일 때만
+/// 반각 오버레이를 적용한다. 페인트가 폰트 **이름 목록**으로 따로 판정하면 두 경로가 갈린다.
+///
+/// - 이름 목록 밖 고정폭(바탕체·궁서체·D2Coding): advance 는 반각인데 글리프는 전각으로
+///   그려져 다음 글자와 겹친다.
+/// - 이름에 `돋움체` 를 포함하지만 메트릭 DB 밖(KoPub돋움체): advance 는 전각인데 글리프만
+///   반각으로 눌려 오른쪽에 빈 공간이 남는다.
+///
+/// 그래서 판정을 이름이 아니라 측정 결정 하나로 통일한다. 돋움체 반각(#2020)과
+/// 휴먼명조·HY헤드라인M 전폭(#6060)은 메트릭만으로 그대로 갈린다.
+pub fn forces_halfwidth_cjk_quote(
+    font_family: &str,
+    bold: bool,
+    italic: bool,
+    c: char,
+    font_size: f64,
+) -> bool {
+    if !is_halfwidth_cjk_quote(c) {
+        return false;
+    }
+    measure_char_width_embedded_decision(font_family, bold, italic, c, font_size).width_source
+        == HALFWIDTH_PUNCTUATION_WIDTH_SOURCE
 }
 
 /// 3 개 이상 연속하는 dash leader 시퀀스의 일부 여부 (Task #352).
@@ -1821,6 +1523,7 @@ fn is_fullwidth_symbol(c: char) -> bool {
         '\u{00A3}' |                   // £ POUND SIGN
         '\u{00A5}'                     // ¥ YEN SIGN
     )
+    || ('\u{2190}'..='\u{21FF}').contains(&c) // Arrows (→, ⇨, ⇒ 등)
     || ('\u{2460}'..='\u{24FF}').contains(&c) // Enclosed Alphanumerics (①②③ 등)
     || ('\u{25A0}'..='\u{25FF}').contains(&c) // Geometric Shapes (□■▲◆○ 등, 섹션 머리 기호)
     || ('\u{2600}'..='\u{26FF}').contains(&c) // Miscellaneous Symbols (☆★ 등)
@@ -1955,6 +1658,87 @@ pub(crate) fn vertical_substitute_char(c: char) -> Option<char> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn issue_4442_noto_sans_kr_regular_ascii_shared_width_uses_tracked_advances() {
+        let style = TextStyle {
+            font_family: "Noto Sans KR".to_string(),
+            font_size: 1000.0,
+            ..Default::default()
+        };
+
+        assert_eq!(estimate_text_width_unrounded("AVATAR", &style), 3633.0);
+        assert_eq!(
+            compute_char_positions("AVATAR", &style),
+            vec![0.0, 608.0, 1183.0, 1791.0, 2390.0, 2998.0, 3633.0]
+        );
+    }
+
+    /// [진단] 흔한 폰트의 라틴 metric 커버리지 — 없으면 0.5em 폴백(캐럿·재래핑 부정확).
+    /// `cargo test --lib latin_metric_coverage_report -- --nocapture` 로 표를 본다.
+    #[test]
+    fn latin_metric_coverage_report() {
+        let fonts = [
+            "바탕",
+            "돋움",
+            "굴림",
+            "궁서",
+            "맑은 고딕",
+            "함초롬바탕",
+            "함초롬돋움",
+            "한컴바탕",
+            "한컴돋움",
+            "HY견고딕",
+            "HY견명조",
+            "HY중고딕",
+            "HY신명조",
+            "휴먼명조",
+            "한양신명조",
+            "중고딕",
+            "Noto Sans KR",
+            "Noto Serif KR",
+            "Batang",
+            "Dotum",
+            "Gulim",
+            "Arial",
+            "Times New Roman",
+            "Calibri",
+            "KoPub바탕체",
+            "KoPub돋움체",
+            "나눔고딕",
+            "나눔명조",
+            "굴림체",
+            "돋움체",
+        ];
+        let mut have = 0;
+        for f in fonts {
+            let ok = font_family_has_metrics(f, false, false);
+            // 함초롬바탕/HCR 은 자동 생성 hmtx 표를 타므로
+            // metric 유무와 무관하게 정확하다 — 표시해 둔다.
+            // 함초롬(HCR)·KoPub 은 별도 per-glyph 경로가 있어 metric 유무와 무관하게 정확하다.
+            let dedicated = f.contains("함초롬")
+                || f.contains("HCR")
+                || f.contains("KoPub")
+                || measure_char_width_embedded(f, false, false, 'E', 100.0).is_some();
+            let tag = if ok {
+                "metric 있음"
+            } else if dedicated {
+                "전용 표(정확)"
+            } else {
+                "→ 0.5em 폴백"
+            };
+            println!("  {f:<22} {tag}");
+            have += (ok || dedicated) as u32;
+        }
+        println!(
+            "
+  {}/{} 정확, 나머지는 라틴 0.5em 폴백",
+            have,
+            fonts.len()
+        );
+        // 회귀 가드 — 흔한 폰트 커버리지가 떨어지면 캐럿·재래핑이 부정확해진다(§4.29).
+        assert!(have >= 29, "라틴 metric 커버리지 회귀: {have}/30");
+    }
+
     /// 테스트용 고정 폭 텍스트 측정기
     ///
     /// 모든 문자를 동일한 폭으로 측정한다.
@@ -2010,6 +1794,243 @@ mod tests {
             }
             positions
         }
+    }
+
+    // ── #4701 함초롬바탕 라틴 = 폰트 hmtx ──
+
+    /// 함초롬바탕(HCR Batang)의 비한글 문자는 **폰트 자신의 hmtx** 로 잰다.
+    ///
+    /// #2156 이 넣고 §4.31(`69bb0813d`)이 값을 갈아끼운 `HAANSOFT_BATANG_ASCII`
+    /// 오버라이드를 제거한 자리다. 그 표는 한글 PDF 의 `가`↔ASCII origin 델타를
+    /// **한국어 전각으로 정규화**해 만들었는데, 이 폰트의 한글 advance 가 0.970em
+    /// 이라 전 ASCII 가 `1/0.970 = 1.0309` 배 부풀었다. `HANBatang.ttf` hmtx 대비
+    /// 평균 +3.54% 였고, 표에 0.970 을 되곱하면 +1.11% 로 줄어 나머지가 origin
+    /// 델타 방식의 추출 잡음임이 드러났다(#4701).
+    ///
+    /// 잡음의 증거: 이 폰트가 같은 advance(0.5500)를 주는 숫자 0~9 에 옛 표는
+    /// 0.5651 과 0.5774 두 값을 배정했다. 폰트 메트릭이라면 있을 수 없는 차이다.
+    ///
+    /// 눈에 띄는 증상은 목차 점선 리더였다 — `·`(U+00B7)가 0.3330 으로 +4.1%
+    /// 넓어 줄당 85개가 누적되면 줄 끝에서 약 21px 벌어졌다.
+    ///
+    /// 자동 생성 표(`font_metrics_data`)는 TTF 에서 추출한 것이라 hmtx 와 불일치가
+    /// 0 이다. 그래서 고칠 것은 표가 아니라 그것을 가로채던 오버라이드였다.
+    #[test]
+    fn issue_4701_hcr_batang_latin_uses_font_hmtx() {
+        let fs = 40.0 / 3.0; // 10pt = 13.333px
+        let w = |c: char| {
+            measure_char_width_embedded("함초롬바탕", false, false, c, fs)
+                .unwrap_or_else(|| panic!("측정 실패: {c:?}"))
+        };
+        let hcr_batang = |c: char| {
+            measure_char_width_embedded("HCR Batang", false, false, c, fs)
+                .unwrap_or_else(|| panic!("HCR Batang 측정 실패: {c:?}"))
+        };
+        // HANBatang.ttf hmtx 실측 (upm=1000). 브라우저 measureText 실측과도 일치한다.
+        for (c, em) in [
+            ('(', 0.3200),
+            (',', 0.3200),
+            ('.', 0.3200),
+            ('·', 0.3200),
+            ('0', 0.5500),
+            ('9', 0.5500),
+            ('A', 0.7060),
+        ] {
+            assert!(
+                (w(c) - fs * em).abs() < 0.05,
+                "{c:?} {} ≠ {em}em (hmtx)",
+                w(c)
+            );
+        }
+        // 폰트가 같은 폭을 주는 글자에는 같은 값이 나와야 한다 — 옛 표의 잡음 재발 가드.
+        for pair in [('0', '9'), ('(', ')'), ('.', ',')] {
+            assert_eq!(w(pair.0), w(pair.1), "{pair:?} 는 hmtx 가 동일하다");
+        }
+        assert_eq!(w('('), hcr_batang('('), "별칭도 같은 경로를 타야 함");
+        // 한글 음절·공백은 기존 경로(HCR hmtx / useFontSpace=0 em/2) 유지.
+        assert!(
+            (w('가') - fs * 0.9700).abs() < 0.05,
+            "한글 {} ≠ 0.97em",
+            w('가')
+        );
+    }
+
+    // ── #2279 한컴돋움/한컴바탕 = Haansoft 실메트릭 ──
+
+    /// 한컴돋움/한컴바탕의 실체는 Haansoft Dotum/Batang (HDOTUM.TTF/HBATANG.TTF
+    /// name table 한국어명). 한글 PDF 실측(36398599 pi35 단일줄 무신축 '*' run:
+    /// 0.583em, 한글 음절 1.0em)과 hmtx 가 일치 — HCR(함초롬) 메트릭('*' 0.498,
+    /// 음절 0.97em)으로 회귀하면 '*' 마스킹 구분선·본문 래핑 줄수가 한글 대비
+    /// ±1 이탈한다 (92 컨트롤셋 36398599/36399105 −1쪽 계열).
+    #[test]
+    fn issue_2279_hancom_dotum_batang_use_haansoft_metrics() {
+        let fs = 20.0; // 15pt
+        let w = |fam: &str, c: char| {
+            measure_char_width_embedded(fam, false, false, c, fs)
+                .unwrap_or_else(|| panic!("측정 실패: {fam} {c:?}"))
+        };
+        // 한컴돋움 = Haansoft Dotum
+        assert!(
+            (w("한컴돋움", '*') - fs * 0.583).abs() < 0.05,
+            "'*' {}",
+            w("한컴돋움", '*')
+        );
+        assert!(
+            (w("한컴돋움", '0') - fs * 0.583).abs() < 0.05,
+            "'0' {}",
+            w("한컴돋움", '0')
+        );
+        assert!(
+            (w("한컴돋움", '가') - fs * 1.0).abs() < 0.05,
+            "'가' {}",
+            w("한컴돋움", '가')
+        );
+        // 한컴바탕 = Haansoft Batang (음절 1.0em; ASCII 는 #2156 표와 동일)
+        assert!(
+            (w("한컴바탕", '가') - fs * 1.0).abs() < 0.05,
+            "'가' {}",
+            w("한컴바탕", '가')
+        );
+        assert!(
+            (w("한컴바탕", '*') - fs * 0.5).abs() < 0.05,
+            "'*' {}",
+            w("한컴바탕", '*')
+        );
+        // 함초롬돋움은 종전대로 HCR Dotum 메트릭 유지 (한글 대체 여부 미실측)
+        assert!(
+            (w("함초롬돋움", '가') - fs * 0.97).abs() < 0.05,
+            "HCR '가' {}",
+            w("함초롬돋움", '가')
+        );
+        // ㆍ(U+318D): 한컴 계열은 area_dot 폴백 대신 embedded 메트릭(1.0em) 신뢰
+        assert!(area_dot_fallback_width("한컴돋움", fs).is_none());
+        assert!(area_dot_fallback_width("한컴바탕", fs).is_none());
+    }
+
+    // ── #2430 한양·휴먼 HFT 실측 메트릭의 native/WASM 정합 보장 ──
+
+    /// 한양 4종·휴먼명조의 ASCII 전 구간(0x20..=0x7E)이 embedded 메트릭으로
+    /// 해소됨을 고정한다. WASM 도 native 와 같은 EmbeddedTextMeasurer 를
+    /// 쓰므로(#4046 통일), 이 커버리지가 성립하는 한 원본 글꼴이 없는
+    /// Studio 환경(HY 대체 글리프 표시)에서도 줄바꿈·캐럿·선택 좌표를
+    /// 결정하는 문자폭은 native 와 동일하다 — hybrid(HFT 실측 메트릭 +
+    /// HY 대체 표시) 정책의 레이아웃 정합 근거.
+    /// 회귀 시(원명 미해소 → 휴리스틱 폴백) embedded 커버리지 구멍이
+    /// 셀 재래핑 줄수를 바꾼다 (#2430 재래핑 오발동의 재발 형태).
+    #[test]
+    fn issue_2430_hft_faces_ascii_embedded_coverage() {
+        let fs = 40.0 / 3.0; // 10pt = 13.333px
+        for fam in [
+            "한양신명조",
+            "한양중고딕",
+            "한양견명조",
+            "한양견고딕",
+            "휴먼명조",
+        ] {
+            for code in 0x20..=0x7Eu32 {
+                let c = char::from_u32(code).unwrap();
+                let w =
+                    measure_char_width_embedded(fam, false, false, c, fs).unwrap_or_else(|| {
+                        panic!("{fam} {c:?}: embedded 메트릭 미해소 — Canvas 폴백 회귀")
+                    });
+                assert!(w > 0.0, "{fam} {c:?}: 비정상 폭 {w}");
+            }
+        }
+        // 실측 스팟 체크 (tools/task2430/measured/ ladder 실측 = 커밋 테이블):
+        // 명조·중고딕 계열 숫자 0.497em, 견 계열 0.565em.
+        let w = |fam: &str, c: char| measure_char_width_embedded(fam, false, false, c, fs).unwrap();
+        assert!(
+            (w("한양신명조", '0') - fs * 0.497).abs() < 0.05,
+            "신명조 '0' {}",
+            w("한양신명조", '0')
+        );
+        assert!(
+            (w("휴먼명조", '0') - fs * 0.497).abs() < 0.05,
+            "휴먼명조 '0' {}",
+            w("휴먼명조", '0')
+        );
+        assert!(
+            (w("한양견명조", '0') - fs * 0.565).abs() < 0.05,
+            "견명조 '0' {}",
+            w("한양견명조", '0')
+        );
+        assert!(
+            (w("한양견고딕", '0') - fs * 0.565).abs() < 0.05,
+            "견고딕 '0' {}",
+            w("한양견고딕", '0')
+        );
+    }
+
+    /// #3820 — 한양중고딕 원명 space만 한컴 PDF p35의 word gap으로 보정한다.
+    /// 실제 TTF hmtx 생성 테이블을 변경하지 않아 HY중고딕과 다른 Hanyang face의
+    /// 일반 반각 space 계약은 그대로다.
+    #[test]
+    fn issue_3820_hanyang_junggothic_space_uses_pdf_advance_only() {
+        let fs = 40.0 / 3.0; // 10pt = 13.333px
+        let hanyang = measure_char_width_embedded("한양중고딕", false, false, ' ', fs)
+            .expect("한양중고딕 space metric");
+        let hy = measure_char_width_embedded("HY중고딕", false, false, ' ', fs)
+            .expect("HY중고딕 space metric");
+        let other = measure_char_width_embedded("한양견고딕", false, false, ' ', fs)
+            .expect("한양견고딕 space metric");
+
+        assert!(
+            (hanyang - quantize_hwp_px(fs * 550.0 / 1024.0)).abs() < f64::EPSILON,
+            "한양중고딕 PDF space advance={hanyang:.3}"
+        );
+        assert!(
+            (hy - quantize_hwp_px(fs * 0.5)).abs() < f64::EPSILON,
+            "HY중고딕 일반 반각 space={hy:.3}"
+        );
+        assert!(
+            (other - quantize_hwp_px(fs * 0.5)).abs() < f64::EPSILON,
+            "다른 한양 face 일반 반각 space={other:.3}"
+        );
+    }
+
+    /// #3820 — 12/14pt standard body의 한양신명조 411/1024em 보정이 접수증 10pt 날짜
+    /// run까지 넓어지면 공백 누적으로 `㊞` anchor가 도장 원 밖으로 이동한다. 크기 하한을
+    /// 고정해 issue1949 원본 HWP line boundary·p81의 line decision·복학원서 일반 반각을 함께
+    /// 보존한다. 분할 stale-cell의 한컴 재조판 규칙은 별도 helper로만 적용한다.
+    #[test]
+    fn issue_3820_hanyang_shinmyeongjo_space_is_standard_body_only() {
+        let standard_body_fs = 16.0; // 12pt
+        let p81_fs = 56.0 / 3.0; // 14pt = 18.666px
+        let receipt_fs = 40.0 / 3.0; // 10pt = 13.333px
+        let standard_body =
+            measure_char_width_embedded("한양신명조", false, false, ' ', standard_body_fs)
+                .expect("한양신명조 12pt space metric");
+        let p81 = measure_char_width_embedded("한양신명조", false, false, ' ', p81_fs)
+            .expect("한양신명조 14pt space metric");
+        let receipt = measure_char_width_embedded("한양신명조", false, false, ' ', receipt_fs)
+            .expect("한양신명조 10pt space metric");
+
+        assert!(
+            (standard_body - quantize_hwp_px(standard_body_fs * 411.0 / 1024.0)).abs()
+                < f64::EPSILON,
+            "issue1949 원본 한양신명조 12pt PDF space advance={standard_body:.3}"
+        );
+        assert!(
+            (p81 - quantize_hwp_px(p81_fs * 411.0 / 1024.0)).abs() < f64::EPSILON,
+            "p81 한양신명조 14pt PDF space advance={p81:.3}"
+        );
+        assert!(
+            (receipt - quantize_hwp_px(receipt_fs * 0.5)).abs() < f64::EPSILON,
+            "접수증 한양신명조 10pt 일반 반각 space={receipt:.3}"
+        );
+
+        let stale_split_style = TextStyle {
+            font_family: "한양신명조".to_string(),
+            font_size: standard_body_fs,
+            ..Default::default()
+        };
+        assert!(
+            (hancom_regenerated_space_width(&stale_split_style).expect("split 12pt space")
+                - standard_body_fs * 0.5)
+                .abs()
+                < f64::EPSILON,
+            "#4138 split stale-cell 12pt space must be half-em"
+        );
     }
 
     // ── MockTextMeasurer 테스트 ──
@@ -2085,6 +2106,22 @@ mod tests {
     }
 
     #[test]
+    fn test_unicode_arrow_uses_symbol_advance() {
+        let style = TextStyle {
+            font_family: "KoPub돋움체 Light".to_string(),
+            font_size: 10.0,
+            ..Default::default()
+        };
+
+        let arrow = estimate_text_width("⇒", &style);
+        let ascii = estimate_text_width("A", &style);
+        assert!(
+            arrow > ascii,
+            "arrow should use symbol advance, arrow={arrow}, ascii={ascii}"
+        );
+    }
+
+    #[test]
     fn test_mock_measurer_tab() {
         let m = MockTextMeasurer { char_width: 10.0 };
         let style = TextStyle {
@@ -2138,6 +2175,24 @@ mod tests {
             "expected 32.0 (2*16.0 heuristic), got {}",
             w
         );
+    }
+
+    #[test]
+    fn test_kopub_dotum_hangul_872_advance() {
+        let m = EmbeddedTextMeasurer;
+        let style = TextStyle {
+            font_family: "KoPub돋움체 Light".to_string(),
+            font_size: 14.0,
+            ..Default::default()
+        };
+
+        // [#6389] KoPub돋움체 한글 전각 872/1000em — 편람 kopub 오라클 PDF 임베드
+        // 서브셋 CIDFont /W 직독(전 웨이트 1,203 글리프 만장일치 872). 종전 1.0
+        // 은 KoPub 미설치 환경의 바탕 치환 렌더(86712)를 face 상수로 오인한 값.
+        // 14px × 0.872 = 12.208 → HWPUNIT 양자화 12.2/자, 두 글자 24.4 를
+        // estimate_text_width 가 총폭 round 해 24.0 (줄바꿈 비교는 unrounded).
+        let w = m.estimate_text_width("가나", &style);
+        assert_eq!(w, 24.0);
     }
 
     #[test]
@@ -2399,6 +2454,67 @@ mod tests {
         );
     }
 
+    /// [#2239] 괄호 narrow(0.3em)는 사다리 실측 폰트(휴먼명조/한양중고딕) 한정.
+    /// 미실측(미등록) 폰트의 괄호는 0.5em 폴백 유지 — HY신명조·바탕 계열
+    /// 0.5em(#2156 ASCII 폭 표) 회귀 방지.
+    #[test]
+    fn test_paren_narrow_is_font_conditioned() {
+        let m = EmbeddedTextMeasurer;
+        // 미등록·미실측 폰트: 괄호는 0.5em 폴백.
+        let style = TextStyle {
+            font_family: UNREGISTERED_FONT.to_string(),
+            font_size: 13.333,
+            ratio: 1.0,
+            ..Default::default()
+        };
+        let positions = m.compute_char_positions("A(B", &style);
+        let advance = positions[2] - positions[1];
+        assert!(
+            (advance - style.font_size * 0.5).abs() < 0.5,
+            "미실측 폰트 '(' 는 0.5em 폴백이어야 함, got {:.2}",
+            advance
+        );
+        // 한양중고딕(사다리 실측 '(' <= 0.29em): narrow 0.3em.
+        let style_hy = TextStyle {
+            font_family: "한양중고딕".to_string(),
+            font_size: 13.333,
+            ratio: 1.0,
+            ..Default::default()
+        };
+        let positions_hy = m.compute_char_positions("A(B", &style_hy);
+        let advance_hy = positions_hy[2] - positions_hy[1];
+        assert!(
+            advance_hy <= style_hy.font_size * 0.45,
+            "한양중고딕 '(' 는 narrow(≤0.45em)여야 함, got {:.2}",
+            advance_hy
+        );
+    }
+
+    /// [Task #1735] 방점 U+302E/U+302F 는 렌더 경로에서 좁은 가운데 점(·)으로
+    /// 치환·렌더되므로, 측정 폭도 narrow(≤0.35em)로 분류해 측정-렌더 폭 정합을
+    /// 유지한다(0.5em 기본 폴백 방지).
+    #[test]
+    fn test_narrow_glyph_tone_marks() {
+        let m = EmbeddedTextMeasurer;
+        let style = TextStyle {
+            font_family: UNREGISTERED_FONT.to_string(),
+            font_size: 16.667,
+            ratio: 1.0,
+            ..Default::default()
+        };
+        for text in &["가\u{302E}나", "가\u{302F}나"] {
+            let positions = m.compute_char_positions(text, &style);
+            let advance = positions[2] - positions[1];
+            assert!(
+                advance <= style.font_size * 0.35,
+                "tone mark advance should be ≤ font_size * 0.35 ({:.2}), got {:.2} for {:?}",
+                style.font_size * 0.35,
+                advance,
+                text
+            );
+        }
+    }
+
     #[test]
     fn test_narrow_glyph_period_and_colon() {
         let m = EmbeddedTextMeasurer;
@@ -2478,6 +2594,55 @@ mod tests {
             dot_advance,
             expected / 2.0
         );
+    }
+
+    #[test]
+    /// [#6478] `「` 는 등록 폰트에서도 **전각**이다 — #2020 의 반각 기대를 뒤집었다.
+    ///
+    /// #2020 의 원 문서(여권신청서)를 한글 2022 로 다시 재니 돋움체 낫표가 전각이고
+    /// (9.96pt → 폭 9.96), 설치된 어떤 폰트도 U+300C 를 반각으로 갖고 있지 않다
+    /// (Windows batang/gulim 8종, 한컴 HBATANG/HDOTUM 모두 1.0 em).
+    fn test_6478_corner_quote_is_fullwidth_in_registered_font() {
+        let m = EmbeddedTextMeasurer;
+        let style = TextStyle {
+            font_family: "돋움체".to_string(),
+            font_size: 13.333,
+            ratio: 1.0,
+            ..Default::default()
+        };
+
+        let positions = m.compute_char_positions("「여", &style);
+        let quote_advance = positions[1] - positions[0];
+        let hangul_advance = positions[2] - positions[1];
+
+        assert!(
+            quote_advance >= style.font_size * 0.9,
+            "`「` 는 등록 폰트에서 전각 advance 로 측정되어야 함. got {:.2}",
+            quote_advance
+        );
+        assert!(
+            hangul_advance >= style.font_size * 0.9,
+            "뒤따르는 한글은 전각 advance 를 유지해야 함. got {:.2}",
+            hangul_advance
+        );
+
+        // [#6478] 바탕체도 같다 — 한글 2022 실측 BatangChe 14.00pt 선언에서
+        // `「` 크기 14.04pt · 전진 14.04 (156509659 1쪽). 종전 rhwp 는 9.65pt /
+        // 전진 6.65 로 반토막이었다.
+        for face in ["바탕체", "굴림체", "궁서체"] {
+            let style = TextStyle {
+                font_family: face.to_string(),
+                font_size: 18.667,
+                ratio: 1.0,
+                ..Default::default()
+            };
+            let positions = m.compute_char_positions("「여", &style);
+            let adv = positions[1] - positions[0];
+            assert!(
+                adv >= style.font_size * 0.9,
+                "{face} 의 `「` 도 전각이어야 함. got {adv:.2}"
+            );
+        }
     }
 
     /// [U+00B7 .notdef 위장값 정정] 비례폰트(휴먼명조)에서 `·`(U+00B7) 글리프

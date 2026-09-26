@@ -42,13 +42,26 @@ fn para_has_equation_only(para: &Paragraph) -> bool {
             .any(|ctrl| matches!(ctrl, Control::Equation(_)))
 }
 
+/// [#4626] 빈 텍스트 판정은 `para_has_visible_text` 하나로 통일한다.
+///
+/// 종전의 `text.trim().is_empty()` 는 개체 대체 문자(`\u{FFFC}`)를 공백으로 보지
+/// 않아, **도형만 있는 문단의 표준형(`text == "\u{FFFC}"`)** 에서 `typeset.rs` 의
+/// 동명 술어와 반대 답을 냈다. 바로 위 형제 술어
+/// (`para_is_treat_as_char_equation_only`)는 이미 `para_has_visible_text` 를 쓴다 —
+/// 이 함수만 예외였다.
 fn para_is_treat_as_char_picture_only(para: &Paragraph) -> bool {
-    para.text.trim().is_empty()
+    !para_has_visible_text(para)
         && para.controls.iter().any(|ctrl| match ctrl {
             Control::Picture(pic) => pic.common.treat_as_char,
             Control::Shape(shape) => shape.common().treat_as_char,
             _ => false,
         })
+}
+
+fn para_has_treat_as_char_table(para: &Paragraph) -> bool {
+    para.controls
+        .iter()
+        .any(|ctrl| matches!(ctrl, Control::Table(table) if table.common.treat_as_char))
 }
 
 fn compact_between_notes_gap_px(raw_gap_hu: i32, dpi: f64, use_pagination_gap: bool) -> f64 {
@@ -93,6 +106,13 @@ pub(crate) struct HeightCursor {
     pub allow_start_height_backtrack: bool,
     /// 미주 흐름의 큰 forward vpos 점프는 단/쪽 재배치 흔적일 수 있어 순차 배치를 유지한다.
     pub suppress_large_forward_jump: bool,
+    /// HWPX 원본의 일부 LINE_SEG vpos 는 이전 쪽/단 조판 좌표가 남아 페이지 상단 본문을
+    /// 과도하게 아래로 밀 수 있다. 원본 IR은 보존하고 조판 커서에서만 제한적으로 접는다.
+    pub suppress_hwpx_stale_forward: bool,
+    /// [#5854] 저장 LINE_SEG 사다리가 통짜 합성값인 문서 — `vertical_pos` 가 실측
+    /// 조판 좌표가 아니므로 앵커 스냅 자체를 끈다. 켜 두면 글꼴로 다시 뽑은 줄
+    /// 진행을 매 항목마다 그 상수 사다리로 되돌려 놓는다.
+    pub uniform_filler_ladder: bool,
     /// [Task #1246] 현재 섹션 미주의 between-notes 마진(HU, 0=미적용). 새 미주 제목이 forward
     /// 흐름에서 이 마진보다 작은 간격을 가지면(다줄 풀이 끝 trailing 누락=문22) 끌어올린다.
     /// 생성자는 0 으로 두고 호출자(build_single_column)가 미주 흐름 컬럼에서만 설정한다.
@@ -102,6 +122,10 @@ pub(crate) struct HeightCursor {
     pub prev_item_content_bottom_y: Option<f64>,
     /// 직전 `vpos_adjust`에서 새 미주 제목 gap을 저장 end_y보다 위로 compact했는지.
     pub(crate) last_compacted_endnote_title_gap: bool,
+    /// [#5699 H1] 저장 사다리가 자리차지 표 밴드를 계상하지 않은 문서에서, 흐름이
+    /// 페인트된 표 밴드 위로 되감기지 못하게 하는 바닥(절대 y px). 기본 `f64::MIN`
+    /// = 비활성. 표 아이템 배치 후 자기모순 판별이 참일 때만 호출자가 올린다.
+    pub min_flow_floor: f64,
 }
 
 impl HeightCursor {
@@ -130,9 +154,12 @@ impl HeightCursor {
             allow_vpos_rewind,
             allow_start_height_backtrack,
             suppress_large_forward_jump,
+            suppress_hwpx_stale_forward: false,
+            uniform_filler_ladder: false,
             endnote_between_notes_hu: 0,
             prev_item_content_bottom_y: None,
             last_compacted_endnote_title_gap: false,
+            min_flow_floor: f64::MIN,
         }
     }
 
@@ -151,6 +178,10 @@ impl HeightCursor {
         styles: &ResolvedStyleSet,
     ) -> f64 {
         self.last_compacted_endnote_title_gap = false;
+        // [#5854] 통짜 합성 사다리는 조판 좌표가 아니다 — 스냅 근거로 쓰지 않는다.
+        if self.uniform_filler_ladder {
+            return y_offset;
+        }
         let Some(prev_pi) = self.prev_layout_para else {
             return y_offset;
         };
@@ -179,10 +210,23 @@ impl HeightCursor {
         let Some(seg) = prev_seg else {
             return y_offset;
         };
+        // [Task #1811] 합성 seg(원본 linesegarray 부재 — reflow/컨버터 생성,
+        // TAG_IMPLEMENTATION_PROPERTY)는 저장 증거가 아니다. **전방(forward)** 보정
+        // 근거로 쓰면 구세션 저장 flow 위치로 과대 전진해(+9.6px) 후속 분할 표 예산이
+        // 부족해진다 (saved_bounds_cumulative_page_break p4 컷 [2]→[3] 결손).
+        // [Task #1811 v2] 단, 되감기와 대형 재앵커 점프는 허용한다 — 전면 차단하면
+        // 파스 경로별 미세 측정차가 재동기화를 잃고 누적되어 라운드트립 쪽나눔이
+        // 갈린다 (seoul_1006 p7→p8 Group+줄 이월 회귀). 판정은 최종 result 산출 후
+        // 방향·크기로 한다 (함수 끝 SYNTH_FORWARD_REANCHOR_MIN_PX 클램프).
+        let synthetic_prev_seg =
+            seg.tag & crate::model::paragraph::LineSeg::TAG_IMPLEMENTATION_PROPERTY != 0;
         if seg.vertical_pos == 0 && prev_pi > 0 {
             return y_offset;
         }
-        let prev_vpos_end = seg.vertical_pos + seg.line_height + seg.line_spacing;
+        let prev_vpos_end = seg
+            .vertical_pos
+            .saturating_add(seg.line_height)
+            .saturating_add(seg.line_spacing);
         let curr_first_vpos = paragraphs
             .get(item_para)
             .and_then(|p| p.line_segs.first())
@@ -210,7 +254,51 @@ impl HeightCursor {
                 .text
                 .chars()
                 .any(|c| c > '\u{001F}' && c != '\u{FFFC}');
-            let vpos_continuous = matches!(curr_first_vpos, Some(v) if v <= prev_vpos_end);
+            // [#2243] 직전 문단이 **빈 앵커 자리차지(TopAndBottom, 비-TAC) 표 host** 면
+            // prev_end→curr 저장 vpos 갭은 표의 흐름 공간 인코딩이다. sequential y 는
+            // 표 소비를 이미 포함하므로 lazy 역산이 이 갭을 재가산하면 표 높이만큼
+            // 이중 계상된다 (36382819 pi=31: lazy_base 역산 +12971HU → 페이지3
+            // +184.9px → 4쪽 sliver, 한글 3쪽). 보정 없이 sequential 을 신뢰한다.
+            // page_base 경로(절대 좌표)는 정상 동작하므로 lazy 역산 한정.
+            let prev_is_empty_float_table_host = !prev_has_text
+                && prev_para.controls.iter().any(|c| {
+                    matches!(c, Control::Table(t)
+                        if !t.common.treat_as_char
+                            && matches!(t.common.text_wrap, TextWrap::TopAndBottom))
+                });
+            // 전방 재가산 형상(저장 갭 존재 = curr_v0 > prev_end)만 차단 — 갭이
+            // 없으면 정상 lazy 역산을 유지해 sequential 과대의 역방향 보정을
+            // 살린다 (156631374: 무차별 차단 시 1→2쪽 회귀).
+            let stored_gap_exists = matches!(curr_first_vpos, Some(v) if v > prev_vpos_end);
+            if prev_is_empty_float_table_host && stored_gap_exists {
+                return y_offset;
+            }
+            // [Issue #1898] 직전 문단이 "실텍스트 + 인라인(tac) 그림 호스트" 이면, 저장
+            // vpos gap 이 현재 문단 spacing_before 이하일 때 연속으로 본다. 이 gap 은 sb
+            // 인코딩이며 sb 는 vpos_corrected_end_y 가 별도로 사전 차감하므로 이미 계상된
+            // 정상 전진이다. tac 그림 PageItem 이 vpos base 를 리셋한 직후 이 gap 을
+            // 불연속으로 오판해 +trailing_ls bridge 를 더하면 그림 문단 뒤 줄 전진이
+            // gap 1회분(+11.7px) 과대해진다 (36388711 p9 참고자료: 렌더 44.8px vs
+            // layout/한컴 33.1px — 기전 1). 시그니처를 tac 그림 텍스트 호스트 직후로
+            // 한정해 일반 lazy 재역산의 bridge 는 종전 유지 (rowbreak-problem-pages
+            // 쪽나눔 무회귀). HWP3-origin 변환본(sb 사전 차감 생략 경로)도 종전 유지.
+            let prev_is_tac_picture_text_host = prev_has_text
+                && prev_para
+                    .controls
+                    .iter()
+                    .any(|c| matches!(c, Control::Picture(p) if p.common.treat_as_char));
+            let curr_sb_hu = if self.skip_spacing_before_prededuct || !prev_is_tac_picture_text_host
+            {
+                0
+            } else {
+                paragraphs
+                    .get(item_para)
+                    .and_then(|p| styles.para_styles.get(p.para_shape_id as usize))
+                    .map(|ps| ((ps.spacing_before * 7200.0 / self.dpi).round() as i32).max(0))
+                    .unwrap_or(0)
+            };
+            let vpos_continuous =
+                matches!(curr_first_vpos, Some(v) if v <= prev_vpos_end + curr_sb_hu);
             let trailing_ls_hu = if vpos_continuous && prev_has_text {
                 0
             } else {
@@ -482,7 +570,7 @@ impl HeightCursor {
             && !curr_is_equation_only_tail
             && matches!(
                 curr_first_vpos,
-                Some(v) if v - seg.vertical_pos >= seg.line_height + seg.line_spacing
+                Some(v) if v - seg.vertical_pos >= seg.line_height.saturating_add(seg.line_spacing)
             );
         let compact_endnote_page_tail_backtrack = self.suppress_large_forward_jump
             && is_page_path
@@ -496,6 +584,22 @@ impl HeightCursor {
         let current_has_visible_text = paragraphs
             .get(item_para)
             .map(para_has_visible_text)
+            .unwrap_or(false);
+        let current_looks_like_numbered_note = paragraphs
+            .get(item_para)
+            .map(|p| {
+                let text = p.text.trim_start();
+                let digit_len = text
+                    .as_bytes()
+                    .iter()
+                    .take_while(|b| b.is_ascii_digit())
+                    .count();
+                (1..=3).contains(&digit_len) && text.as_bytes().get(digit_len) == Some(&b')')
+            })
+            .unwrap_or(false);
+        let current_is_tac_table_host = paragraphs
+            .get(item_para)
+            .map(para_has_treat_as_char_table)
             .unwrap_or(false);
         let compact_endnote_title_body_stale_forward = self.suppress_large_forward_jump
             && !is_page_path
@@ -549,8 +653,24 @@ impl HeightCursor {
         let current_line_advance_px = paragraphs
             .get(item_para)
             .and_then(|p| p.line_segs.first())
-            .map(|s| hwpunit_to_px((s.line_height + s.line_spacing).max(0), self.dpi))
+            .map(|s| {
+                hwpunit_to_px(
+                    (s.line_height.saturating_add(s.line_spacing)).max(0),
+                    self.dpi,
+                )
+            })
             .unwrap_or(0.0);
+        let compact_endnote_page_no_separator_tail_pullup = self.suppress_large_forward_jump
+            && is_page_path
+            && current_has_visible_text
+            && current_looks_like_numbered_note
+            && !curr_is_equation_only_tail
+            && seg.line_spacing < 0
+            && current_line_advance_px <= 14.5
+            && end_y < y_offset - 6.0
+            && y_offset - end_y <= 18.0
+            && end_y <= self.col_area_y + self.col_area_height
+            && y_offset > self.col_area_y + self.col_area_height - 80.0;
         let current_line_height_px = paragraphs
             .get(item_para)
             .and_then(|p| p.line_segs.first())
@@ -674,6 +794,31 @@ impl HeightCursor {
             && end_y <= self.col_area_y + self.col_area_height
             && y_offset <= self.col_area_y + self.col_area_height * 0.75;
         let stale_forward = self.suppress_large_forward_jump && end_y > y_offset + 100.0;
+        let prev_is_initial_empty_reset = prev_pi == 0
+            && seg.vertical_pos == 0
+            && !prev_has_visible_text
+            && prev_para.text.trim().is_empty()
+            && y_offset <= self.col_area_y + 48.0;
+        let current_vpos_far_from_prev =
+            matches!(curr_first_vpos, Some(v) if v - prev_vpos_end > 3200);
+        let previous_has_stale_hwpx_line_metrics = self.suppress_hwpx_stale_forward
+            && crate::renderer::paragraph_source_line_metrics_need_reflow(
+                prev_para, styles, self.dpi,
+            );
+        let hwpx_page_start_stale_forward = self.suppress_hwpx_stale_forward
+            && is_page_path
+            && applied
+            && !vpos_rewind
+            && y_offset <= self.col_area_y + 96.0
+            && end_y > y_offset + 48.0
+            && ((prev_is_initial_empty_reset
+                && current_has_visible_text
+                && current_vpos_far_from_prev)
+                || (current_is_tac_table_host && end_y > y_offset + 180.0)
+                // 손상된 단일 줄의 저장 높이가 이후 문단의 절대 vpos까지 밀어 둔
+                // HWPX는 순차 조판 위치를 유지한다. 그렇지 않으면 앞 줄을 재조판해도
+                // 다음 문단에서 동일한 빈 공간이 다시 복원된다.
+                || (previous_has_stale_hwpx_line_metrics && current_has_visible_text));
         let compact_endnote_large_gap_body_stale_forward = self.suppress_large_forward_jump
             && !is_page_path
             && !vpos_rewind
@@ -749,12 +894,24 @@ impl HeightCursor {
             && !follows_tall_inline_item
             && y_offset > self.col_area_y + self.col_area_height * 0.90
             && y_offset <= col_bottom;
+        let compact_endnote_zero_gap_text_floor = self.suppress_large_forward_jump
+            && is_page_path
+            && self.endnote_between_notes_hu == 0
+            && !current_is_endnote_title
+            && current_has_visible_text
+            && current_looks_like_numbered_note
+            && !curr_is_equation_only_tail
+            && measured_prev_content_bottom_y.is_some()
+            && end_y < prev_content_floor_y - 0.25
+            && y_offset >= prev_content_floor_y
+            && y_offset - end_y <= 24.0;
         if compact_endnote_stale_note_gap
             || compact_endnote_title_body_stale_forward
             || compact_endnote_large_gap_body_stale_forward
             || compact_endnote_page_title_body_stale_forward
             || compact_endnote_page_title_mid_stale_gap
             || compact_no_separator_large_title_tail_gap
+            || hwpx_page_start_stale_forward
             || (applied && (compact_endnote_new_note_jump || compact_endnote_tac_picture_gap))
         {
             // Compact endnote flow encodes visual gaps in absolute vpos.
@@ -784,6 +941,8 @@ impl HeightCursor {
                 // 제목 문단은 paragraph layout에서 spacing_before가 다시 더해지므로
                 // 커서 기준 y에서는 그만큼 미리 빼야 실제 첫 줄이 목표 gap에 놓인다.
                 y_offset - prev_line_spacing_px * 0.25 - curr_sb
+            } else if hwpx_page_start_stale_forward {
+                y_offset
             } else if compact_endnote_new_note_jump {
                 bottom_new_note_gap_cap.unwrap_or(y_offset)
             } else if let Some(y) = stale_note_gap_y {
@@ -894,6 +1053,13 @@ impl HeightCursor {
                 .max(prev_content_floor_y)
                 .max(self.col_area_y)
                 .min(y_offset)
+        } else if compact_endnote_zero_gap_text_floor {
+            // 0mm 미주의 일반 텍스트 연속 문단은 저장 vpos가 실제 렌더 하단보다
+            // 위를 가리키는 경우가 있다. 제목/수식 tail 특수 보정이 아닌 일반
+            // 텍스트에서는 직전 TextLine bbox 하단을 최소 시작점으로 보존한다.
+            prev_content_floor_y.max(self.col_area_y).min(y_offset)
+        } else if hwpx_page_start_stale_forward {
+            y_offset
         } else if compact_endnote_large_gap_body_stale_forward {
             // 큰 미주 사이 문서의 본문 중간 텍스트는 저장 vpos가 이전 제목/수식
             // 그룹의 절대 위치 흔적으로 남아 순차 y보다 한 note 간격 이상 앞으로
@@ -968,6 +1134,11 @@ impl HeightCursor {
                 .max(prev_floor)
                 .max(self.col_area_y)
                 .min(y_offset)
+        } else if compact_endnote_page_no_separator_tail_pullup {
+            // 렌더용 lineSeg를 위로 당긴 page-path 한 줄 tail은 저장 end_y가
+            // 의도한 위치다. 여기서 순차 y_offset을 고르면 127~129 같은 마지막
+            // 번호 묶음이 frame 아래로 잘린다.
+            end_y.max(self.col_area_y).min(y_offset)
         } else if compact_endnote_single_line_tail_backtrack {
             end_y
         } else if compact_endnote_title_tail_backtrack {
@@ -1030,6 +1201,9 @@ impl HeightCursor {
         if title_after_equation_tail_extra_gap > 0.0 {
             result = (result + title_after_equation_tail_extra_gap).min(col_bottom);
             self.shift_vpos_base_for_rendered_delta(title_after_equation_tail_extra_gap);
+        }
+        if compact_endnote_zero_gap_text_floor && result > end_y + 0.5 {
+            self.shift_vpos_base_for_rendered_delta(result - end_y);
         }
         if compact_endnote_text_after_lazy_tall_equation_floor {
             let inferred_extra =
@@ -1174,7 +1348,35 @@ impl HeightCursor {
         {
             return y_offset + prev_line_spacing_px;
         }
+        // [Task #1811 v2] 합성 seg 증거의 **소폭(drift형) 전방 이동**만 차단한다.
+        // - 되감기(result < y_offset): 허용 — sequential 이 앞서 나갔을 때의 재동기화.
+        // - 대형 전방 점프(> SYNTH_FORWARD_REANCHOR_MIN_PX): 허용 — 저장 vpos 로의
+        //   구조적 재앵커. 파스 경로별 미세 측정차(예: seoul_1006 pi=41 표 +9.6px)가
+        //   누적되어도 양 경로가 같은 저장 좌표에 재앵커되어 쪽나눔 결정이 수렴한다.
+        //   전면 차단하면 누적차가 쪽 경계에서 발현해 라운드트립 pagination 이 갈린다.
+        // - 소폭 전방(≤ 임계): 차단 — 구세션 저장 flow 위치로의 과대 전진(+9.6px,
+        //   saved_bounds_cumulative_page_break p4 분할 예산 결손)이 이 대역이다.
+        const SYNTH_FORWARD_REANCHOR_MIN_PX: f64 = 48.0;
+        if synthetic_prev_seg
+            && result > y_offset + 0.5
+            && result - y_offset <= SYNTH_FORWARD_REANCHOR_MIN_PX
+        {
+            if std::env::var("RHWP_VPOS_DEBUG").is_ok() {
+                eprintln!(
+                    "VPOS_SYNTH_FWD_SKIP: pi={} prev_pi={} y_in={:.2} result={:.2}",
+                    item_para, prev_pi, y_offset, result,
+                );
+            }
+            return y_offset;
+        }
         result
+    }
+
+    /// 활성 base 로 사영한 저장-사다리 기대 y. 렌더 점프가 사다리에 이미
+    /// 인코딩된 공간인지(기준점 이동 불필요) 가리는 데 쓴다 (#4533 2135039).
+    pub(crate) fn ladder_expected_y(&self, col_y: f64, first_vpos: i32) -> Option<f64> {
+        let base = self.vpos_page_base.or(self.vpos_lazy_base)?;
+        Some(col_y + hwpunit_to_px(first_vpos - base, self.dpi))
     }
 
     /// 이미 계산된 vpos 기준 y보다 실제 렌더 y를 아래로 밀었을 때, 후속 항목도
@@ -1193,6 +1395,25 @@ impl HeightCursor {
             self.vpos_lazy_base = Some(base - delta_hu);
         }
     }
+
+    /// [#4613 · #4599 밴드-플로우] 렌더가 저장 사다리보다 `delta_px` 만큼 **뒤로**(위로) 배치된
+    /// 경우의 역보정 — 낡은 사다리 전방 스냅을 기각해 줄을 자리차지 표 위 틈에 남길 때,
+    /// 후속 문단의 사다리 목표가 함께 위로 이동해야 상대 간격이 유지된다.
+    /// `shift_vpos_base_for_rendered_delta`(전방 밀림, base 감소)의 대칭이다.
+    pub(crate) fn shift_vpos_base_for_rendered_backtrack(&mut self, delta_px: f64) {
+        if delta_px <= 0.0 {
+            return;
+        }
+        let delta_hu = (delta_px / self.dpi * 7200.0).round() as i32;
+        if delta_hu <= 0 {
+            return;
+        }
+        if let Some(base) = self.vpos_page_base {
+            self.vpos_page_base = Some(base + delta_hu);
+        } else if let Some(base) = self.vpos_lazy_base {
+            self.vpos_lazy_base = Some(base + delta_hu);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1200,6 +1421,61 @@ mod tests {
     use super::*;
     use crate::model::paragraph::LineSeg;
     use crate::renderer::style_resolver::ResolvedParaStyle;
+
+    /// [#4626] 글자처럼 취급하는 도형 하나만 든 문단.
+    fn tac_shape_para(text: &str) -> Paragraph {
+        use crate::model::shape::{RectangleShape, ShapeObject};
+        let mut rect = RectangleShape::default();
+        rect.common.treat_as_char = true;
+        Paragraph {
+            text: text.to_string(),
+            controls: vec![Control::Shape(Box::new(ShapeObject::Rectangle(rect)))],
+            ..Default::default()
+        }
+    }
+
+    /// 도형만 있는 문단의 **표준형**은 `text == "\u{FFFC}"` 다. 종전 판정은
+    /// `trim()` 이 개체 대체 문자를 공백으로 보지 않아 여기서 `false` 를 냈고,
+    /// `typeset.rs` 의 동명 술어(`true`)와 정면으로 어긋났다.
+    #[test]
+    fn object_replacement_only_para_is_treat_as_char_picture_only() {
+        assert!(
+            para_is_treat_as_char_picture_only(&tac_shape_para("\u{FFFC}")),
+            "개체 대체 문자만 있는 문단을 도형 전용으로 보지 않았다"
+        );
+    }
+
+    /// 같은 파일의 형제 술어와 같은 답을 내야 한다 — 빈 텍스트 판정의 단일 정의.
+    #[test]
+    fn empty_and_control_only_paras_agree_with_visible_text_helper() {
+        for text in ["", "\u{FFFC}", "\u{FFFC}\u{FFFC}", "\u{000D}"] {
+            let para = tac_shape_para(text);
+            assert_eq!(
+                para_is_treat_as_char_picture_only(&para),
+                !para_has_visible_text(&para),
+                "text={text:?} 에서 빈 텍스트 판정이 갈렸다"
+            );
+        }
+    }
+
+    /// 실제 글자가 있으면 도형 전용이 아니다.
+    #[test]
+    fn para_with_real_text_is_not_treat_as_char_picture_only() {
+        assert!(!para_is_treat_as_char_picture_only(&tac_shape_para("가")));
+        assert!(!para_is_treat_as_char_picture_only(&tac_shape_para(
+            "\u{FFFC}가"
+        )));
+    }
+
+    /// 도형이 없으면 텍스트가 비어도 도형 전용이 아니다.
+    #[test]
+    fn para_without_treat_as_char_shape_is_not_picture_only() {
+        let para = Paragraph {
+            text: "\u{FFFC}".to_string(),
+            ..Default::default()
+        };
+        assert!(!para_is_treat_as_char_picture_only(&para));
+    }
 
     // DPI=96 → 75 HWPUNIT = 1px (1 inch = 7200 HU = 96px). 손계산 정합용.
     const DPI: f64 = 96.0;
@@ -1222,6 +1498,7 @@ mod tests {
 
     fn styles(spacing_before: f64) -> ResolvedStyleSet {
         ResolvedStyleSet {
+            hwp3_variant: false,
             para_styles: vec![ResolvedParaStyle {
                 spacing_before,
                 ..Default::default()
@@ -2093,6 +2370,37 @@ mod tests {
         assert!((got - y_in).abs() < 1e-6, "got={got} expected={y_in}");
     }
 
+    /// 0mm 미주 일반 텍스트 연속 문단은 저장 vpos가 직전 렌더 bbox 하단보다 위를
+    /// 가리켜도 실제 콘텐츠 하단 아래에서 시작해야 글자 겹침이 생기지 않는다.
+    #[test]
+    fn compact_endnote_zero_gap_text_keeps_previous_content_floor() {
+        let mut c = compact_endnote_cursor(Some(1000));
+        c.endnote_between_notes_hu = 0;
+        c.prev_layout_para = Some(0);
+        c.prev_item_content_bottom_y = Some(115.0);
+
+        let mut prev = para(0, 1000, 800, 160, 5000);
+        prev.text = "202) 무력한 과거의 삶".to_string();
+        let mut curr = para(0, 1960, 800, 160, 5000);
+        curr.text = "203) 현실에 정면으로 맞서는 삶".to_string();
+
+        let y_offset = 118.0;
+        let got = c.vpos_adjust(y_offset, 1, &[prev, curr], &styles(0.0));
+        let expected_floor = y_offset - 160.0 / 75.0;
+        assert!(
+            (got - expected_floor).abs() < 1e-6,
+            "got={got} expected={expected_floor}"
+        );
+
+        let end_y = COL_Y + (1960.0 - 1000.0) / 75.0;
+        let expected_base = 1000 - (((got - end_y) / DPI * 7200.0).round() as i32);
+        assert_eq!(
+            c.vpos_page_base,
+            Some(expected_base),
+            "내린 만큼 vpos base를 이동해야 후속 문단이 다시 당겨지지 않음"
+        );
+    }
+
     /// [Task #1256] 단일 줄 prev(빈 separator, ls=between_notes)로 끝나는 미주 제목 경계에서
     /// safe_vpos_backtrack 이 end_y(주입 7mm 미포함)로 cram 하면, y_offset(7mm 포함)을 유지하고
     /// 내린 만큼 vpos base 를 이동한다.
@@ -2168,5 +2476,20 @@ mod tests {
         assert_eq!(c.vpos_page_base, base_before, "base 무이동");
         // 보정 분기를 타지 않으므로 y_offset 유지(cram 아님) 또는 backtrack — 핵심은 base 무이동.
         let _ = got;
+    }
+
+    /// [#4613 · #4599 밴드-플로우] 후방 배치 역보정은 base 를 delta 만큼 늘려(전방 밀림 보정의
+    /// 대칭) 후속 문단의 사다리 목표를 함께 위로 이동시킨다.
+    #[test]
+    fn backtrack_shift_raises_vpos_base_symmetrically() {
+        let mut c = cursor(Some(6000));
+        c.shift_vpos_base_for_rendered_delta(10.0); // 전방 10px → base -750
+        assert_eq!(c.vpos_page_base, Some(5250));
+        c.shift_vpos_base_for_rendered_backtrack(10.0); // 후방 10px → base +750 복원
+        assert_eq!(c.vpos_page_base, Some(6000));
+        // 0 이하 무동작
+        c.shift_vpos_base_for_rendered_backtrack(0.0);
+        c.shift_vpos_base_for_rendered_backtrack(-3.0);
+        assert_eq!(c.vpos_page_base, Some(6000));
     }
 }

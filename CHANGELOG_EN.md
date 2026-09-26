@@ -4,6 +4,577 @@ This document records the major changes of the rhwp project.
 
 > 한국어 버전은 [CHANGELOG.md](CHANGELOG.md) 를 참조하세요.
 
+## [Unreleased]
+
+## [0.8.6] — 2026-09-02
+
+> Cumulative PATCH release prepared from provenance for 262 PRs found in the 2,214-commit feature baseline
+> after v0.8.4. Later versioning, validation, and release-record commits are tracked separately from that measured
+> range. It improves document fidelity, Studio editing, CLI and agent surfaces, input safety, and release
+> reliability while keeping the existing JSON envelope major.
+
+### Typesetting, rendering, and fonts
+
+- Added `HwpDocument.setExactFontInstance(optionsJson)` and `clearExactFontInstance(optionsJson)`. They apply
+  `boundedHorizontalLtrV1` variable-font requests only to exact slots registered by the host, with strict JSON
+  validation and idempotent per-slot clearing. Axes are never inferred from parser data or font names (#4969).
+- Connected exact-font kerning, bounded common-shaping replay, and vertical layout to the typesetting and
+  CanvasKit paths in guarded stages. Unsupported or malformed inputs retain the established safe fallback.
+- Fixed page ownership and placement for stored RowBreak tables, physical frames, LineSegs, space-taking
+  objects, table widths, text-box vpos, superscript advance, empty-line TAC pictures, and overlapping Square
+  pictures against Hancom oracle output.
+- Added opt-in `--compat 2024` handling for Hancom 2024 table-anchor line accounting. The default policy does
+  not switch merely because of a version number (#5525).
+
+### Open, save, and round-trip preservation
+
+- Preserve `hp:ole` shape-component children (`offset`, `orgSz`, `curSz`, `flip`, `rotationInfo`,
+  `renderingInfo`, and `lineShape`) plus `id`/`instid`. A zero `curSz` is restored through its sentinel and
+  negative offsets retain the required u32 wraparound (#4669, #5450).
+- Serialize HWPX curves as `hp:seg` chains to prevent Hancom open crashes, and recover pictures when BinData
+  storage IDs contain gaps (#4676, #3893, #4049).
+- Fixed HWP3 section-control placement and character preservation, plus save paths that could lose body text
+  through OWPML enums, hidden descriptions, or placeholder ranges (#4680, #4776).
+- Open HWPML documents that include a DOCTYPE or declare Version 2.1 (#5848).
+- Nested-table search and replace now emits `cellPath` at depth two and beyond while preserving the existing
+  depth-one `cellContext` envelope (#2792).
+
+### Editing, Studio, and browser extensions
+
+- Added whole-document HTML and Word `.doc` export plus numeric chart-data editing UI.
+- Fixed Korean IME `Ctrl+A`, document/recent-file names after Save As, header/footer selection and editing APIs,
+  validated zoom application, and standard print-paper snapping.
+- Improved mouse resizing for merged and ordinary table borders, caret reveal after page breaks, and ruler
+  updates.
+- Prevented `.xlsx` downloads from being incorrectly opened by the HWP viewer in the Chrome extension (#6547).
+
+### CLI, agents, and MCP
+
+- Expanded editing and query commands and consolidated Control/document queries in `rhwp-q-pack`.
+- Added a public document-agent command bridge and an HWP 2024 remote MCP client.
+- Reworked the CLI help index and per-command help, and made `test-caption` reject unverified success.
+
+### Security, performance, and operations
+
+- Bounded HWPX-container and parser recursion, and hardened input boundaries and WMF initialization.
+- Oracle PDF auto-selection now fails closed when format, producer, or saving product is ambiguous.
+- Reused exact-font sources and variable-shaping caches within bounded owners, and reduced repeated CI work
+  through nextest archive partitioning, split CodeQL paths, and documentation/review-only evidence reuse.
+- Restored trusted-controller reuse for identical merge trees. The live post-release Render Diff canary remains
+  tracked in #6243.
+
+### Packages and distribution
+
+- Added a native `aarch64-unknown-linux-gnu` target to the GitHub Release CLI matrix (#5949, #6573).
+- Fixed Docker image builds when the requested GID is already in use (#5758).
+- Align Rust, `@rhwp/core`, `@rhwp/editor`, Studio, VS Code, and Chrome/Edge/Firefox/Safari at version 0.8.6.
+
+### Compatibility and known follow-ups
+
+- Exact-font instances and `--compat 2024` are explicit opt-ins. Existing defaults and the JSON envelope major
+  remain unchanged.
+- Re-saving may produce different bytes where preservation bugs were repaired; those changes restore document
+  meaning rather than introduce a format break.
+- Issue #5949 remains open until the real v0.8.6 Linux AArch64 asset passes ELF, executable-bit, and version
+  checks.
+- Issue #6243 remains open until the trusted controller passes a real post-release canary on `main`.
+
+### Contributors
+
+Twenty people contributed during this cycle (credit keys, case-preserving alphabetical order):
+
+<!-- release-contributors:start -->
+- @chrisryugj
+- @coolwithyou
+- @davindev
+- dkh0324 — Git author credit; no public GitHub account confirmed
+- @edwardkim
+- @humdrum00001010
+- @JamesPsh
+- @jangster77
+- @jeong-sik
+- @johndoekim
+- @keepYaoung
+- @kevin9327
+- @kjh0523
+- @lpaiu-cs
+- @planet6897
+- @postmelee
+- @RaghavShubham
+- @Shadungi
+- @t2c-lab
+- @thhan74
+<!-- release-contributors:end -->
+
+## [0.8.4] — 2026-08-12
+
+### Distribution surface rollback
+
+- Restored the official distribution surface to the v0.8.2 set: GitHub Pages,
+  native CLI archives on GitHub Releases, npm `@rhwp/core` and `@rhwp/editor`,
+  VS Code Marketplace/Open VSX, and the Chrome, Edge, and Firefox extensions
+  remain supported (#4655).
+- Removed the PyPI, `@rhwp/node`, GHCR CLI image, deb/rpm/MSI, install scripts,
+  package-manager manifests, and setup GitHub Action paths that had been added
+  without explicit maintainer adoption and complete safety validation (#4655).
+- Removed the dedicated Python and Node binding source, tests, and current-use
+  documentation together with those withdrawn channels. A new official channel
+  now requires agreed build, install, update, rollback, and ownership evidence.
+
+## [0.8.3] — 2026-08-11
+
+> Cumulative PATCH release integrating 190 PRs since v0.8.2. It expands
+> encrypted-document open/save support, nested-table layout and editing,
+> MCP/agent execution contracts, official Node/Python bindings, and
+> multi-platform distribution. The existing JSON envelope major remains 1.0.
+
+### Encrypted documents and save compatibility
+
+- Open HWP5 EncryptVersion 4 documents with a Studio password prompt
+  (#3405, #3477).
+- Added HWP3 decryption and encrypted HWPX opening, with stronger preservation
+  of archaic Hangul strings in HWP3 (#3483, #3516).
+- Added encrypted save-and-reopen contracts for HWP3, HWP5, and HWPX (#3690).
+- Expanded fixes for corrupt HWP5 save paths and HWPX namespace, OLE, tab, and
+  chart round-trip preservation.
+
+### Typesetting and rendering fidelity
+
+- Continued fixes for nested-table pagination, RowBreak, empty cell paragraphs,
+  child-table flow, and the final bottom border (#4094, #4122, #4174, #4517,
+  #4525, #4567).
+- Restored square-number and small right-triangle glyphs encoded through PUA
+  character overlap (#4139, #4227, #4228).
+- Added exact CanvasKit glyph-run replay and improved page-number metrics and
+  replay determinism (#3741).
+
+### Editing, Studio, and VS Code
+
+- Fixed nested-table text/table selection and copy paths, and expanded
+  multi-cell formatting (#4119, #4267, #4276).
+- Added three-mode F5 table-cell resizing, table split/join, and a font-style
+  no-op fix (#3771, #3831, #4271).
+- Added VS Code document-outline navigation (#4093).
+- Expanded the HwpCtrl-compatible surface and compatibility ledger in stages
+  (#4187, #4274, #4486).
+
+### CLI, MCP, and agent contracts
+
+- `mcp-serve` now provides a stdio JSON-RPC server with document session handles
+  (#3571).
+- Added IR/capabilities/plan schemas, ontology, provenance, replay/lineage/audit,
+  signing, anchor/gate, security diagnostics, and a validation ladder. The
+  `capabilities` schema registry self-describes envelope 1.0, IR 1.0,
+  capabilities 1.3, and plan 1.1 (#4574).
+- `run` plans and capsules bind input, plan, and output hashes; optional CAS
+  preconditions can reject changed input before execution.
+- Added official Node and Python bindings plus generated-type drift checks.
+
+### Security and performance
+
+- Bounded decompression output to prevent memory exhaustion from deflate-bomb
+  inputs (#4263).
+- Reduced cursor, selection, local repaint, duplicate-render, and post-edit
+  rerender costs for large tables (#3672, #3745, #4156, #4265).
+- Integrated Subsecond hotpatch invalidation, diagnostics, lifecycle, and repaint
+  boundaries (#4602).
+
+### Packages and distribution
+
+- Added GitHub Release CLI archives for Linux x86_64, macOS x86_64/arm64, and
+  Windows x86_64, with `SHA256SUMS.txt`.
+- Added workflows for Python wheels/sdist, `@rhwp/node`, Debian/RPM/MSI
+  installers, and GHCR container images. Channels without publishing secrets or
+  packaging prerequisites validate and then skip publication explicitly.
+- Added cargo-binstall asset mapping, install.sh/install.ps1, and initial
+  Scoop/Homebrew/Winget/AUR channels. Hash-based manifests are updated only after
+  release assets exist.
+- Hardened CI with pinned action SHAs, stale-run cancellation, cache-generation
+  cleanup, and path-aware execution.
+
+### Contributors
+
+Sixteen people contributed during this cycle (GitHub handles, alphabetical):
+
+- @edwardkim, @enigma-jerry72, @humdrum00001010, @JamesPsh, @jangster77, @jeong-sik,
+  @johndoekim, @kevin9327, @lpaiu-cs, @NacreousCloud, @planet6897, @postmelee,
+  @scari, @seo-rii, @walnutkim, @yuyu04
+
+## [0.8.2] — 2026-07-27
+
+> Hotfix — restores printing in the browser extensions, which had been broken
+> since v0.8.0.
+
+### Extension printing restored
+- **Fixed printing failing with "file not found" in the browser extensions
+  (Chrome, Edge, Firefox).** The print preview document (`print.html`) was not
+  included in the extension build output; it was omitted from the build copy list
+  when the print path was introduced in v0.8.0 (#3433).
+- Added a required-artifact gate to the extension builds. Previously a failed
+  asset copy only produced a warning and the build still succeeded, so the
+  omission went unnoticed. The build now fails when a runtime-required file is
+  missing.
+
+### Rendering correction
+- Wired left/right outMargin into the x-origin of TAC inline tables to match
+  Hangul character rules (#3396).
+
+### Known issues
+- The studio E2E `print-pdf-issue3126` PDF guidance modal assertions fail. The
+  print surface itself works; the failure originates outside this release's scope
+  and its root cause is not yet diagnosed (#3450).
+- The studio E2E `issue-2214` page-local repaint contract failure carries over
+  from v0.8.1; whether it is a regression remains undetermined (#3412).
+
+## [0.8.1] — 2026-07-26
+
+> PATCH release — rendering corrections and CLI contract consistency since
+> v0.8.0. New features are included but are confined to the CLI tooling layer;
+> there are no public library API changes.
+
+### Rendering corrections
+- Header objects placed on the master page (page-number boxes, labels) no longer
+  overflow past the side margins to the physical paper edge — the horizontal
+  reference area for paragraph/column-anchored objects is corrected to the body
+  text area, matching Hancom output (#3402).
+- HWP 3.0: page 1 WordArt now renders without a sidecar file — the embedded OLE
+  payload (pic_type=1, additional info block id=2), previously misread as an
+  externally linked image, is extracted, repackaged, and drawn from its OlePres000
+  WMF preview. WMF POLYPOLYGON hole loss is also corrected (single path merge)
+  (#3363).
+- HWP 3.0: paragraph borders set to "no line" no longer render as solid lines —
+  wiring now follows Hancom's measured mapping. Shading side rules share the same
+  root cause and are corrected together (#3303).
+
+### CLI — contract consistency
+- Unified positional argument parsing across `export` commands — svg/png/pdf/
+  markdown/render-tree/doclang (#3359); `export-text` accepts option-first
+  invocation (#3349).
+- `search --limit` truncation is now visible — added `totalMatchCount` and
+  `truncated` (#3353).
+- `thumbnail` exit-code consistency — removed the behavior of ignoring unknown
+  options and returning exit 0 (#3366).
+- `capabilities` now self-describes `export-png` feature availability via
+  `requiresFeature`/`available` (#3357); `edit` commands are registered in
+  capabilities and MCP self-description (#3329).
+- ingest rejects unknown fields — immediate failure with position and hint
+  instead of silent data loss (#3358).
+- `build-from-ingest` now specifies a borderless default borderFill, removing
+  boxes drawn around every text run (#3355).
+
+### CLI — new features
+- `edit fill-fields` for filling form values (#3329), `edit replace-text` for
+  document-wide replacement (#3373), `edit set-cell` for writing cells by table
+  grid coordinates (#3381).
+- Added search, export-tables, and fields axes to `batch` (#3346).
+- Standard government form assets — General Draft Form (Form No. 1) and Simplified
+  Draft Form (Form No. 2), with 23 form fields and contract tests (#3372).
+- Large-scale page-by-page comparison harness against Hancom official PDF
+  references (#3389).
+
+### studio
+- Style creation, modification, and deletion are now recorded in the edit history;
+  previously they bypassed the edit router and could not be undone with `Ctrl+Z`.
+  Deletion is recorded as a snapshot because it reassigns style_id document-wide
+  (#3387).
+- Guarded the dev-only fetch for externally linked images in production and
+  extension builds, removing extension Errors noise (#3348).
+
+### Dependencies
+- base64 0.22.1 → 0.23.0, snafu 0.9.1 → 0.9.2.
+- Seven GitHub Actions major updates — checkout v7, setup-node v7, cache v6,
+  upload-pages-artifact v5, deploy-pages v5, github-script v9, action-gh-release v3.
+
+### Known issues
+- The studio E2E `issue-2214` page-local repaint contract fails at the
+  `after-56-sync` checkpoint (cumulative wasmFlush 2, expected 0). No comparison
+  against v0.8.0 was performed, so whether this is a regression remains
+  undetermined; tracked separately (#3412).
+
+## [0.8.0] — 2026-07-26
+
+> MINOR release — 265 PRs integrated since v0.7.19. Save round-trip preservation
+> overhaul (invalidation contract + dozens of HWPX/HWP5 attribute round-trips),
+> new agent-facing CLI query/verification tool suite, parser fuzzing
+> infrastructure, editing-undo fidelity series, and rendering/font consistency
+> improvements. Starting with this release, **browser extension versions
+> (Chrome/Edge/Firefox/Safari) are unified with the library version**
+> (0.2.8 → 0.8.0).
+
+### Save reliability — round-trip preservation overhaul
+- Fixed a batch of invalidation omissions where edits reverted to stale bytes on
+  save — form values, bookmarks, click-here fields, style edits, neighbor-cell
+  borders, equation properties, pasted HTML formatting, and more (the
+  raw_stream/raw_data invalidation contract is now a canonical document).
+- Dozens of HWPX save round-trip preservations: secPr grid/startNum/tabStop,
+  table allowOverlap, vertical writing, borderFill threeD/shadow, 7 imgBrush
+  modes, lineShape arrowheads, 3-state checkboxes, memo border lineType,
+  paragraph numFormat literals, fieldBegin/fieldEnd fieldid, bullet paraHead,
+  caption vertAlign, refList memoProperties, object locks, and more.
+- HWP5 save-loss fixes — paragraph number format, autoTab bit, shape captions,
+  footnote/endnote decorations, BinData remap for caption images in hwpx→hwp.
+
+### CLI — agent tool suite
+- 8 JSON query/verification tools integrated: `info` / `export-text --json` /
+  parallel batch streaming, `export-structure`, `capabilities`,
+  `ir-diff --json` verdict envelope, `export-tables` (grid JSON), `fields`,
+  `search` (addressed results), `export-svg --json` (render manifest).
+- `export-doclang` — export HWP/HWPX to DocLang v0.6 XML.
+- Established non-zero exit-code contract on failure; fixed `export-png` /
+  `export-pdf` missing external-linked image loading (#3302).
+
+### Parser robustness — fuzzing and defenses
+- Introduced cargo-fuzz parser fuzzing infrastructure (stage 1) and extended
+  WMF / ooxml_chart harnesses (stage 2).
+- Hardened against malicious/corrupt inputs: WMF region sign-extension panic,
+  EMF POINTS16 unchecked allocation, 68 GB table-grid allocation, CFB corrupt
+  header panic, DIB over-allocation, infinite-loop/overflow defenses.
+- HWP3 IR wiring series — footnote options, separator length/margins,
+  between-notes spacing (×4 scale, footnote-only, grounded in Hancom's own
+  HWP3→HWPX conversion), TOC-mark separation, bookmark under-read, has_border.
+
+### Editing — undo fidelity series
+- Footnote/endnote/equation insertion and header-footer structural operations
+  are now recorded in history (#3207).
+- Cell paragraph-merge undo restores paragraph-scope properties in table
+  cells / text boxes / captions / nested tables (#2342 completed).
+- Header/footer fields separate display text from model offsets — caret, undo,
+  extraction, and render-tree JSON consistency (#3216).
+
+### Rendering consistency
+- Trust stored anchor-lines in para-float stacks — resolved bottom-aligned
+  overlap and +1 over-splitting (#2813).
+- Removed environment-dependent font sourcing paths and completed Web Canvas
+  base-family fallbacks — 10k survey r23 establishes a font-clean baseline
+  (zero page-count regressions).
+- Hanyang/Human-family ASCII metric calibration, repeated table-header grid
+  alignment, TAC margin double-add fix, overlapping-image clip fix, 3D/ofPie
+  chart rendering, CanvasKit positioned-text replay.
+
+### rhwp-studio
+- Responsiveness and Korean input latency improvements; memoized image
+  conversion results.
+- Input validation pass — ~20 clamp fixes across dialogs/toolbar plus
+  name-length guards preventing record corruption.
+- External-linked image display, HWPX OLE object selection, host save
+  notification API `notifySaved`, IME/grid-view fixes.
+
+### Browser extensions
+- **Unified versioning**: extension versions now match the library (0.8.0).
+- Hardened settings persistence/recovery and auto-open defenses.
+
+### Infrastructure & docs
+- svg2pdf determinism patches moved to an rhwp-hosted fork; wasm-pack 0.15.0
+  pinned; CI parallelization (Native Skia/test archive, Frontend/Lint) and
+  retry hardening. (A self-hosted runner experiment was validated and rolled
+  back to hosted runners; the pitfall catalog is preserved in docs.)
+- PR review workflow split into conditional guides; serialization invalidation
+  contract documented; bulk-PR triage tooling; permanent edit-sweep harness.
+
+### Contributors
+
+200 contributor PRs merged in this cycle (since v0.7.19; GitHub handles,
+alphabetical):
+
+- @chrisryugj — permanent edit-sweep harness (#2458), one-command OVR
+  self-verification (#2449) *(first contribution — welcome!)*
+- @cskwork — embed loadFile dialog deadlock prevention (#2518)
+- @donggyun112 — template PrvText placeholder fix (#2388), section start-mark
+  migration (#2386) *(first contribution — welcome!)*
+- @humdrum00001010 — studio responsiveness / Korean input latency (#3255)
+- @jangster77 (Taesup Jang) — 42 integration & review-record PRs: #3216
+  header/footer field integration (#3325), conditional PR-review guides
+  (#3299), bulk intake integrations
+- @johndoekim — 3D / ofPie chart rendering (#2500), host save notification
+  `notifySaved` (#2660)
+- @kevin9327 — 88 PRs: HWPX/HWP5 save round-trip preservation series
+  (batches A–M, G3–G12), HWP3 IR wiring series, WMF/CFB/EMF hardening,
+  8 CLI JSON tools (#3304), studio input clamp / dialog sync series
+- @lpaiu-cs — 18-PR undo fidelity series: dialog/object history recording
+  (#2337–#2378), footnote/endnote/equation & header-footer structural
+  recording (#3208), cell-merge paragraph meta restore (#3324),
+  header/footer display_text separation (#3323)
+- @myeolinmalchi — export-doclang: DocLang v0.6 XML export (#3132)
+  *(first contribution — welcome!)*
+- @planet6897 (Jaeook Ryu) — 28 PRs: 10k Korean oracle survey r16–r23 series
+  (font-clean baseline), para-float anchor-line trust (#3270), crop fallback
+  regression restore (#3241), render/layout integrations, font fallbacks
+  (#3300/#3314)
+- @postmelee (Taegyu Lee) — 13 PRs: wasm-pack 0.15.0 pin / toolchain
+  alignment (#2420), repeated table-header grid (#2512), Native Skia cache
+  writer recovery (#3123), Chrome extension settings hardening (#2658)
+- @seo-rii — CanvasKit series: positioned text replay (#2939),
+  document-scoped auto selection (#2394), direct PageLayerTree PDF (#2372)
+- @sxngt — embed loadFile `suppressDialogs` option (#2390)
+  *(first contribution — welcome!)*
+
+## [0.7.19] — 2026-07-17
+
+> Patch following v0.7.18 — honoring stored geometry signals (intra-paragraph vpos
+> reset/rewind) across both render and edit paths, table pagination precision
+> (rowspan declared-residual, machine-generated form under-splitting), memory /
+> PDF determinism improvements, HML format support, and legacy /web decoupling.
+> Public API stays backward compatible — PATCH.
+
+### Rendering fidelity — stored-signal trust lineage
+- Promote mid-paragraph vpos 0-reset (page-boundary encoding) to a split point for
+  paragraphs starting in non-zero columns — fixes bottom clipping / content loss in
+  treatise p2 right column, plus the same defect on p4 (#2320).
+- Honor intra-para reset for full-page tac picture + trailing tac table paragraphs and
+  remove ghost height accounting — poster attachment document 5→3 pages, matching
+  Hangul (#2311).
+- Fix tac table height collapse in machine-generated documents without stored
+  LINE_SEGs — Jinan form 1→2 pages, market-survey pin 309→312 (toward 315) (#2319).
+- Fix under-splitting of two-full-page form-table documents — consume float exclusion
+  zones in the table-paragraph path + correct inline misclassification of full-page-scale
+  (≥30000HU) TAC tables (#2322).
+- Spill small tac TopAndBottom object lines into the bottom page margin — extends the
+  stored page-last trust path, r12 OVER+SHAPE oracle +3 (#2137, partial).
+- Cap master-page objects at the BehindText plane via master_page provenance —
+  master-page content no longer covers body text in studio/skia (#2318).
+
+### Table pagination precision
+- Add rowspan merged-cell declared-residual to the last spanned row — convention
+  confirmed by measuring Hangul row rules; curriculum-map 380→385 pages. Also re-wrap
+  under-stored (single-lineseg over-width) cell paragraphs and port relaxed hard-break
+  into the rowspan block offset walk (giant cells only) (#2291/#2237).
+- Fix two under-splitting defects in table-dense documents — RowBreak rowspan block
+  continuation-residual evaporation + TAC picture paragraph height accounting (#2287),
+  plus bottom band-fill offset cut retry (#2097).
+- Five fresh-layout measurement fixes matching Hangul + footer lead/margin error
+  attribution and instrumentation (#2279).
+- 80168 regulatory-analysis 157-page alignment — seven-axis decomposition of the
+  cancellation network (#2070); RowBreak large-table density (trailing-space ghost
+  lines + aim padding-0) and non-Percent line-spacing 2× scale fix (#2070).
+- KBU=1 (character-unit line breaking) line-start prohibition retraction — prevents
+  isolated periods at line starts, matching a Hangul 2024 oracle (#2244). Fix inverted
+  Korean break-unit semantics (#2185). Recompose abnormal HWPX line metrics (#2093).
+
+### Editing fidelity (rhwp-studio)
+- Preserve stored resets (column/page-boundary encodings) and paragraph gaps in the
+  edit-path vpos recalculation — fixes multi-column band loss / page-count drift and
+  removes 60 spurious page-count changes across a 574-sample edit sweep (#2299).
+- Fix invisible continuous input in giant-cell (115-page) documents — targeted
+  normalized-state cache coherence invalidation (#2214).
+- Clear stale object/table selection refs after undo/redo (#2303); add a real-key
+  Ctrl+Z smoke to the undo contract e2e plus a harness modal-residue fix (#2317).
+- Preserve table cell clip in the static picture layer (#2228). Overflow view enabled
+  by default (#2205 line). File menu "Recent Documents" submenu with meta-only
+  records (#2285).
+
+### Render pipeline & fonts
+- CanvasKit readiness gate and hardened public opt-in (#2224), proof-gated resource
+  replay with failure containment (#2248), refreshed cross-backend diagnostics /
+  regression corpus with generalized render-profile plumbing (export-png defaults to
+  print-equivalent) (#2297 line).
+- Local font multilingual matching with CanvasKit registration (#2227), CanvasKit
+  bullet font correction (#2190).
+- skia PNG: fix chart RawSvg fragment double-offset clipping via viewBox (#2292) and
+  prefer Korean-capable fonts in the fallback chain — restores missing chart text
+  (#2293).
+- OOXML chart C2a stock HLC rendering with 2D fidelity (#2277, #1431 Track C).
+- HWP5 strikeout: whitelist strike shapes instead of trusting bits — avoids
+  misreading the 3D-placeholder convention (#2258, spec errata #34).
+
+### Performance, memory, determinism
+- Lazy BinData loading — embedded images no longer fully resident at parse time,
+  RSS 244MB→49MB (#2263).
+- `--text-as-paths` option for the PDF memory dominator (svg2pdf text embedding)
+  (#2264); vendored svg2pdf determinism patch for byte-reproducible export-pdf
+  (#2269, with font-numbering nondeterminism attribution and a normalize-compare tool).
+
+### Format support
+- HML (HWPML) document open + semantics-preserving save (#1157).
+- @rhwp/editor MessageChannel embed transport v1 (#2186).
+
+### Frontend infrastructure
+- Remove the legacy `/web` dev app (18 entries, 616KB) and its coupling in the CI
+  detector / metrics / font contract; non-legacy neutrality proven with function-level
+  metrics (#2313).
+- assets/fonts as the canonical font root (#2254 line), frontend package build/test CI
+  gate (#2183), Phase 0 baseline freeze (#2124, ongoing).
+
+### Tools & docs
+- HWP 2020 MCP client long-document timeout sync (#2253), 13th 10k-sample validation
+  report (#2262), row-anchor comparison tool (tools/task2287), print-mode CLI manual
+  refresh, ongoing PR-review record keeping (jangster77's review-doc series).
+
+### Contributors
+
+55 contributor PRs merged in this cycle (since v0.7.18; GitHub handles, alphabetical):
+
+- @cskwork — HML open/semantics-preserving save (#2219), @rhwp/editor MessageChannel embed transport v1 (#2187)
+- @jangster77 (Taesup Jang) — 17 PRs of external-PR integration and review records: local font multilingual matching (#2227), cell clip preservation (#2229), abnormal HWPX line recomposition (#2231), CanvasKit bullet fonts (#2196), MCP timeout (#2255), etc.
+- @johndoekim — OOXML chart C2a stock HLC rendering (#2288)
+- @lpaiu-cs — edit-path stored-reset preservation (#2314), stale selection refs after undo/redo (#2304), real-key undo e2e smoke (#2324)
+- @planet6897 (Jaeook Ryu) — 21 PRs of rendering/pagination fidelity: rowspan declared-residual convention (#2309), the r15 form-stack trilogy (#2315/#2321/#2323), lazy BinData (#2265), svg2pdf determinism (#2281), 10k sample validation (#2262), etc.
+- @postmelee (Taegyu Lee) — legacy /web removal (#2316), giant-cell edit cache coherence (#2241), break-unit semantics fix (#2194), canonical font root (#2254), frontend CI gate (#2216/#2235), Phase 0 freeze (#2174)
+- @seo-rii — CanvasKit readiness gate (#2224), proof-gated resource replay (#2248), cross-backend diagnostics/profile plumbing (#2297)
+- @yeonic (Jongyeon Kim) — HWP5 strikeout strike-shape whitelist (#2258) *(welcome, first contribution!)*
+
+## [0.7.18] — 2026-07-11
+
+> Patch release following v0.7.17 — large-scale rendering fidelity fixes (floating/front
+> object pagination, RowBreak tables, endnote flow), huge-table performance, editor
+> caret/undo/OLE parity, lenient parsing & expanded HWPX preservation, WMF shape rewrite.
+> Includes 21 internal refactoring rounds with zero behavioral regressions. Public API
+> remains backward compatible — PATCH.
+
+### Rendering fidelity
+- Floating/front object pagination parity: one-image-per-page splitting (#1995/#2004/#2006),
+  paper-anchored behind-text tables (#1994), floating-form over-pagination 81→18 pages
+  (#2019), nested 1×1 cell content pagination (#2007).
+- RowBreak tables: block-cut sliver absorption (#1921), footnote-heavy over-pagination
+  (#1937), missing-LINE_SEG cell line-height correction 213→159 pages (#1842),
+  declared-fit trust expansion (#2097), vert_offset double-counting (#2015).
+- Bottom saved-bounds trust (#2093), page-bottom anchored frame vpos=0 preservation
+  (#1920/#2158), Hancom-family Latin/punctuation widths mapped to Haansoft Batang
+  metrics (#2156), and more.
+
+### Performance
+- Removed O(pages×cell) re-measurement via cell_units memoization (#1949); removed O(n²)
+  cell measurement for a 52,694-cell document render timeout (#2063); DocumentCore: Send
+  restored via Rc→Arc (#2087).
+
+### Editor (rhwp-studio)
+- Caret on late pages: 3,064ms→33ms via page-hint search (#2021). Unified undo snapshot
+  routing for find&replace and picture/equation property dialogs (#2037/#2028/#2077).
+  OLE selection/caption/paste parity (#2069), table-cell Enter caret fixes (#2164/#1951).
+
+### Parser & serialization
+- Lenient decoding fallback for partially corrupted documents (#1932), unregistered
+  styleIDRef demotion (#1933), encrypted-HWPX detection (#1946), MAX_XML_SIZE 256MB
+  (#1917). HWPX preservation: note shapes (#1984), breakLatinWord (#1986), secPr fields
+  (#1987), curSz=0 sentinel (#2017). HWP5 page_def/CommonObjAttr round-trip (#1915/#1916).
+
+### WMF/Shapes
+- write_line rewrite fixing connectLine corruption (#1943), legacy drawText emission
+  (#1944), shape restrictInPage bottom clamp (#2075), cell-anchored picture
+  vertical_align (#2071).
+
+### Internal quality
+- 21 complexity-refactoring rounds: max CC 288→117 (−59%), zero behavioral regressions
+  across all rounds (#1904/#2131), metric formula v2.1 + reduction-potential scanner
+  (#2130), quality dashboard published under mydocs/metrics/.
+### Contributors
+
+268 contributor PRs merged this cycle (since v0.7.17), GitHub handles in alphabetical order:
+
+- @humdrum00001010 — HWPX package-graph serialization (#1675), endnote parity (#1875), +3
+- @jangster77 (Taesup Jang) — 130 PRs: table/editing parity, external PR integration & reviews, OLE object parity (#2103), long-input caret/IME (#2172)
+- @johndoekim — bangjeom rendering (#1738), OOXML chart C1c/C1d (#1890/#1954/#2140), +3
+- @kkyu8925 — empty-host co-anchored float table orphan control (#1767), +3 *(first contribution — welcome!)*
+- @lpaiu-cs — undo snapshot routing trilogy (#2028/#2039/#2078), restrictInPage clamps (#2033/#2076), BinData id allocation (#2040), cell-anchored picture valign (#2074) *(first contribution — welcome!)*
+- @oleg-sung — centered cell paragraph vpos after TAC shape (#1674) *(first contribution — welcome!)*
+- @physwkim — cell_units Rc→Arc Send restoration (#2087), new-paragraph format inheritance (#2095)
+- @planet6897 (Jaeook Ryu) — 74 PRs: rendering-fidelity series (RowBreak tables, floating/front object pagination, huge-table performance #2063, 10k-document surveys)
+- @postmelee (Taegyu Lee) — 28 PRs: CI release-test migration (#1739), frontend refactoring plan v2 (#2080) & Phase 0 baseline (#2174, in progress)
+- @seo-rii — CanvasKit object-gap diagnostics (#1806), +2
+- @snvtac — endnote reset-rewind column placement (#1495) *(first contribution — welcome!)*
+
+Dependencies: 6 dependabot PRs (including the quick-xml 0.41 security release).
+
+
 ## [0.7.17] — 2026-06-23
 
 > Patch following v0.7.16 — first OOXML chart render-fidelity work, legacy-shape shapeComment

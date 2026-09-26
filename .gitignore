@@ -3,6 +3,11 @@
 /target-local/
 # aarch64 크로스 빌드 산출물 (OKE 파드용 rhwp CLI, load_doc_mcp_arm64_image.sh 가 씀)
 /target-arm64/
+
+# 회귀 suite 파생 산출물: PR review·CI의 --prepare와 unit-tier --generate에서만 임시 생성한다.
+/tests/generated/
+/tests/generated/unit-test-tiers.json
+/tests/suites/manifest.json
 # 루트 Cargo.lock 은 추적한다 — rhwp 는 bin 산출 패키지라 재현 가능 빌드를 위해
 # 커밋 권장(#1423, Cargo 공식 가이드). 의존성 갱신은 별도 PR 로 관리.
 # bindings/Native(iOS FFI, ios/devel 분기) 는 별개 패키지이며 Linux 메인 환경에서
@@ -33,21 +38,21 @@ Thumbs.db
 /ttfs/windows/
 /ttfs/hamchob-r.ttf
 /ttfs/hamchod-r.ttf
-/web/fonts/hamchob-r.woff2
-/web/fonts/hamchod-r.woff2
-/web/fonts/h2hdrm.woff2
-/web/fonts/hygprm.woff2
-/web/fonts/hygtre.woff2
-/web/fonts/hymjre.woff2
-/web/fonts/ArialW05-Regular.woff2
-/web/fonts/Calibri.woff2
-/web/fonts/CourierNewW05-Regular.woff2
-/web/fonts/TahomaW05-Regular.woff2
-/web/fonts/TimesNewRomanW05-Regular.woff2
-/web/fonts/VerdanaW05-Regular.woff2
-/web/fonts/MalgunGothicW35-Regular.woff2
-/web/fonts/WebdingsW95-Regular.woff2
-/web/fonts/WingdingsW95-3.woff2
+/assets/fonts/hamchob-r.woff2
+/assets/fonts/hamchod-r.woff2
+/assets/fonts/h2hdrm.woff2
+/assets/fonts/hygprm.woff2
+/assets/fonts/hygtre.woff2
+/assets/fonts/hymjre.woff2
+/assets/fonts/ArialW05-Regular.woff2
+/assets/fonts/Calibri.woff2
+/assets/fonts/CourierNewW05-Regular.woff2
+/assets/fonts/TahomaW05-Regular.woff2
+/assets/fonts/TimesNewRomanW05-Regular.woff2
+/assets/fonts/VerdanaW05-Regular.woff2
+/assets/fonts/MalgunGothicW35-Regular.woff2
+/assets/fonts/WebdingsW95-Regular.woff2
+/assets/fonts/WingdingsW95-3.woff2
 
 # 외부 참조
 /webhwp/
@@ -58,6 +63,8 @@ Thumbs.db
 .claude/*
 # .claude/skills/는 프로젝트 종속 Skill (rhwp 바이너리 호출, ingest_schema_v1 사용)이므로 추적
 !.claude/skills/
+# .claude/agents/는 프로젝트 종속 서브에이전트 정의(bug-hunter 등, #3398)이므로 추적
+!.claude/agents/
 
 # 환경변수 (민감 정보)
 .env
@@ -84,6 +91,9 @@ mydocs/privacy/*
 rhwp-vscode/media/rhwp.js
 rhwp-vscode/media/rhwp_bg.wasm
 
+# 폐기된 Node 바인딩 로컬 설치·빌드 잔여물
+/bindings/node/
+
 # rhwp-chrome 빌드 산출물
 rhwp-chrome/dist/
 rhwp-chrome/*.zip
@@ -103,3 +113,11 @@ samples/.doc-mcp/
 
 # 로컬 개인 문서를 가리키는 심볼릭 링크 (저장소 밖 경로)
 rhwp-studio/public/mentor-docs/
+# Python 로컬 가상환경과 바이트코드 캐시
+/venv/
+__pycache__/
+*.pyc
+tmp/
+
+# node 바인딩 의존성 — 커밋 대상 아님(#4656 실수 커밋 정리)
+bindings/node/node_modules/

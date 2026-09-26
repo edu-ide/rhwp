@@ -20,7 +20,8 @@ export const defaultShortcuts: [ShortcutDef, string][] = [
   [{ key: 'z', ctrl: true }, 'edit:undo'],
   [{ key: 'z', ctrl: true, shift: true }, 'edit:redo'],
   [{ key: 'y', ctrl: true }, 'edit:redo'],
-  [{ key: 'a', ctrl: true }, 'edit:select-all'],
+  // 한글 IME에서는 e.key가 'ㅁ' 또는 조합 중 'Process'가 되므로 물리 KeyA로 보정한다.
+  [{ key: 'a', code: 'KeyA', ctrl: true }, 'edit:select-all'],
 
   [{ key: 'e', ctrl: true }, 'edit:delete'],
   [{ key: 'ㄷ', ctrl: true }, 'edit:delete'],
@@ -34,8 +35,8 @@ export const defaultShortcuts: [ShortcutDef, string][] = [
   [{ key: 'o', ctrl: true }, 'file:open'],
   [{ key: 'ㅐ', ctrl: true }, 'file:open'],
   [{ key: 's', ctrl: true }, 'file:save'],
-  // [Task #833] Ctrl+Shift+S → 다른 이름으로 저장 (한글 IME 'ㄴ' 도 함께).
-  [{ key: 's', ctrl: true, shift: true }, 'file:save-as'],
+  // [Task #833] Ctrl+Shift+S → 다른 이름으로 저장 (한글 IME 'ㄴ'/Process 도 함께).
+  [{ key: 's', code: 'KeyS', ctrl: true, shift: true }, 'file:save-as'],
   [{ key: 'ㄴ', ctrl: true, shift: true }, 'file:save-as'],
   [{ key: 'p', ctrl: true }, 'file:print'],
 
@@ -47,6 +48,11 @@ export const defaultShortcuts: [ShortcutDef, string][] = [
   [{ key: 'ㄹ', alt: true }, 'format:char-shape'],
   [{ key: 't', alt: true }, 'format:para-shape'],
   [{ key: 'ㅅ', alt: true }, 'format:para-shape'],
+  // [#3682] 개체 속성 — 커맨드(shortcutLabel 'P')는 정의돼 있었으나 단축키 매핑이
+  // 없어 어떤 경로로도 실행되지 않았다(차트/그림/도형 공통). 개체 선택 상태에서만
+  // canExecute 가 참이므로 본문 타이핑의 'p' 와 충돌하지 않는다.
+  [{ key: 'p', code: 'KeyP' }, 'format:object-properties'],
+  [{ key: 'ㅔ', code: 'KeyP' }, 'format:object-properties'],
 
   // 서식 – 스타일
   [{ key: 'f6' }, 'format:style-dialog'],
@@ -57,8 +63,12 @@ export const defaultShortcuts: [ShortcutDef, string][] = [
   // 줌
   [{ key: '=', ctrl: true }, 'view:zoom-in'],
   [{ key: '+', ctrl: true }, 'view:zoom-in'],
+  [{ key: '+', ctrl: true, shift: true }, 'view:zoom-in'],
   [{ key: '-', ctrl: true }, 'view:zoom-out'],
   [{ key: '0', ctrl: true }, 'view:zoom-100'],
+
+  // 도구 상자 (한글 2024 호환)
+  [{ key: 'f1', ctrl: true }, 'view:toolbox-basic'],
 
   // 검색
   [{ key: 'f', ctrl: true }, 'edit:find'],
@@ -66,7 +76,8 @@ export const defaultShortcuts: [ShortcutDef, string][] = [
   [{ key: 'l', ctrl: true }, 'edit:find-again'],
   [{ key: 'v', alt: true, shift: true }, 'edit:compare-documents'],
   [{ key: 'h', ctrl: true, shift: true }, 'edit:document-history'],
-  [{ key: 'g', alt: true }, 'edit:goto'],
+  // macOS 영문 입력에서 Option+G의 key는 ©가 되지만 물리 키는 KeyG로 유지된다.
+  [{ key: 'g', code: 'KeyG', alt: true }, 'edit:goto'],
   [{ key: 'ㅎ', alt: true }, 'edit:goto'],
 
   // 입력
@@ -120,7 +131,6 @@ export const defaultShortcuts: [ShortcutDef, string][] = [
   // 표
   [{ key: 'enter', alt: true }, 'table:insert-row-col'],
   [{ key: 'delete', alt: true }, 'table:delete-row-col'],
-  [{ key: 's', ctrl: true, shift: true }, 'table:block-sum'],
   [{ key: 'a', ctrl: true, shift: true }, 'table:block-avg'],
   [{ key: 'p', ctrl: true, shift: true }, 'table:block-product'],
 ];

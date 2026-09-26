@@ -6,6 +6,23 @@ import { userSettings } from '@/core/user-settings';
 import type { FontSet } from '@/core/user-settings';
 import { getLocalFonts } from '@/core/local-fonts';
 
+type FontMenuCategory = 'all' | 'current' | 'document' | 'fontSets' | 'system';
+
+interface FontMenuEntry {
+  value: string;
+  label: string;
+}
+
+const BASE_FONTS = ['함초롬바탕', '함초롬돋움', '맑은 고딕', '나눔고딕', '바탕', '돋움', '궁서'];
+
+const FONT_MENU_CATEGORIES: ReadonlyArray<{ id: FontMenuCategory; label: string }> = [
+  { id: 'all', label: '모든 글꼴' },
+  { id: 'current', label: '현재 글꼴' },
+  { id: 'document', label: '문서 글꼴' },
+  { id: 'fontSets', label: '대표 글꼴' },
+  { id: 'system', label: '시스템 글꼴' },
+];
+
 /** 서식 도구 모음 (style-bar) 컨트롤러 */
 export class Toolbar {
   private styleName: HTMLSelectElement;
@@ -32,9 +49,15 @@ export class Toolbar {
   private btnLsUp: HTMLButtonElement;
   private btnLsDown: HTMLButtonElement;
   private fontLang: HTMLSelectElement;
+  private alignButtons: Array<{ button: HTMLButtonElement; alignment: string }> = [];
 
   private enabled = false;
   private styleDropdownInitialized = false;
+  /** 한컴형 글꼴 메뉴. native select는 선택값/접근성 호환 상태로 유지한다. */
+  private fontMenu: HTMLElement | null = null;
+  private fontMenuCategory: FontMenuCategory = 'document';
+  private fontMenuDocumentFonts: string[] = [];
+  private fontMenuCleanup: (() => void) | null = null;
   /** 마지막으로 받은 fontFamilies (언어별 7개 배열) */
   private lastFontFamilies?: string[];
 
@@ -108,6 +131,10 @@ export class Toolbar {
         e.preventDefault();
         this.dispatcher.dispatch(cmdId);
       });
+      btn.addEventListener('click', (event) => {
+        // 키보드 Enter/Space가 만드는 click에는 선행 mousedown이 없다.
+        if (event.detail === 0) this.dispatcher.dispatch(cmdId);
+      });
     }
   }
 
@@ -165,10 +192,12 @@ export class Toolbar {
 
       const commit = () => {
         const num = parseInt(input.value, 10);
+        // format:line-spacing-increase 커맨드(format.ts)와 동일하게 500%로 상한 clamp
         if (num > 0) {
-          this.ensureLsOption(num);
-          this.lsSelect.value = String(num);
-          this.dispatcher.dispatch('format:line-spacing', { value: num });
+          const clamped = Math.min(500, num);
+          this.ensureLsOption(clamped);
+          this.lsSelect.value = String(clamped);
+          this.dispatcher.dispatch('format:line-spacing', { value: clamped });
         }
         input.remove();
         this.lsSelect.style.display = '';
@@ -185,7 +214,7 @@ export class Toolbar {
     this.btnLsUp.addEventListener('mousedown', (e) => {
       e.preventDefault();
       const cur = Number(this.lsSelect.value) || 160;
-      const next = cur + 5;
+      const next = Math.min(500, cur + 5);
       this.ensureLsOption(next);
       this.lsSelect.value = String(next);
       this.dispatcher.dispatch('format:line-spacing', { value: next });
@@ -225,7 +254,20 @@ export class Toolbar {
   /** 글꼴 선택 + 크기 변경 이벤트 */
   private setupFontControls(): void {
     this.populateFontSetOptions();
-    this.populateLocalFontOptions();
+
+    // native select는 선택값과 기존 자동화 호환에만 사용한다. 실제 목록은 범주형 메뉴로 연다.
+    this.fontName.addEventListener('pointerdown', (event) => {
+      event.preventDefault();
+      this.toggleFontMenu();
+    });
+    this.fontName.addEventListener('keydown', (event) => {
+      if (event.key === 'ArrowDown' || event.key === 'ArrowUp' || event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        this.openFontMenu();
+      } else if (event.key === 'Escape') {
+        this.closeFontMenu();
+      }
+    });
 
     this.fontName.addEventListener('change', () => {
       const name = this.fontName.value;
@@ -277,16 +319,18 @@ export class Toolbar {
         e.preventDefault();
         const pt = parseFloat(this.fontSize.value);
         if (!isNaN(pt) && pt > 0) {
-          this.eventBus.emit('format-char', { fontSize: Math.round(pt * 100) } as CharProperties);
+          const clampedPt = Math.min(4096, Math.max(1, pt));
+          this.fontSize.value = String(clampedPt);
+          this.eventBus.emit('format-char', { fontSize: Math.round(clampedPt * 100) } as CharProperties);
         }
       }
     });
 
-    // 크기 증감 버튼
+    // 크기 증감 버튼 (char-shape-dialog.ts의 fontSize 범위 100~409600과 동일한 1~4096pt로 clamp)
     this.btnSizeUp.addEventListener('mousedown', (e) => {
       e.preventDefault();
       const pt = parseFloat(this.fontSize.value) || 10;
-      const newPt = pt + 1;
+      const newPt = Math.min(4096, pt + 1);
       this.fontSize.value = String(newPt);
       this.eventBus.emit('format-char', { fontSize: Math.round(newPt * 100) } as CharProperties);
     });
@@ -398,20 +442,24 @@ export class Toolbar {
 
   /** 문단 정렬 버튼 이벤트 → 커맨드 디스패치 */
   private setupAlignButtons(): void {
-    const aligns: [string, string][] = [
-      ['#btn-align-left', 'format:align-left'],
-      ['#btn-align-center', 'format:align-center'],
-      ['#btn-align-right', 'format:align-right'],
-      ['#btn-align-justify', 'format:align-justify'],
-      ['#btn-align-distribute', 'format:align-distribute'],
-      ['#btn-align-split', 'format:align-split'],
+    const aligns: [string, string, string][] = [
+      ['#btn-align-left', 'left', 'format:align-left'],
+      ['#btn-align-center', 'center', 'format:align-center'],
+      ['#btn-align-right', 'right', 'format:align-right'],
+      ['#btn-align-justify', 'justify', 'format:align-justify'],
+      ['#btn-align-distribute', 'distribute', 'format:align-distribute'],
+      ['#btn-align-split', 'split', 'format:align-split'],
     ];
-    for (const [sel, cmdId] of aligns) {
+    for (const [sel, alignment, cmdId] of aligns) {
       const btn = this.container.querySelector(sel) as HTMLButtonElement;
       if (btn) {
+        this.alignButtons.push({ button: btn, alignment });
         btn.addEventListener('mousedown', (e) => {
           e.preventDefault();
           this.dispatcher.dispatch(cmdId);
+        });
+        btn.addEventListener('click', (event) => {
+          if (event.detail === 0) this.dispatcher.dispatch(cmdId);
         });
       }
     }
@@ -483,33 +531,25 @@ export class Toolbar {
   /** 문서 로드 시 글꼴 드롭다운을 초기화한다 (기본 글꼴 + 문서 글꼴 + 대표/로컬) */
   initFontDropdown(docFonts?: string[]): void {
     this.lastFontFamilies = docFonts ? [...docFonts] : undefined;
-    const BASE_FONTS = ['함초롬바탕', '함초롬돋움', '맑은 고딕', '나눔고딕', '바탕', '돋움', '궁서'];
+    this.fontMenuDocumentFonts = this.normalizeFontNames(docFonts ?? []);
+    this.fontMenuCategory = this.fontMenuDocumentFonts.length > 0 ? 'document' : 'current';
+    this.closeFontMenu();
     this.fontName.replaceChildren();
     for (const name of BASE_FONTS) {
-      const opt = document.createElement('option');
-      opt.value = name;
-      opt.textContent = name;
-      this.fontName.appendChild(opt);
+      this.ensureFontOption(name);
     }
     if (docFonts?.length) {
-      const seen = new Set(BASE_FONTS);
       for (const name of docFonts) {
-        if (!seen.has(name)) {
-          const opt = document.createElement('option');
-          opt.value = name;
-          opt.textContent = name;
-          this.fontName.appendChild(opt);
-          seen.add(name);
-        }
+        this.ensureFontOption(name);
       }
     }
     this.populateFontSetOptions();
-    this.populateLocalFontOptions();
   }
 
   private refreshFontDropdown(): void {
     const previousValue = this.fontName.value;
-    this.initFontDropdown(this.lastFontFamilies);
+    // 재감지는 현재 캐럿의 7개 언어 글꼴이 아니라 문서 전체 글꼴 목록을 유지해야 한다.
+    this.initFontDropdown(this.fontMenuDocumentFonts);
     if (previousValue && this.fontName.querySelector(`option[value="${CSS.escape(previousValue)}"]`)) {
       this.fontName.value = previousValue;
     }
@@ -534,11 +574,21 @@ export class Toolbar {
 
   /** 커서 위치의 문단 속성(줄간격 등)을 도구 모음에 반영한다 */
   private updateParaState(props: ParaProperties): void {
+    for (const { button, alignment } of this.alignButtons) {
+      this.setActive(button, props.alignment === alignment);
+    }
+
     if (props.lineSpacingType === 'Percent' && props.lineSpacing !== undefined) {
       const val = Math.round(props.lineSpacing);
       this.ensureLsOption(val);
       this.lsSelect.value = String(val);
+      return;
     }
+    // 백분율이 아닌 줄 간격(고정 값/최소/여백만 지정)은 이 백분율 목록으로 표현할 수 없다.
+    // 직전 문단의 값을 남겨 두면 두 가지가 함께 깨진다 — 표시가 실제와 어긋나고, 사용자가
+    // 그 표시값과 같은 항목을 고르면 select 의 change 가 발화하지 않아(핸들러가 change 에
+    // 달려 있다) "눌러도 안 먹고 여러 번 눌러야 반영되는" 상태가 된다. 비워서 둘 다 막는다.
+    this.lsSelect.selectedIndex = -1;
   }
 
   /** 커서 위치의 스타일을 드롭다운에 반영한다 */
@@ -579,12 +629,7 @@ export class Toolbar {
     // 글꼴명 — 선택된 언어 카테고리에 따라 표시
     const displayFont = this.getDisplayFontFamily(props);
     if (displayFont) {
-      if (!this.fontName.querySelector(`option[value="${CSS.escape(displayFont)}"]`)) {
-        const opt = document.createElement('option');
-        opt.value = displayFont;
-        opt.textContent = displayFont;
-        this.fontName.appendChild(opt);
-      }
+      this.ensureFontOption(displayFont);
       this.fontName.value = displayFont;
     }
 
@@ -613,6 +658,8 @@ export class Toolbar {
     const opacity = enabled ? '1' : '0.5';
     this.container.style.opacity = opacity;
     this.container.style.pointerEvents = enabled ? 'auto' : 'none';
+    this.container.setAttribute('aria-disabled', String(!enabled));
+    this.container.inert = !enabled;
   }
 
   /** 선택된 언어 카테고리에 해당하는 글꼴명을 반환한다 */
@@ -641,12 +688,7 @@ export class Toolbar {
       }
     }
     if (displayFont) {
-      if (!this.fontName.querySelector(`option[value="${CSS.escape(displayFont)}"]`)) {
-        const opt = document.createElement('option');
-        opt.value = displayFont;
-        opt.textContent = displayFont;
-        this.fontName.appendChild(opt);
-      }
+      this.ensureFontOption(displayFont);
       this.fontName.value = displayFont;
     }
   }
@@ -676,31 +718,187 @@ export class Toolbar {
     this.fontName.insertBefore(group, this.fontName.firstChild);
   }
 
-  /** 로컬 글꼴 optgroup을 #font-name 드롭다운에 추가 */
-  private populateLocalFontOptions(): void {
-    const localFonts = getLocalFonts();
-    if (localFonts.length === 0) return;
+  /** native select에 없는 글꼴은 상태 동기화용 option만 추가한다. */
+  private ensureFontOption(name: string): void {
+    const normalized = name.trim();
+    if (!normalized || Array.from(this.fontName.options).some(option => option.value === normalized)) return;
+    const opt = document.createElement('option');
+    opt.value = normalized;
+    opt.textContent = normalized;
+    this.fontName.appendChild(opt);
+  }
 
-    // 기존 로컬 글꼴 optgroup 제거 (재호출 대비)
-    this.fontName.querySelectorAll('optgroup[label="로컬 글꼴"]').forEach(g => g.remove());
-
-    const group = document.createElement('optgroup');
-    group.label = '로컬 글꼴';
-
-    for (const name of localFonts) {
-      const opt = document.createElement('option');
-      opt.value = name;
-      opt.textContent = name;
-      group.appendChild(opt);
+  private normalizeFontNames(names: readonly string[]): string[] {
+    const seen = new Set<string>();
+    const normalized: string[] = [];
+    for (const candidate of names) {
+      const name = candidate.trim();
+      if (!name || seen.has(name)) continue;
+      seen.add(name);
+      normalized.push(name);
     }
+    return normalized;
+  }
 
-    // 대표 글꼴 optgroup 다음에 삽입
-    const fontSetGroup = this.fontName.querySelector('optgroup[label="대표 글꼴"]');
-    if (fontSetGroup?.nextSibling) {
-      this.fontName.insertBefore(group, fontSetGroup.nextSibling);
+  private toggleFontMenu(): void {
+    if (this.fontMenu) {
+      this.closeFontMenu();
     } else {
-      this.fontName.insertBefore(group, this.fontName.firstChild);
+      this.openFontMenu();
     }
+  }
+
+  /** 한컴처럼 범주를 먼저 고르는 글꼴 메뉴를 연다. */
+  private openFontMenu(): void {
+    if (this.fontMenu) return;
+    const menu = document.createElement('div');
+    menu.className = 'font-picker-menu';
+    menu.setAttribute('role', 'dialog');
+    menu.setAttribute('aria-label', '글꼴 목록');
+
+    const categories = document.createElement('div');
+    categories.className = 'font-picker-categories';
+    categories.setAttribute('role', 'tablist');
+    for (const category of FONT_MENU_CATEGORIES) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'font-picker-category';
+      button.dataset.category = category.id;
+      button.textContent = category.label;
+      button.setAttribute('role', 'tab');
+      button.addEventListener('click', () => {
+        this.fontMenuCategory = category.id;
+        this.renderFontMenu(menu);
+      });
+      categories.appendChild(button);
+    }
+
+    const content = document.createElement('div');
+    content.className = 'font-picker-content';
+    const heading = document.createElement('div');
+    heading.className = 'font-picker-heading';
+    heading.dataset.role = 'heading';
+    const list = document.createElement('div');
+    list.className = 'font-picker-list';
+    list.dataset.role = 'list';
+    list.setAttribute('role', 'listbox');
+    content.append(heading, list);
+    menu.append(categories, content);
+
+    const rect = this.fontName.getBoundingClientRect();
+    menu.style.left = `${Math.max(4, Math.min(rect.left, window.innerWidth - 510))}px`;
+    menu.style.top = `${Math.min(rect.bottom + 2, window.innerHeight - 360)}px`;
+    document.body.appendChild(menu);
+    this.fontMenu = menu;
+    this.fontName.setAttribute('aria-expanded', 'true');
+    this.renderFontMenu(menu);
+
+    const closeOnPointerDown = (event: PointerEvent) => {
+      const target = event.target;
+      if (target instanceof Node && (menu.contains(target) || this.fontName.contains(target))) return;
+      this.closeFontMenu();
+    };
+    const closeOnKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') this.closeFontMenu();
+    };
+    document.addEventListener('pointerdown', closeOnPointerDown, true);
+    window.addEventListener('keydown', closeOnKeyDown, true);
+    window.addEventListener('resize', this.closeFontMenu);
+    this.fontMenuCleanup = () => {
+      document.removeEventListener('pointerdown', closeOnPointerDown, true);
+      window.removeEventListener('keydown', closeOnKeyDown, true);
+      window.removeEventListener('resize', this.closeFontMenu);
+    };
+  }
+
+  private closeFontMenu = (): void => {
+    this.fontMenuCleanup?.();
+    this.fontMenuCleanup = null;
+    this.fontMenu?.remove();
+    this.fontMenu = null;
+    this.fontName.setAttribute('aria-expanded', 'false');
+  };
+
+  private renderFontMenu(menu: HTMLElement): void {
+    const heading = menu.querySelector<HTMLElement>('[data-role="heading"]');
+    const list = menu.querySelector<HTMLElement>('[data-role="list"]');
+    if (!heading || !list) return;
+    const category = FONT_MENU_CATEGORIES.find(item => item.id === this.fontMenuCategory)!;
+    const entries = this.getFontMenuEntries(this.fontMenuCategory);
+    heading.textContent = `${category.label} (${entries.length})`;
+    for (const button of menu.querySelectorAll<HTMLButtonElement>('.font-picker-category')) {
+      const active = button.dataset.category === this.fontMenuCategory;
+      button.classList.toggle('active', active);
+      button.setAttribute('aria-selected', String(active));
+    }
+
+    const fragment = document.createDocumentFragment();
+    if (entries.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'font-picker-empty';
+      empty.textContent = '표시할 글꼴이 없습니다.';
+      fragment.appendChild(empty);
+    } else {
+      for (const entry of entries) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'font-picker-option';
+        button.setAttribute('role', 'option');
+        button.setAttribute('aria-selected', String(entry.value === this.fontName.value));
+        button.textContent = entry.label;
+        button.title = entry.label;
+        button.addEventListener('click', () => this.selectFontMenuEntry(entry.value));
+        fragment.appendChild(button);
+      }
+    }
+    list.replaceChildren(fragment);
+  }
+
+  private getFontMenuEntries(category: FontMenuCategory): FontMenuEntry[] {
+    const current = this.fontName.value && !this.fontName.value.startsWith('__fontset__')
+      ? [{ value: this.fontName.value, label: this.fontName.value }]
+      : [];
+    const documentFonts = this.fontMenuDocumentFonts.map(name => ({ value: name, label: name }));
+    const baseFonts = BASE_FONTS.map(name => ({ value: name, label: name }));
+    const fontSets = userSettings.getAllFontSets().map(fontSet => ({
+      value: `__fontset__${fontSet.name}`,
+      label: `◆ ${fontSet.name}`,
+    }));
+    switch (category) {
+      case 'current':
+        return current;
+      case 'document':
+        return documentFonts;
+      case 'fontSets':
+        return fontSets;
+      case 'system':
+        return getLocalFonts().map(name => ({ value: name, label: name }));
+      case 'all':
+        return this.uniqueFontMenuEntries([
+          ...current,
+          ...documentFonts,
+          ...baseFonts,
+          ...fontSets,
+          ...getLocalFonts().map(name => ({ value: name, label: name })),
+        ]);
+    }
+  }
+
+  private uniqueFontMenuEntries(entries: readonly FontMenuEntry[]): FontMenuEntry[] {
+    const seen = new Set<string>();
+    return entries.filter((entry) => {
+      if (seen.has(entry.value)) return false;
+      seen.add(entry.value);
+      return true;
+    });
+  }
+
+  private selectFontMenuEntry(value: string): void {
+    if (!value) return;
+    this.ensureFontOption(value);
+    this.fontName.value = value;
+    this.fontName.dispatchEvent(new Event('change', { bubbles: true }));
+    this.closeFontMenu();
   }
 
   /** 대표 글꼴 세트 이름으로 FontSet 검색 */

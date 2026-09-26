@@ -1,3 +1,10 @@
+---
+kind: guide
+status: active
+canonical: mydocs/manual/cli_commands.md
+last_verified: 2026-07-16
+---
+
 # rhwp export-png 명령 매뉴얼
 
 ## 개요
@@ -81,11 +88,11 @@ rhwp export-png samples/exam_kor.hwp -p 16
 rhwp export-png samples/exam_kor.hwp -o my_output/
 
 # 한컴 전용 폰트 (HY견명조 등) 가 시스템에 없을 때 ttfs 디렉토리 지정
-rhwp export-png samples/exam_kor.hwp --font-path /home/edward/mygithub/ttfs
+rhwp export-png samples/exam_kor.hwp --font-path ./local-fonts
 
 # 여러 폰트 디렉토리 지정
 rhwp export-png samples/exam_kor.hwp \
-  --font-path /home/edward/mygithub/ttfs \
+  --font-path ./local-fonts \
   --font-path /usr/share/fonts/truetype/nanum
 
 # 고해상도 (2배 배율, 인쇄용)
@@ -113,7 +120,7 @@ rhwp export-png samples/exam_kor.hwp --vlm-target llava
 # AI 파이프라인 통합 (Claude + 한컴 폰트)
 rhwp export-png samples/exam_kor.hwp \
   --vlm-target claude \
-  --font-path /home/edward/mygithub/ttfs \
+  --font-path ./local-fonts \
   -o output/claude_input/
 
 # 인쇄용 300 DPI (auto-scale 3.125)
@@ -159,7 +166,8 @@ VLM 프리셋 영역 영역 dimension 영역 영역 페이지 native 비율 + �
 
 `--font-path` 로 지정한 디렉토리의 모든 TTF/OTF/TTC 파일을 메모리에 로드. CharShape.font_family (예: "HY견명조") 와 일치하는 typeface 가 있으면 우선 사용.
 
-본 환경 권장 경로: `/home/edward/mygithub/ttfs` (한컴 전용 폰트 다수 보유)
+예시 경로 `./local-fonts`는 사용자가 합법적으로 보유한 로컬 폰트 디렉터리로 바꾼다. 폰트 파일의
+라이선스와 재배포 가능 여부는 별도로 확인한다.
 
 ### 2. 시스템 FontMgr — 한글 fallback chain
 
@@ -217,8 +225,14 @@ cargo build --features native-skia
 cargo build --release --features native-skia
 
 # native-skia 테스트
-cargo test --features native-skia skia --lib
+cargo test --features native-skia --lib
+
+# 동시성을 조정해야 할 때만 test harness 인자로 전달한다.
+cargo test --features native-skia --lib -- --test-threads <현재_환경에_맞는_값>
 ```
+
+`native-skia`만 Cargo feature다. `skia`를 feature 뒤에 쓰면 이름 filter가 되어 전체 lib 회귀 대신
+`skia`가 포함된 테스트만 실행한다.
 
 ## 비목표 (현재 단계)
 

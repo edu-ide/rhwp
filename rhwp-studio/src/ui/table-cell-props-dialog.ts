@@ -4,6 +4,7 @@ import type { WasmBridge } from '@/core/wasm-bridge';
 import type { CellProperties, TableProperties } from '@/core/types';
 import type { EventBus } from '@/core/event-bus';
 import type { RhwpRealtimeOperationDraft } from '@/engine/realtime-operation';
+import type { CommandServices } from '@/command/types';
 
 const HWPUNIT_PER_MM = 7200 / 25.4;
 
@@ -128,6 +129,8 @@ export class TableCellPropsDialog extends ModalDialog {
   // 현재 속성값 캐시
   private cellProps!: CellProperties;
   private tableProps!: TableProperties;
+  /** undo 기록 라우팅용 (없으면 wasm 직접 호출 fallback). */
+  private services: CommandServices | undefined;
 
   constructor(
     wasm: WasmBridge,
@@ -135,6 +138,7 @@ export class TableCellPropsDialog extends ModalDialog {
     tableCtx: { sec: number; ppi: number; ci: number },
     cellIdx: number,
     mode: 'table' | 'cell' = 'cell',
+    services?: CommandServices,
   ) {
     super('표/셀 속성', 480);
     this.wasm = wasm;
@@ -142,6 +146,7 @@ export class TableCellPropsDialog extends ModalDialog {
     this.tableCtx = tableCtx;
     this.cellIdx = cellIdx;
     this.mode = mode;
+    this.services = services;
   }
 
   show(): void {
@@ -1077,6 +1082,20 @@ export class TableCellPropsDialog extends ModalDialog {
         this.borderEdits[i] = { type: b.type, width: b.width, color: b.color };
       }
     }
+    // 굵기/색/선종류 컨트롤을 대표 테두리(왼쪽)로 동기화한다. 이 컨트롤들은
+    // applyBorderToDirection()이 '현재 값'으로 그대로 읽어 wasm.set*Properties에
+    // 전달하므로, 미리보기만 문서 값을 반영하고 컨트롤은 하드코딩 기본값(0.1mm/검정/실선)에
+    // 머무르면 방향 버튼 재적용 시 기존 서식이 조용히 유실된다 (#2908).
+    const rep = this.borderEdits[0];
+    if (rep) {
+      this.borderSelectedLineType = rep.type;
+      this.borderWidthSelect.value = String(rep.width);
+      this.borderColorInput.value = rep.color;
+      this.borderLineTypeGrid.querySelectorAll('.tcp-line-type-item').forEach((el, idx) => {
+        const lineTypeDefs = [0, 1, 2, 3, 4, 5, 6, 8];
+        el.classList.toggle('active', lineTypeDefs[idx] === rep.type);
+      });
+    }
     this.updateBorderPreview();
   }
 
@@ -1204,8 +1223,8 @@ export class TableCellPropsDialog extends ModalDialog {
     if (props.fillType === 'solid' && props.fillColor) {
       this.bgColorRadio.checked = true;
       this.bgColorPicker.value = props.fillColor;
-      if (props.patternColor) this.bgPatternColorPicker.value = props.patternColor;
-      if (props.patternType != null) this.bgPatternTypeSelect.value = String(props.patternType);
+      this.bgPatternColorPicker.value = props.patternColor ?? '#000000';
+      this.bgPatternTypeSelect.value = props.patternType != null ? String(props.patternType) : '0';
     } else {
       this.bgNoneRadio.checked = true;
     }
@@ -1376,17 +1395,6 @@ export class TableCellPropsDialog extends ModalDialog {
       }
     }
 
-    this.wasm.setCellProperties(sec, ppi, ci, this.cellIdx, newCellProps as Partial<CellProperties>);
-    this.onRealtimeOperation?.({
-      kind: 'setCellProperties',
-      position: { sectionIndex: sec, paragraphIndex: ppi, charOffset: 0 },
-      sec,
-      ppi,
-      ci,
-      cellIndex: this.cellIdx,
-      cellProps: newCellProps as Partial<CellProperties>,
-    });
-
     // 표 속성 수정
     const pbValue = parseInt(this.tablePageBreakSelect.value, 10);
     const newTableProps: Record<string, unknown> = {
@@ -1445,17 +1453,33 @@ export class TableCellPropsDialog extends ModalDialog {
       }
     }
 
-    this.wasm.setTableProperties(sec, ppi, ci, newTableProps as Partial<TableProperties>);
-    this.onRealtimeOperation?.({
-      kind: 'setTableProperties',
-      position: { sectionIndex: sec, paragraphIndex: ppi, charOffset: 0 },
-      sec,
-      ppi,
-      ci,
-      tableProps: newTableProps as Partial<TableProperties>,
-    });
-
-    this.eventBus.emit('document-changed');
+    let committed = false;
+    const applyProps = () => {
+      this.wasm.setCellProperties(sec, ppi, ci, this.cellIdx, newCellProps as Partial<CellProperties>);
+      this.wasm.setTableProperties(sec, ppi, ci, newTableProps as Partial<TableProperties>);
+      committed = true;
+    };
+    // 표/셀 속성 변경도 undo 대상이다 — 편집 라우터를 통과시켜 스냅샷으로
+    // 기록한다 (#1320 계약, picture-props-dialog(#2027)와 동일 패턴).
+    // services 미주입 환경에서만 직접 적용 fallback.
+    const ih = this.services?.getInputHandler();
+    if (ih) {
+      ih.executeOperation({
+        kind: 'snapshot',
+        operationType: 'objectProps',
+        operation: () => {
+          applyProps();
+          return ih.getCursorPosition();
+        },
+      });
+    } else {
+      applyProps();
+      this.eventBus.emit('document-changed');
+    }
+    if (committed) {
+      this.onRealtimeOperation?.({ kind: 'setCellProperties', position: { sectionIndex: sec, paragraphIndex: ppi, charOffset: 0 }, sec, ppi, ci, cellIndex: this.cellIdx, cellProps: newCellProps as Partial<CellProperties> });
+      this.onRealtimeOperation?.({ kind: 'setTableProperties', position: { sectionIndex: sec, paragraphIndex: ppi, charOffset: 0 }, sec, ppi, ci, tableProps: newTableProps as Partial<TableProperties> });
+    }
   }
 
   // ─── "모두(A)" 일괄 여백 스피너 ─────────────────────
@@ -1523,6 +1547,18 @@ export class TableCellPropsDialog extends ModalDialog {
     inp.className = 'dialog-input';
     inp.step = '0.1';
     inp.min = '0';
+    // HTML min 속성은 .value 를 자동으로 clamp 하지 않는다(브라우저는 checkValidity()에서만
+    // 검사) — 음수·비정상 값이 그대로 parseFloat 되어 wasm.setCellProperties/setTableProperties
+    // 로 전달되는 것을 막는다. (#2838 번호매기기 시작 번호 clamp 누락과 동일 패턴)
+    inp.addEventListener('change', () => {
+      if (inp.value === '') return;
+      const min = inp.min !== '' ? parseFloat(inp.min) : -Infinity;
+      const max = inp.max !== '' ? parseFloat(inp.max) : Infinity;
+      const v = parseFloat(inp.value);
+      if (!Number.isFinite(v)) return;
+      const clamped = Math.min(max, Math.max(min, v));
+      if (clamped !== v) inp.value = String(clamped);
+    });
     return inp;
   }
 

@@ -11,8 +11,53 @@ export interface PrintPage {
   className: string;
 }
 
+export type PrintIntent = 'print' | 'pdf';
+
+export const PDF_PRINT_GUIDANCE =
+  '브라우저 인쇄 창에서 ‘대상 → PDF로 저장’을 선택합니다.';
+
+export function pdfPrintTitle(fileName: string): string {
+  const baseName = fileName.trim().replace(/\.(hwp|hwpx|hml)$/i, '').trim();
+  return baseName || '문서';
+}
+
+export function printProgressText(
+  intent: PrintIntent,
+  currentPage: number,
+  pageCount: number,
+): string {
+  const label = intent === 'pdf' ? 'PDF 준비 중…' : '인쇄 준비 중…';
+  return `${label} (${currentPage}/${pageCount})`;
+}
+
+export function printReadyText(intent: PrintIntent): string {
+  return intent === 'pdf'
+    ? `PDF 준비 완료 — ${PDF_PRINT_GUIDANCE}`
+    : '인쇄 미리보기 준비 완료';
+}
+
+// 표준 판형의 변 길이(mm): A3~A5 · JIS B4/B5 · Letter · Legal · Tabloid.
+// HWP 파일은 길이를 정수 HWPUNIT(1/7200인치)으로 저장하므로 A4 297mm 가
+// 84188 유닛(=296.9966mm)이 되고, get_page_info_native 의 소수 1자리 px
+// 직렬화가 더 깎아 환산 결과가 296.995mm 로 나온다. 산술로는 "297" 을
+// 복원할 수 없어 인쇄 mm 경계에서 표준 치수로 스냅해 판형 정체성을 되살린다.
+const STANDARD_PAPER_DIMENSIONS_MM = [
+  148, 182, 210, 215.9, 257, 279.4, 297, 355.6, 364, 420, 431.8,
+];
+
+// 유닛 양자화(≤0.004mm)와 wire 의 소수 1자리 px 절단(≤0.014mm)만 흡수하는
+// 크기. 사용자가 입력할 수 있는 비표준 크기(0.1mm 단위)는 건드리지 않는다.
+const PAPER_SNAP_TOLERANCE_MM = 0.05;
+
+export function snapToStandardPaperMm(mm: number): number {
+  for (const standard of STANDARD_PAPER_DIMENSIONS_MM) {
+    if (Math.abs(mm - standard) <= PAPER_SNAP_TOLERANCE_MM) return standard;
+  }
+  return mm;
+}
+
 export function pxToPrintMm(px: number): number {
-  return Math.round((px * 25.4 / 96) * 1000) / 1000;
+  return snapToStandardPaperMm(Math.round((px * 25.4 / 96) * 1000) / 1000);
 }
 
 function formatMm(mm: number): string {
@@ -101,12 +146,45 @@ ${pageSizeRules}
 @media screen {
   body { background: #e5e7eb; display: flex; flex-direction: column; align-items: center; gap: 16px; padding: 16px; }
   .page { background: #fff; box-shadow: 0 2px 8px rgba(0,0,0,0.15); }
-  .print-bar { position: fixed; top: 0; left: 0; right: 0; background: #1e293b; color: #fff; padding: 8px 16px; display: flex; align-items: center; gap: 12px; font: 14px sans-serif; z-index: 100; }
-  .print-bar button { padding: 6px 16px; background: #2563eb; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-size: 14px; }
-  .print-bar button:hover { background: #1d4ed8; }
-  body { padding-top: 56px; }
+  body.rhwp-print-preview { padding-top: 72px; }
+  .print-preview-bar {
+    position: fixed;
+    inset: 0 0 auto 0;
+    z-index: 100;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-height: 48px;
+    padding: 8px 16px;
+    background: #1e293b;
+    color: #f8fafc;
+    box-shadow: 0 2px 8px rgba(15,23,42,0.28);
+    font: 14px/1.4 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  .print-preview-bar button {
+    min-width: 72px;
+    height: 32px;
+    padding: 0 14px;
+    border: 1px solid #64748b;
+    border-radius: 5px;
+    background: #475569;
+    color: #fff;
+    cursor: pointer;
+    font: inherit;
+  }
+  .print-preview-bar button:hover { background: #64748b; }
+  .print-preview-bar button:focus-visible { outline: 2px solid #93c5fd; outline-offset: 2px; }
+  .print-preview-bar .print-preview-primary { background: #2563eb; border-color: #60a5fa; }
+  .print-preview-bar .print-preview-primary:hover { background: #1d4ed8; }
+  .print-preview-title {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: #e2e8f0;
+  }
 }
-@media print { .print-bar { display: none; } }
+@media print { .print-preview-bar { display: none !important; } }
 `;
 }
 

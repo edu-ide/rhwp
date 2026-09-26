@@ -464,11 +464,11 @@ fn issue_1274_2022_nov_page11_partial_endnote_tail_stays_in_page_frame() {
     let page11 = doc.dump_page_items(Some(10));
     let page12 = doc.dump_page_items(Some(11));
     assert!(
-        page11.contains("PartialParagraph  pi=553  lines=0..8"),
+        page11.contains("PartialParagraph[미주]  pi=553  lines=0..8"),
         "한컴/PDF 기준 문14) 꼬리 첫 조각은 11쪽 끝에 남아야 함\n{page11}"
     );
     assert!(
-        page12.contains("PartialParagraph  pi=553  lines=8..11"),
+        page12.contains("PartialParagraph[미주]  pi=553  lines=8..11"),
         "문14) 꼬리 나머지는 12쪽 첫머리에서 이어져야 함\n{page12}"
     );
 
@@ -1064,9 +1064,7 @@ fn issue_1293_clean_visual_sweep_targets_keep_page_counts_and_shape_profiles() {
         );
 
         let shape = &doc.document().sections[0].section_def.endnote_shape;
-        let visible_separator = shape.separator_length != 0
-            || shape.separator_line_type != 0
-            || shape.separator_line_width != 0;
+        let visible_separator = shape.separator_line_type != 0 && shape.separator_line_width != 0;
         assert_eq!(
             visible_separator, target.visible_separator,
             "{} 구분선 표시 여부가 sweep 기준과 달라지면 안 됨",
@@ -1127,7 +1125,7 @@ fn issue_1139_exam_2022_page_count_matches_hancom_after_endnotes() {
     let page9 = doc.dump_page_items(Some(8));
     let page10 = doc.dump_page_items(Some(9));
     assert!(
-        page9.contains("PartialParagraph  pi=522  lines=0..4"),
+        page9.contains("PartialParagraph[미주]  pi=522  lines=0..4"),
         "9쪽에는 문7 미주 마지막 문단의 앞부분 pi=522 lines=0..4가 남아야 함\n{page9}"
     );
     assert!(
@@ -1139,7 +1137,7 @@ fn issue_1139_exam_2022_page_count_matches_hancom_after_endnotes() {
         "한컴오피스 기준 문8 미주 pi=523은 9쪽에 들어가면 안 됨\n{page9}"
     );
     assert!(
-        page10.contains("PartialParagraph  pi=522  lines=4..5"),
+        page10.contains("PartialParagraph[미주]  pi=522  lines=4..5"),
         "한컴오피스 기준 문7 미주 마지막 수식 줄은 10쪽 첫 줄로 넘어가야 함\n{page10}"
     );
     assert!(
@@ -1189,8 +1187,8 @@ fn issue_1139_page17_endnote_question30_starts_on_right_column() {
         "문30 앞부분(pi=928..930)이 18쪽으로 이월되면 17쪽 하단 배치가 한컴 기준보다 일찍 끊김\n{page18}"
     );
     assert!(
-        page17.contains("PartialParagraph  pi=931  lines=0..4")
-            && page18.contains("PartialParagraph  pi=931  lines=4..9")
+        page17.contains("PartialParagraph[미주]  pi=931  lines=0..4")
+            && page18.contains("PartialParagraph[미주]  pi=931  lines=4..9")
             && !page17.contains("FullParagraph[미주]  pi=931")
             && !page18.contains("FullParagraph[미주]  pi=931"),
         "문30 본문은 17/18쪽에서 줄 단위로 이어져야 함\n{page17}\n{page18}"
@@ -1417,7 +1415,7 @@ fn issue_1139_page19_question29_starts_on_right_column() {
     let page20 = doc.dump_page_items(Some(19));
 
     assert!(
-        page19.contains("PartialParagraph  pi=992  lines=1..3"),
+        page19.contains("PartialParagraph[미주]  pi=992  lines=1..3"),
         "한컴오피스 기준 pi=992의 reset 이후 줄은 19쪽 우측 단으로 이어져야 함\n{page19}"
     );
     assert!(
@@ -1489,15 +1487,15 @@ fn issue_1139_page22_question29_intro_moves_to_previous_page() {
         "문29 제목/출제의도가 22쪽 첫머리에 남으면 22쪽 렌더링이 한컴보다 늦게 시작함\n{page22}"
     );
     assert!(
-        page22.contains("Shape          pi=1131 ci=0  그림 tac=true"),
+        page22.contains("Shape[미주]          pi=1131 ci=0  그림 tac=true"),
         "한컴오피스 기준 22쪽은 문29의 큰 구 그림(pi=1131)부터 시작해야 함\n{page22}"
     );
     assert!(
-        page22.contains("Table          pi=1169 ci=0"),
+        page22.contains("Table[미주]          pi=1169 ci=0"),
         "한컴오피스 기준 문30 그래프 표(pi=1169)는 22쪽 우측 단에 렌더되어야 함\n{page22}"
     );
     assert!(
-        page22.contains("PartialParagraph  pi=1175  lines=0..10"),
+        page22.contains("PartialParagraph[미주]  pi=1175  lines=0..10"),
         "PDF 기준 22쪽 끝에는 문30 (i) 풀이의 마지막 텍스트 줄까지 남아야 함\n{page22}"
     );
 
@@ -1517,7 +1515,7 @@ fn issue_1139_page23_question30_picture_line_is_rendered() {
 
     let page23 = doc.dump_page_items(Some(22));
     assert!(
-        page23.contains("PartialParagraph  pi=1175  lines=10..13"),
+        page23.contains("PartialParagraph[미주]  pi=1175  lines=10..13"),
         "PDF 기준 23쪽은 문30 (ii) 그림 줄부터 시작해야 함\n{page23}"
     );
 
@@ -1676,7 +1674,7 @@ fn issue_1139_2023_pages12_13_endnote_boundary_matches_pdf() {
     assert!(
         page12.contains("FullParagraph[미주]  pi=635")
             && page12.contains("FullParagraph[미주]  pi=636")
-            && !page12.contains("Shape          pi=637 ci=0"),
+            && !page12.contains("Shape[미주]          pi=637 ci=0"),
         "PDF 기준 문14 tail(pi=635/636)은 12쪽에 남고 그래프(pi=637)는 13쪽에서 시작해야 함\n{page12}"
     );
     assert!(
@@ -1686,7 +1684,7 @@ fn issue_1139_2023_pages12_13_endnote_boundary_matches_pdf() {
     );
 
     let graph = page13
-        .find("Shape          pi=637 ci=0  그림 tac=true")
+        .find("Shape[미주]          pi=637 ci=0  그림 tac=true")
         .expect("page 13 starts with question 14 graph");
     let q15_title = page13
         .find("FullParagraph[미주]  pi=638")
@@ -1704,11 +1702,11 @@ fn issue_1189_2023_page19_question29_tail_matches_pdf() {
 
     let page19 = doc.dump_page_items(Some(18));
     assert!(
-        page19.contains("PartialParagraph  pi=935  lines=0..2")
-            && page19.contains("PartialParagraph  pi=935  lines=2..3")
+        page19.contains("PartialParagraph[미주]  pi=935  lines=0..2")
+            && page19.contains("PartialParagraph[미주]  pi=935  lines=2..3")
             && page19.contains("FullParagraph[미주]  pi=946")
             && page19.contains("FullParagraph[미주]  pi=952")
-            && page19.contains("PartialParagraph  pi=953  lines=0..1"),
+            && page19.contains("PartialParagraph[미주]  pi=953  lines=0..1"),
         "PDF 기준 19쪽 우측 단에는 문29 제목, 첫 그림, 그림 아래 첫 문단이 함께 남고, 앞쪽 pi=935 분배는 기존 위치를 유지해야 함\n{page19}"
     );
 
@@ -1743,16 +1741,16 @@ fn issue_1189_2022_nov_page17_internal_rewind_keeps_formula_tail_on_next_page() 
         page14.contains("FullParagraph[미주]  pi=632")
             && page14.contains("FullParagraph[미주]  pi=650")
             && page14.contains("FullParagraph[미주]  pi=669")
-            && page14.contains("PartialParagraph  pi=671  lines=0..2"),
+            && page14.contains("PartialParagraph[미주]  pi=671  lines=0..2"),
         "PDF 기준 14쪽은 문22~문27 시작 흐름이 같은 페이지에 유지되어야 함\n{page14}"
     );
     assert!(
-        page16.contains("PartialParagraph  pi=786  lines=0..1")
-            && !page16.contains("PartialParagraph  pi=786  lines=0..2"),
+        page16.contains("PartialParagraph[미주]  pi=786  lines=0..1")
+            && !page16.contains("PartialParagraph[미주]  pi=786  lines=0..2"),
         "한컴/PDF 기준 16쪽 하단에는 문26 수식 문단의 첫 줄만 남아야 함\n{page16}"
     );
     assert!(
-        page17.contains("PartialParagraph  pi=786  lines=1..5")
+        page17.contains("PartialParagraph[미주]  pi=786  lines=1..5")
             && page17.contains("FullParagraph[미주]  pi=787")
             && page17.contains("FullParagraph[미주]  pi=801"),
         "한컴/PDF 기준 17쪽은 문26 수식 나머지 줄 뒤에 문27/문28이 이어져야 함\n{page17}"
@@ -2169,12 +2167,20 @@ fn issue_1284_2023_sep_page20_question30_title_stays_in_left_tail() {
     let q30_continuation = page20
         .find("FullParagraph[미주]  pi=976")
         .expect("page 20 question 30 right-column continuation");
+    // [#6544] 한글 2024 오라클 재측정으로 기대값을 정정한다.
+    //
+    // 종전 기대("식 줄은 오른쪽 단")는 위험 휴리스틱이 저장 사다리를 뚫던 시절의 동작을
+    // 고정한 것이고 한컴 PDF 와 어긋난다. 저장 사다리의 단 경계 신호(vpos 되감김)는
+    // pi=976 에서 나고(1213345 -> 1209109), 이 쪽 저장 회계도 단 0 `diff = -0.0px` 다.
+    //
+    // 한글 2024 PDF p20: `9b PQ=4a AB …… ㉠` 이 **왼쪽 단 하단** y=810.0pt 에 있고,
+    // 오른쪽 단은 `, 이므로 ㉠에서` y=68.1pt 로 시작한다.
     assert!(
         q30_title < page20_col1
             && q30_intro < page20_col1
-            && q30_equation > page20_col1
+            && q30_equation < page20_col1
             && q30_continuation > page20_col1,
-        "현재 sweep 기준 문30은 page 20 왼쪽 단 하단에 제목과 첫 풀이 2줄을 남기고 오른쪽 단 수식으로 이어져야 함\n{page20}"
+        "문30 은 page 20 왼쪽 단 하단에 제목·풀이·식까지 남기고 오른쪽 단으로 이어져야 함 (한글 2024 오라클)\n{page20}"
     );
 
     let tree = doc.build_page_render_tree(19).expect("page 20 render tree");
@@ -2200,8 +2206,8 @@ fn issue_1284_2023_sep_page20_question30_title_stays_in_left_tail() {
         q30_condition_bbox
     );
     assert!(
-        q30_equation_bbox.x > 390.0 && (84.0..=110.0).contains(&q30_equation_bbox.y),
-        "문30 식 줄은 현재 sweep처럼 오른쪽 단 상단에서 이어져야 함: {:?}",
+        q30_equation_bbox.x < 80.0 && (1068.0..=1090.0).contains(&q30_equation_bbox.y),
+        "문30 식 줄은 한글 2024 처럼 왼쪽 단 하단(약 y=1080px = 810.0pt)에 남아야 함: {:?}",
         q30_equation_bbox
     );
     assert!(
@@ -2260,12 +2266,12 @@ fn issue_1284_2024_between20_page18_late_question_titles_match_pdf() {
     let page17 = doc.dump_page_items(Some(16));
     let page18 = doc.dump_page_items(Some(17));
     assert!(
-        page17.contains("PartialParagraph  pi=894  lines=0..4")
+        page17.contains("PartialParagraph[미주]  pi=894  lines=0..4")
             && !page17.contains("FullParagraph[미주]  pi=894"),
         "PDF 기준 page17 오른쪽 단 하단에는 문28 (ⅰ) 풀이의 마지막 줄 직전까지 남아야 함\n{page17}"
     );
     assert!(
-        page18.contains("PartialParagraph  pi=894  lines=4..5")
+        page18.contains("PartialParagraph[미주]  pi=894  lines=4..5")
             && !page18.contains("FullParagraph[미주]  pi=894"),
         "PDF 기준 page18 왼쪽 단은 문28 (ⅰ) 풀이 마지막 줄부터 시작해야 함\n{page18}"
     );
@@ -2367,7 +2373,7 @@ fn issue_1293_2024_zero_endnote_spacing_page19_tail_moves_to_page20() {
     assert!(
         page19.contains("FullParagraph[미주]  pi=909")
             && page19.contains("FullParagraph[미주]  pi=955")
-            && page19.contains("PartialParagraph  pi=960  lines=0..3"),
+            && page19.contains("PartialParagraph[미주]  pi=960  lines=0..3"),
         "PDF 기준 page 19는 문25 tail pi=909에서 시작해 문29 pi=960 앞 3줄까지 이어져야 함\n{page19}"
     );
     assert!(
@@ -2376,7 +2382,7 @@ fn issue_1293_2024_zero_endnote_spacing_page19_tail_moves_to_page20() {
     );
 
     let p20_tail = page20
-        .find("PartialParagraph  pi=960  lines=3..4")
+        .find("PartialParagraph[미주]  pi=960  lines=3..4")
         .expect("page 20 starts with 문29 final text tail");
     let p20_formula = page20
         .find("FullParagraph[미주]  pi=961")
@@ -2577,7 +2583,7 @@ fn issue_1293_2024_visible_separator_shape987_page17_rewind_para_stays_whole() {
         .expect("page 17 문28 제목");
 
     assert!(
-        !page17.contains("PartialParagraph  pi=786"),
+        !page17.contains("PartialParagraph[미주]  pi=786"),
         "새 쪽 왼쪽 단 상단에 들어온 문26 rewind 문단(pi=786)을 다시 2/3줄로 쪼개면 page 수가 22쪽으로 밀림\n{page17}"
     );
     assert!(
@@ -2691,7 +2697,7 @@ fn issue_1293_2024_no_separator_20mm_page11_question12_tail_stays_in_frame() {
         .find("FullParagraph[미주]  pi=526")
         .expect("page 11 문12 제목");
     let q12_graph = page11
-        .find("Shape          pi=537")
+        .find("Shape[미주]          pi=537")
         .expect("page 11 문12 그래프");
     let q12_tail = page11
         .find("FullParagraph[미주]  pi=538")
@@ -3136,13 +3142,18 @@ fn issue_1274_2022_oct_page11_question20_equation_tail_keeps_pdf_bleed() {
     let equation_bottom =
         max_equation_visual_bottom_in_region(&tree.root, 395.0, 700.0, 1020.0, 1100.0)
             .expect("문20 하단 수식");
+    // [#6544] 한글 2024 오라클 재측정으로 기대값을 정정한다.
+    //
+    // 종전 하한(>= 1118.0px = 838.5pt)은 단 하단 819.21pt 를 **20.3pt 넘는 bleed** 를
+    // 요구했다. 한컴 PDF 는 그 bleed 를 만들지 않는다 — 오른쪽 단 마지막 잉크 하단이
+    // 818.3pt(= 1091.1px)로 단 **안**에서 끝난다(rhwp 종전 839.5pt).
     assert!(
-        equation_bottom <= 1124.0,
-        "문20 하단 수식-only tail은 현재 sweep 기준 허용 bleed 안에 남아야 함: bottom={equation_bottom}"
+        equation_bottom <= 1100.0,
+        "문20 하단 수식 tail 은 단 하단(1092.3px) 언저리에서 끝나야 함: bottom={equation_bottom}"
     );
     assert!(
-        equation_bottom >= 1118.0,
-        "문20 수식 tail을 과도하게 끌어올리면 현재 sweep의 하단 잔여 흐름과 달라짐: bottom={equation_bottom}"
+        equation_bottom >= 1088.0,
+        "문20 수식 tail 을 과도하게 끌어올리면 한글(1091.1px)보다 위로 간다: bottom={equation_bottom}"
     );
 }
 
@@ -3318,9 +3329,14 @@ fn issue_1274_2022_oct_page16_question30_title_tail_continues_next_column() {
         (1060.0..=1085.0).contains(&title.y),
         "문30 제목은 한컴/PDF처럼 16쪽 하단에 남아야 함: title={title:?}"
     );
+    // [#6544] 한글 2024 오라클 재측정으로 기대값을 정정한다.
+    //
+    // 한컴 PDF p16 은 `함수 …의 한 부정적분을 …라 하자.` 를 **왼쪽 단** y=809.7pt 에
+    // 두고, 오른쪽 단은 `조건 (가)에서` y=68.0pt 로 시작한다. 종전 기대(첫 본문 줄이
+    // 다음 단 상단)는 휴리스틱이 저장 사다리를 뚫던 시절의 동작이다.
     assert!(
-        first_line.x > 390.0 && (84.0..=104.0).contains(&first_line.y),
-        "문30 첫 본문 줄은 현재 sweep 기준 다음 단 상단에서 이어져야 함: title={title:?}, first_line={first_line:?}"
+        first_line.x < 80.0 && (1078.0..=1094.0).contains(&first_line.y),
+        "문30 첫 본문 줄은 한글 2024 처럼 제목 바로 아래 왼쪽 단에서 이어져야 함: title={title:?}, first_line={first_line:?}"
     );
 }
 
@@ -3345,13 +3361,13 @@ fn issue_1189_2022_nov_pages10_12_rewind_tail_and_equation_scale_match_pdf() {
         "10쪽 문6 꼬리 수식은 본문 하단을 넘겨 문단끼리 겹치면 안 됨: bottom={question6_tail_bottom}"
     );
     assert!(
-        page11.contains("PartialParagraph  pi=553  lines=0..8")
+        page11.contains("PartialParagraph[미주]  pi=553  lines=0..8")
             && !page11.contains("FullParagraph[미주]  pi=553"),
         "문14 tail은 11쪽에서 내부 vpos 리셋 직전까지만 렌더되어야 함\n{page11}"
     );
     assert!(
-        page12.contains("PartialParagraph  pi=553  lines=8..11")
-            && page12.contains("Shape          pi=554 ci=0  그림 tac=true")
+        page12.contains("PartialParagraph[미주]  pi=553  lines=8..11")
+            && page12.contains("Shape[미주]          pi=554 ci=0  그림 tac=true")
             && page12.contains("FullParagraph[미주]  pi=555"),
         "12쪽은 문14 tail 텍스트 뒤 그래프와 문15가 이어져야 함\n{page12}"
     );
@@ -3678,5 +3694,22 @@ fn issue_1139_endnote_equation_exposes_note_ref_and_properties() {
         props["hasCaption"].as_bool(),
         Some(false),
         "캡션이 없는 수식은 수식 속성 여백/캡션 탭에서 위치 없음으로 표시되어야 함: {props}"
+    );
+}
+
+#[test]
+fn issue_1139_2024_hwpx_page9_endnote_title_moves_with_first_payload_line() {
+    let bytes = std::fs::read("samples/3-09월_교육_통합_2022.hwpx").expect("sample");
+    let doc = HwpDocument::from_bytes(&bytes).expect("parse");
+    let page9 = doc.dump_page_items(Some(8));
+    let page10 = doc.dump_page_items(Some(9));
+
+    assert!(
+        !page9.contains("pi=523"),
+        "문8 제목만 9쪽 오른쪽 단 하단에 남기면 한컴 2024 PDF와 달라짐\n{page9}"
+    );
+    assert!(
+        page10.contains("pi=523"),
+        "문8은 첫 payload 줄과 함께 10쪽에서 시작해야 함\n{page10}"
     );
 }

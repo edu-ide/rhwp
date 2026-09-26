@@ -13,6 +13,8 @@ taeho <92752011+xogh3198@users.noreply.github.com> thlee2 <thlee2>
 # @planet6897 (Jaeuk Ryu) — 일부 커밋이 "Jaeook Ryu <jaeook.ryu@gmail.com>" 로
 # 기록됨(#1248/#1256/#1257/#1258 미주 trailing 조사). 동일인 통합.
 Jaeuk Ryu <35355437+planet6897@users.noreply.github.com> Jaeook Ryu <jaeook.ryu@gmail.com>
+Jaeuk Ryu <35355437+planet6897@users.noreply.github.com> jaeook.ryu <jaeook.ryu@gmail.com>
+Jaeuk Ryu <35355437+planet6897@users.noreply.github.com> jaeook.ryu <cubeiworks.ai@gmail.com>
 
 # @twoLoop-40 — PR #1226 (수식 LEFT-RIGHT 첨자 결합). 커밋이 "joonho <jh.lee@spira-t.com>" 로 기록됨.
 twoLoop-40 <72702492+twoLoop-40@users.noreply.github.com> joonho <jh.lee@spira-t.com>
@@ -28,6 +30,7 @@ humdrum00001010 <24985201+humdrum00001010@users.noreply.github.com> humdrum00001
 # ── 동일인 표시 통합 (GitHub 계정 기준 정규화; 별개 인물 아님) ──
 # @jangster77 (Taesup Jang)
 jangster77 <76559226+jangster77@users.noreply.github.com> Taesup Jang <tsjang@gmail.com>
+jangster77 <76559226+jangster77@users.noreply.github.com> TaesupJang <tsjang@enterit.co.kr>
 # @postmelee — 커밋이 "postmelee" / "Taegyu Lee" 두 이름(meleeisdeveloping)으로 기록됨.
 postmelee <65849802+postmelee@users.noreply.github.com> postmelee <meleeisdeveloping@gmail.com>
 postmelee <65849802+postmelee@users.noreply.github.com> Taegyu Lee <meleeisdeveloping@gmail.com>
@@ -53,3 +56,14 @@ wonbbnote <102503017+wonbbnote@users.noreply.github.com> wonbbnote <wonbb3313@gm
 edwardkim <tangokorea@gmail.com> edward <tangokorea@gmail.com>
 edwardkim <tangokorea@gmail.com> edward kim <tangokorea@gmail.com>
 edwardkim <tangokorea@gmail.com> edward.kim <edward.kim@minervasoft.co.kr>
+
+# ── oleg-sung: 오타 표기(Sungyrovsky) + 이메일 2종 통합 ──
+Oleg Sungurovsky <safasgasc.asfg@gmail.com> Oleg Sungyrovsky <andreisungurovsky@yandex.ru>
+Oleg Sungurovsky <safasgasc.asfg@gmail.com> Oleg Sungurovsky <andreisungurovsky@yandex.ru>
+
+# ── v0.7.19 신규 기여자 (CHANGELOG 기준) ──
+# @cskwork — HML open/semantics-preserving save (#2219), MessageChannel embed (#2187)
+cskwork <76669236+cskwork@users.noreply.github.com> cskwork <csk917work@gmail.com>
+cskwork <76669236+cskwork@users.noreply.github.com> donga-csk <76669236+cskwork@users.noreply.github.com>
+# @lpaiu-cs (Juneyoung Kim) — undo/redo migration 연작
+lpaiu-cs <lpaiu.cs@gmail.com> 김준영 (Juneyoung, Kim) <lpaiu.cs@gmail.com>

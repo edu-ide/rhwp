@@ -6,7 +6,6 @@ use crate::error::HwpError;
 use crate::model::control::Control;
 use crate::model::event::DocumentEvent;
 use crate::model::paragraph::Paragraph;
-use crate::renderer::style_resolver::resolve_styles;
 
 impl DocumentCore {
     pub fn paste_html_native(
@@ -58,7 +57,23 @@ impl DocumentCore {
                 new_chars,
             );
 
+            // [Task #2299] 리셋 판별용 — reflow 이전 저장 흐름 end 캡처.
+            let stored_end_for_reset = crate::renderer::composer::paragraph_flow_end(
+                &self.document.sections[section_idx].paragraphs[para_idx],
+            );
             self.reflow_paragraph(section_idx, para_idx);
+            // [Task #2299] 삽입/변경 문단들의 vpos 를 흐름에 연결한다 — placeholder 를
+            // 방치하면 이후 편집의 vpos 재계산이 저장 단/쪽 리셋으로 오인해 고착시킨다.
+            let doc_hwp3_layout = self.document.layout_profile().hwp3_layout();
+            crate::renderer::composer::recalculate_section_vpos(
+                &mut self.document.sections[section_idx].paragraphs,
+                para_idx,
+                None,
+                stored_end_for_reset,
+                &self.styles,
+                self.dpi,
+                doc_hwp3_layout,
+            );
             self.recompose_paragraph(section_idx, para_idx);
             self.paginate_if_needed();
 
@@ -86,7 +101,7 @@ impl DocumentCore {
                 .text
                 .is_empty();
 
-            let mut insert_idx = if left_empty {
+            let insert_idx = if left_empty {
                 // 빈 왼쪽 문단을 첫 번째 파싱 문단으로 대체
                 self.document.sections[section_idx].paragraphs[para_idx] = parsed_paras[0].clone();
                 let idx = para_idx + 1;
@@ -126,6 +141,20 @@ impl DocumentCore {
             for i in para_idx..=last_para_idx {
                 self.reflow_paragraph(section_idx, i);
             }
+            // [Task #2299] 삽입 문단들의 vpos 를 흐름에 연결한다 — 클론/placeholder
+            // 좌표를 방치하면 이후 편집의 vpos 재계산이 저장 단/쪽 리셋으로 오인해
+            // 고착시킨다. left_empty 면 host 자체가 클론이라 신규 구간에 포함한다.
+            let fresh_start = if left_empty { para_idx } else { para_idx + 1 };
+            let doc_hwp3_layout = self.document.layout_profile().hwp3_layout();
+            crate::renderer::composer::recalculate_section_vpos(
+                &mut self.document.sections[section_idx].paragraphs,
+                para_idx,
+                Some(fresh_start..last_para_idx + 1),
+                None,
+                &self.styles,
+                self.dpi,
+                doc_hwp3_layout,
+            );
 
             // 선택적 재구성: 원본 문단 재구성 + 삽입 문단 composed 추가
             self.recompose_paragraph(section_idx, para_idx);
@@ -165,6 +194,18 @@ impl DocumentCore {
         for i in para_idx..=last_para_idx {
             self.reflow_paragraph(section_idx, i);
         }
+        // [Task #2299] 삽입/변경 문단들의 vpos 를 흐름에 연결한다 — placeholder 를
+        // 방치하면 이후 편집의 vpos 재계산이 저장 단/쪽 리셋으로 오인해 고착시킨다.
+        let doc_hwp3_layout = self.document.layout_profile().hwp3_layout();
+        crate::renderer::composer::recalculate_section_vpos(
+            &mut self.document.sections[section_idx].paragraphs,
+            para_idx,
+            Some(para_idx + 1..last_para_idx + 1),
+            None,
+            &self.styles,
+            self.dpi,
+            doc_hwp3_layout,
+        );
 
         // 선택적 재구성: 원본 문단 재구성 + 삽입 문단 composed 추가
         self.recompose_paragraph(section_idx, para_idx);
@@ -210,7 +251,8 @@ impl DocumentCore {
                     };
                     p.controls.clear();
                     p.text = text;
-                    p.char_count = p.text.encode_utf16().count() as u32;
+                    // [#3494] char_count 는 문단 종결자를 포함한다 (model/paragraph.rs:1042).
+                    p.char_count = p.text.encode_utf16().count() as u32 + 1;
                     p.char_offsets = p
                         .text
                         .chars()
@@ -392,7 +434,30 @@ impl DocumentCore {
     // === HTML 파서 ===
 
     /// HTML 문자열을 파싱하여 Paragraph 목록을 생성한다.
+    /// `<div>`/`<p><table>` 재귀 하강 깊이 상한. Gmail 등 웹메일 클립보드는 서명·본문을
+    /// 감싸는 wrapper `<div>`가 수십 겹인 경우가 흔하다(예: 실사용 리포트 — 서명 블록 하나에
+    /// `</div>` 8개 이상 연속). 이 깊이만큼 매번 `find_closing_tag_chars`로 전체 구간을
+    /// 다시 훑고 재귀하므로, 깊이가 무제한이면 붙여넣기 한 번이 브라우저를 "응답 없음"으로
+    /// 멈춰 세울 만큼 느려진다(실사용 확인). 이 상한을 넘으면 태그 트리 파싱을 포기하고
+    /// 태그만 제거한 평문 문단으로 폴백한다 — 서식은 잃어도 붙여넣기 자체는 항상 끝난다.
+    const HTML_PASTE_MAX_RECURSION_DEPTH: u32 = 16;
+
+    /// 파싱을 시도할 최대 HTML 바이트 크기. 이보다 크면 태그 트리 파싱 없이 평문으로
+    /// 폴백한다 — 크기 자체가 계산량의 또 다른 축이라 깊이 상한과 별개로 방어한다.
+    const HTML_PASTE_MAX_BYTES: usize = 400_000;
+
     pub(crate) fn parse_html_to_paragraphs(&mut self, html: &str) -> Vec<Paragraph> {
+        self.parse_html_to_paragraphs_at_depth(html, 0)
+    }
+
+    fn parse_html_to_paragraphs_at_depth(&mut self, html: &str, depth: u32) -> Vec<Paragraph> {
+        if depth >= Self::HTML_PASTE_MAX_RECURSION_DEPTH || html.len() > Self::HTML_PASTE_MAX_BYTES
+        {
+            let mut fallback_paragraphs = Vec::new();
+            self.flush_text_to_paragraphs(&mut fallback_paragraphs, &html_strip_tags(html));
+            return fallback_paragraphs;
+        }
+
         let mut paragraphs: Vec<Paragraph> = Vec::new();
 
         // <!--StartFragment-->...<!--EndFragment--> 영역 추출 (없으면 전체 사용)
@@ -482,7 +547,7 @@ impl DocumentCore {
 
                     // <p> 내부에 <table>이 있으면 재귀적으로 처리
                     if p_inner.to_lowercase().contains("<table") {
-                        let sub_paras = self.parse_html_to_paragraphs(p_inner);
+                        let sub_paras = self.parse_html_to_paragraphs_at_depth(p_inner, depth + 1);
                         paragraphs.extend(sub_paras);
                         pos = p_end;
                         continue;
@@ -510,9 +575,78 @@ impl DocumentCore {
                         &div_inner
                     };
 
-                    let sub_paras = self.parse_html_to_paragraphs(div_inner);
+                    let sub_paras = self.parse_html_to_paragraphs_at_depth(div_inner, depth + 1);
                     paragraphs.extend(sub_paras);
                     pos = div_end;
+                    continue;
+                } else if tag_lower.starts_with("<ul") || tag_lower.starts_with("<ol") {
+                    // [Gmail 등 웹메일 서명 붙여넣기가 raw 태그로 나오던 결함] 목록 태그
+                    // 자체는 컨테이너일 뿐이라 <div>처럼 내부를 재귀 처리한다 — <li> 각각이
+                    // 실제 항목 문단이 된다.
+                    if !pending_text.trim().is_empty() {
+                        self.flush_text_to_paragraphs(&mut paragraphs, &pending_text);
+                        pending_text.clear();
+                    }
+                    let list_tag_name = if tag_lower.starts_with("<ul") {
+                        "ul"
+                    } else {
+                        "ol"
+                    };
+                    let list_content_start = tag_end + 1;
+                    let list_end = find_closing_tag_chars(&chars, pos, list_tag_name);
+                    let list_inner: String = chars[list_content_start..list_end.min(len)]
+                        .iter()
+                        .collect();
+                    let close_marker = format!("</{list_tag_name}>");
+                    let list_inner = if let Some(idx) = list_inner.rfind(&close_marker) {
+                        &list_inner[..idx]
+                    } else {
+                        &list_inner
+                    };
+                    let sub_paras = self.parse_html_to_paragraphs(list_inner);
+                    paragraphs.extend(sub_paras);
+                    pos = list_end;
+                    continue;
+                } else if tag_lower.starts_with("<li") {
+                    // <li> 내부 전체(중첩 span/strong 등 포함)를 한 문단으로 묶어
+                    // parse_inline_content 로 서식까지 보존해 파싱하고, 글머리 기호를
+                    // 앞에 붙인다. 표 없는 최상위 <p> 처리와 동일한 패턴.
+                    if !pending_text.trim().is_empty() {
+                        self.flush_text_to_paragraphs(&mut paragraphs, &pending_text);
+                        pending_text.clear();
+                    }
+                    let li_content_start = tag_end + 1;
+                    let li_end = find_closing_tag_chars(&chars, pos, "li");
+                    let li_inner: String =
+                        chars[li_content_start..li_end.min(len)].iter().collect();
+                    let li_inner = if let Some(idx) = li_inner.rfind("</li>") {
+                        &li_inner[..idx]
+                    } else {
+                        &li_inner
+                    };
+                    let mut para = Paragraph::default();
+                    self.parse_inline_content(&mut para, li_inner);
+                    if !para.text.trim().is_empty() {
+                        para.text = format!("• {}", para.text);
+                        para.char_offsets = para
+                            .text
+                            .chars()
+                            .scan(0u32, |acc, c| {
+                                let off = *acc;
+                                *acc += c.len_utf16() as u32;
+                                Some(off)
+                            })
+                            .collect();
+                        para.char_count = para.text.encode_utf16().count() as u32 + 1;
+                        // 글머리 기호("• ")만큼 스타일 구간을 오른쪽으로 밀어 정렬을 맞춘다.
+                        // start_pos 는 UTF-16 코드유닛 단위(위 char_offsets 와 동일 축).
+                        let bullet_len = "• ".encode_utf16().count() as u32;
+                        for cs in &mut para.char_shapes {
+                            cs.start_pos += bullet_len;
+                        }
+                        paragraphs.push(para);
+                    }
+                    pos = li_end;
                     continue;
                 } else if tag_lower.starts_with("<br") {
                     // <br> → 문단 구분
@@ -532,18 +666,26 @@ impl DocumentCore {
                 } else {
                     // 기타 태그 무시 (span 등 인라인은 <p> 밖에서 직접 올 수 있음)
                     if tag_lower.starts_with("<span") {
-                        // <span>...</span> 인라인 콘텐츠
+                        // [Gmail 등 웹메일 서명 붙여넣기가 raw 태그로 나오던 결함] 예전
+                        // 코드는 span 내부(중첩 <u>/<strong>/주석 포함)를 첫 ">" 뒤부터
+                        // 그대로 pending_text 에 밀어 넣어, 태그 자체가 문서에 문자로
+                        // 그대로 찍혔다. <p> 처리와 같은 방식으로 parse_inline_content 에
+                        // 넘겨 중첩 서식(굵게 등)까지 해석한 문단으로 만든다.
+                        if !pending_text.trim().is_empty() {
+                            self.flush_text_to_paragraphs(&mut paragraphs, &pending_text);
+                            pending_text.clear();
+                        }
                         let span_end = find_closing_tag_chars(&chars, pos, "span");
-                        let span_full: String =
-                            chars[tag_start..span_end.min(len)].iter().collect();
-                        let span_full = if let Some(idx) = span_full.rfind("</span>") {
-                            &span_full[..idx]
-                        } else {
-                            &span_full
-                        };
-                        // span 태그 내부 텍스트 추출
-                        if let Some(gt_pos) = span_full.find('>') {
-                            pending_text.push_str(&span_full[gt_pos + 1..]);
+                        let inner_start = tag_end + 1;
+                        let inner_end = span_end.saturating_sub(7); // "</span>".len()
+                        let span_inner: String = chars
+                            [inner_start..inner_end.max(inner_start).min(len)]
+                            .iter()
+                            .collect();
+                        let mut para = Paragraph::default();
+                        self.parse_inline_content(&mut para, &span_inner);
+                        if !para.text.trim().is_empty() {
+                            paragraphs.push(para);
                         }
                         pos = span_end;
                         continue;
@@ -563,13 +705,43 @@ impl DocumentCore {
             self.flush_text_to_paragraphs(&mut paragraphs, &pending_text);
         }
 
-        // 빈 결과 시 최소 처리
+        // 빈 결과 시 최소 처리 — flush_text_to_paragraphs 재사용으로 줄바꿈 분리와
+        // 긴 줄 강제 절단(FLUSH_LINE_CHAR_CAP)을 여기도 동일하게 적용한다.
+        // flush_text_to_paragraphs 가 자체적으로 decode_html_entities 를 수행하므로,
+        // 여기서는 태그만 벗긴 원문(html_strip_tags)을 넘겨 엔티티 이중 디코딩을 피한다.
         if paragraphs.is_empty() {
-            let plain = html_to_plain_text(html);
-            if !plain.is_empty() {
+            let stripped = html_strip_tags(html);
+            if !stripped.trim().is_empty() {
+                self.flush_text_to_paragraphs(&mut paragraphs, &stripped);
+            }
+        }
+
+        paragraphs
+    }
+
+    /// 개행이 전혀 없는 한 "줄"을 이 길이(문자 수) 단위로 강제 절단해 별도 문단으로 만든다.
+    ///
+    /// [붙여넣기 화면 겹침 방지] 웹페이지 렌더 결과가 아니라 원본 소스(view-source 등)를
+    /// 통째로 복사하면, 내부 텍스트에 실제 개행 문자가 전혀 없는 경우(예: 한 줄짜리 최소화
+    /// JS/JSON 블록)가 있다 — 실사용 확인: Daum 홈페이지 전체 소스(HTML 598KB) 붙여넣기가
+    /// 개행 없는 50만자 이상 단일 문단을 만들어 화면이 겹쳐 보이는 결과로 이어졌다. 문단
+    /// 하나가 이 정도로 크면 줄바꿈 계산 등 조판 경로가 원래 가정하지 않은 크기라 무너진다.
+    const FLUSH_LINE_CHAR_CAP: usize = 4000;
+
+    /// 텍스트를 문단으로 변환하여 추가한다 (줄바꿈 기준 분리, 개행 없는 긴 줄은 추가 절단).
+    pub(crate) fn flush_text_to_paragraphs(&self, paragraphs: &mut Vec<Paragraph>, text: &str) {
+        let decoded = decode_html_entities(text);
+        for line in decoded.split('\n') {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let chars: Vec<char> = trimmed.chars().collect();
+            for chunk in chars.chunks(Self::FLUSH_LINE_CHAR_CAP) {
                 let mut para = Paragraph::default();
-                para.text = plain;
-                para.char_count = para.text.encode_utf16().count() as u32;
+                para.text = chunk.iter().collect();
+                // [#3494] char_count 는 문단 종결자를 포함한다 (model/paragraph.rs:1042).
+                para.char_count = para.text.encode_utf16().count() as u32 + 1;
                 para.char_offsets = para
                     .text
                     .chars()
@@ -581,32 +753,6 @@ impl DocumentCore {
                     .collect();
                 paragraphs.push(para);
             }
-        }
-
-        paragraphs
-    }
-
-    /// 텍스트를 문단으로 변환하여 추가한다 (줄바꿈 기준 분리).
-    pub(crate) fn flush_text_to_paragraphs(&self, paragraphs: &mut Vec<Paragraph>, text: &str) {
-        let decoded = decode_html_entities(text);
-        for line in decoded.split('\n') {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            let mut para = Paragraph::default();
-            para.text = trimmed.to_string();
-            para.char_count = para.text.encode_utf16().count() as u32;
-            para.char_offsets = para
-                .text
-                .chars()
-                .scan(0u32, |acc, c| {
-                    let off = *acc;
-                    *acc += c.len_utf16() as u32;
-                    Some(off)
-                })
-                .collect();
-            paragraphs.push(para);
         }
     }
 
@@ -636,24 +782,19 @@ impl DocumentCore {
                 let tag_lower = tag_str.to_lowercase();
 
                 if tag_lower.starts_with("<span") {
+                    // [붙여넣기 무한루프/응답없음 방지] span_end_tag(깊이 인식 탐색)가 이미
+                    // 정확한 닫는 위치를 갖고 있는데, 예전 코드는 그 뒤에 또 "</span>" 리터럴을
+                    // 처음부터 선형 재탐색했다 — 중첩 span이 많은 Gmail류 클립보드(span 수백
+                    // 개)에서 O(n) 재탐색이 span마다 반복돼 실질적으로 O(n²)이 됐고, 게다가
+                    // 깊이를 무시한 첫 "</span>" 매치라 중첩 span에서는 내부 span의 닫는
+                    // 태그를 잘못 집는 경계 버그이기도 했다. span_end_tag 하나로 통일한다
+                    // ("</span>".len() == 7 만큼 빼면 내용 끝 위치).
                     let span_end_tag = find_closing_tag_chars(&chars, pos, "span");
                     let inner_start = tag_end + 1;
-                    let inner_end = {
-                        // char 배열에서 "</span>" 검색 (바이트 인덱스 혼동 방지)
-                        let close_chars: Vec<char> = "</span>".chars().collect();
-                        let mut found = None;
-                        for i in inner_start..len.saturating_sub(close_chars.len() - 1) {
-                            let slice: String = chars[i..i + close_chars.len().min(len - i)]
-                                .iter()
-                                .collect();
-                            if slice.to_lowercase() == "</span>" {
-                                found = Some(i);
-                                break;
-                            }
-                        }
-                        found.unwrap_or(span_end_tag)
-                    };
-                    let inner: String = chars[inner_start..inner_end.min(len)].iter().collect();
+                    let inner_end = span_end_tag.saturating_sub(7);
+                    let inner: String = chars[inner_start..inner_end.max(inner_start).min(len)]
+                        .iter()
+                        .collect();
                     let inner_text = decode_html_entities(&html_strip_tags(&inner));
 
                     if !inner_text.is_empty() {
@@ -751,7 +892,8 @@ impl DocumentCore {
         }
 
         para.text = full_text;
-        para.char_count = para.text.encode_utf16().count() as u32;
+        // [#3494] char_count 는 문단 종결자를 포함한다 (model/paragraph.rs:1042).
+        para.char_count = para.text.encode_utf16().count() as u32 + 1;
         para.char_offsets = para
             .text
             .chars()
@@ -800,6 +942,13 @@ impl DocumentCore {
             0
         };
         let mut cs = self.document.doc_info.char_shapes[base_id as usize].clone();
+        // 파싱된 문서의 CharShape 는 원본 CHAR_SHAPE 레코드 바이트를 raw_data 로 들고 있고
+        // (parser/doc_info.rs), 직렬화기는 raw_data 가 있으면 필드 대신 그 바이트를 그대로
+        // 쓴다(serializer/doc_info.rs). 아래에서 굵기·색·크기를 바꿔도 raw_data 를 비우지
+        // 않으면 저장 시 원본 서식 바이트가 나가 붙여넣은 서식이 통째로 사라진다.
+        // PartialEq 가 raw_data 를 비교에서 제외하므로 아래 중복 검색도 이를 걸러내지 못한다.
+        // CharShapeMods::apply_to(model/style.rs)가 같은 이유로 첫 줄에서 raw_data 를 비운다.
+        cs.raw_data = None;
 
         // CSS 속성 파싱 및 적용
         let css_lower = css.to_lowercase();
@@ -850,7 +999,8 @@ impl DocumentCore {
         let has_underline = inherited_underline
             || css_lower.contains("text-decoration:underline")
             || css_lower.contains("text-decoration: underline")
-            || css_lower.contains("text-decoration-line:underline");
+            || css_lower.contains("text-decoration-line:underline")
+            || css_lower.contains("text-decoration-line: underline");
         cs.underline_type = if has_underline {
             UnderlineType::Bottom
         } else {
@@ -874,7 +1024,7 @@ impl DocumentCore {
         self.document.doc_info.char_shapes.push(cs);
         self.document.doc_info.raw_stream_dirty = true;
         // 스타일 세트 갱신
-        self.styles = resolve_styles(&self.document.doc_info, self.dpi);
+        self.rebuild_resolved_styles();
         new_id
     }
 
@@ -894,6 +1044,9 @@ impl DocumentCore {
             .get(base_id as usize)
             .cloned()
             .unwrap_or_default();
+        // CharShape 쪽과 동일 — 원본 PARA_SHAPE 바이트를 비우지 않으면 정렬·줄간격 변경이
+        // 저장 시 사라진다(ParaShapeMods::apply_to 와 같은 처리).
+        ps.raw_data = None;
 
         let css_lower = css.to_lowercase();
 
@@ -935,7 +1088,7 @@ impl DocumentCore {
         let new_id = self.document.doc_info.para_shapes.len() as u16;
         self.document.doc_info.para_shapes.push(ps);
         self.document.doc_info.raw_stream_dirty = true;
-        self.styles = resolve_styles(&self.document.doc_info, self.dpi);
+        self.rebuild_resolved_styles();
         new_id
     }
 
@@ -954,5 +1107,78 @@ impl DocumentCore {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::document::Document;
+    use crate::model::style::{CharShape, ParaShape};
+
+    /// 파싱을 거친 문서를 흉내낸다 — CharShape/ParaShape 가 원본 레코드 바이트를
+    /// raw_data 로 들고 있는 상태(parser/doc_info.rs 가 하는 일).
+    fn core_with_parsed_shapes() -> DocumentCore {
+        let mut doc = Document::default();
+        let mut cs = CharShape::default();
+        cs.raw_data = Some(vec![0xAA; 72]);
+        doc.doc_info.char_shapes.push(cs);
+        let mut ps = ParaShape::default();
+        ps.raw_data = Some(vec![0xBB; 54]);
+        doc.doc_info.para_shapes.push(ps);
+        let mut core = DocumentCore::new_empty();
+        core.document = doc;
+        core
+    }
+
+    // HTML 붙여넣기가 만드는 CharShape/ParaShape 는 char_shapes[0]/para_shapes[0] 의 clone
+    // 이라 원본 raw_data 를 물고 온다. 직렬화기는 raw_data 가 있으면 필드 대신 그 바이트를
+    // 그대로 쓰므로(serializer/doc_info.rs), 비우지 않으면 붙여넣은 서식이 저장 시 사라진다.
+    // PartialEq 가 raw_data 를 제외하므로 중복 검색도 이를 걸러내지 못한다.
+
+    #[test]
+    fn html_paste_char_shape_drops_stale_raw_data() {
+        let mut core = core_with_parsed_shapes();
+        let id = core.css_to_char_shape_id("font-weight:bold;color:#ff0000", false, false, false);
+        let cs = &core.document.doc_info.char_shapes[id as usize];
+        assert!(cs.bold, "전제: CSS 가 반영돼야 함");
+        assert!(
+            cs.raw_data.is_none(),
+            "raw_data 가 남으면 저장 시 원본 서식 바이트가 나가 붙여넣은 서식이 사라진다"
+        );
+    }
+
+    #[test]
+    fn html_paste_para_shape_drops_stale_raw_data() {
+        let mut core = core_with_parsed_shapes();
+        let id = core.css_to_para_shape_id("text-align:center");
+        let ps = &core.document.doc_info.para_shapes[id as usize];
+        assert!(
+            ps.raw_data.is_none(),
+            "raw_data 가 남으면 정렬·줄간격 변경이 저장 시 사라진다"
+        );
+    }
+}
+
+#[cfg(test)]
+mod textdecoline_tests {
+    use super::*;
+    use crate::model::document::Document;
+    use crate::model::style::{CharShape, UnderlineType};
+
+    #[test]
+    fn css_underline_recognizes_text_decoration_line_with_space() {
+        let mut doc = Document::default();
+        doc.doc_info.char_shapes.push(CharShape::default());
+        let mut core = DocumentCore::new_empty();
+        core.document = doc;
+
+        let id = core.css_to_char_shape_id("text-decoration-line: underline", false, false, false);
+        let cs = &core.document.doc_info.char_shapes[id as usize];
+        assert_ne!(
+            cs.underline_type,
+            UnderlineType::None,
+            "콜론 뒤 공백이 있는 text-decoration-line: underline 도 밑줄로 인식돼야 함"
+        );
     }
 }

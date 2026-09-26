@@ -12,7 +12,7 @@ use super::*;
 /// LIST_HEADER for Footnote (size=16): paraCount(SInt4) + property(UInt4) + 8 byte zero padding.
 ///
 /// 참조: `hwplib::ControlFootnote` + `CtrlHeaderFootnote`.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct Footnote {
     /// 각주 번호
     pub number: u16,
@@ -31,7 +31,7 @@ pub struct Footnote {
 }
 
 /// 미주 ('en  ' 컨트롤) — [Task #1050] Footnote 와 동일 구조
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct Endnote {
     /// 미주 번호
     pub number: u16,
@@ -50,7 +50,7 @@ pub struct Endnote {
 }
 
 /// 각주/미주 모양 (HWPTAG_FOOTNOTE_SHAPE)
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct FootnoteShape {
     /// 속성 비트 플래그
     pub attr: u32,
@@ -64,8 +64,9 @@ pub struct FootnoteShape {
     pub suffix_char: char,
     /// 시작 번호
     pub start_number: u16,
-    /// 구분선 길이
-    pub separator_length: HwpUnit16,
+    /// 구분선 길이. 한컴 미주 기본값 noteLine="14692344"(전폭 sentinel)이
+    /// i16 범위를 넘으므로 i32로 보존한다(i16 절단 시 0x2ff8=12280 → 짧은 구분선 버그).
+    pub separator_length: i32,
     /// HWPX 원본 슬롯: 구분선 위 여백.
     pub separator_margin_top: HwpUnit16,
     /// HWP5 원본 슬롯: 구분선 위 여백. HWPX 경로의 과거 매핑값 보존에도 사용될 수 있다.
@@ -236,7 +237,7 @@ impl FootnoteShape {
 }
 
 /// 번호 형식
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize)]
 pub enum NumberFormat {
     #[default]
     Digit, // 1, 2, 3
@@ -261,7 +262,7 @@ pub enum NumberFormat {
 }
 
 /// 번호 매기기 방식
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize)]
 pub enum FootnoteNumbering {
     #[default]
     /// 앞 구역에 이어서
@@ -273,7 +274,7 @@ pub enum FootnoteNumbering {
 }
 
 /// 배치 방법
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize)]
 pub enum FootnotePlacement {
     #[default]
     /// 각 단마다 따로 배열 / 문서의 마지막

@@ -78,7 +78,9 @@ fn assert_name_insert_by_path(
     expected_path: &[(usize, usize, usize)],
 ) {
     // 1쪽 상단 답안지 `성명` 오른쪽 빈 입력칸 내부 좌표.
-    let hit = hit_json(doc, 0, 250.0, 210.0);
+    // [#3386 A/C/D] 중첩 TAC anchor 의 outer-margin top 정합(+3.8px)으로
+    // 중첩 표가 한글 좌표로 내려가, 종전 y=210.0 이 경계 밖이 됨 — 셀 안쪽 재고정.
+    let hit = hit_json(doc, 0, 250.0, 216.0);
     assert_answer_sheet_name_hit(&hit, outer_control_index, expected_path);
 
     let path = path_tuples(&hit);
@@ -142,7 +144,15 @@ fn issue_850_exam_social_overlay_images_api_stays_compact_for_input_loop() {
         "flow images must still be counted for decode retry scheduling: {overlay_json}"
     );
     assert!(
-        overlay_json.len() < 128,
+        overlay["flowImageCount"].as_u64().unwrap_or(0) > 0,
+        "flow images must be exposed separately for flow-static reuse decisions: {overlay_json}"
+    );
+    assert!(
+        overlay["flowRawSvgCount"].as_u64().is_some(),
+        "flow rawSvg count must be exposed for flow-static reuse decisions: {overlay_json}"
+    );
+    assert!(
+        overlay_json.len() < 256,
         "input loop overlay JSON must remain compact: len={}, json={overlay_json}",
         overlay_json.len()
     );

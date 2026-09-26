@@ -22,6 +22,7 @@ class AutosaveRecoveryDialog extends ModalDialog {
 
   protected createBody(): HTMLElement {
     const body = document.createElement('div');
+    body.classList.add('recovery-dialog-body');
     body.style.padding = '16px 20px';
     body.style.lineHeight = '1.55';
 
@@ -37,6 +38,7 @@ class AutosaveRecoveryDialog extends ModalDialog {
     body.appendChild(note);
 
     const list = document.createElement('div');
+    list.classList.add('recovery-draft-list');
     list.style.display = 'flex';
     list.style.flexDirection = 'column';
     list.style.gap = '8px';
@@ -44,7 +46,7 @@ class AutosaveRecoveryDialog extends ModalDialog {
     for (const draft of this.drafts) {
       const label = document.createElement('label');
       label.style.display = 'grid';
-      label.style.gridTemplateColumns = 'auto 1fr';
+      label.style.gridTemplateColumns = 'auto minmax(0, 1fr)';
       label.style.columnGap = '10px';
       label.style.alignItems = 'start';
       label.style.padding = '10px';
@@ -61,8 +63,17 @@ class AutosaveRecoveryDialog extends ModalDialog {
       });
 
       const text = document.createElement('div');
+      text.classList.add('recovery-draft-copy');
       const title = document.createElement('div');
-      title.textContent = draft.fileName || '문서.hwp';
+      title.classList.add('recovery-draft-title');
+      const displayName = draft.fileName || (() => {
+        switch (draft.sourceFormat?.toLowerCase()) {
+          case 'hml': return '문서.hml';
+          case 'hwpx': return '문서.hwpx';
+          default: return '문서.hwp';
+        }
+      })();
+      title.textContent = displayName;
       title.style.fontWeight = '600';
       const meta = document.createElement('div');
       meta.textContent = describeDraft(draft);
@@ -149,6 +160,7 @@ class AutosaveRecoveryDialog extends ModalDialog {
 
       super.show();
       activeAutosaveRecoveryDialog = this;
+      this.dialog.classList.add('recovery-dialog');
 
       const footer = this.dialog.querySelector('.dialog-footer');
       const restoreBtn = this.dialog.querySelector('.dialog-btn-primary') as HTMLButtonElement | null;

@@ -4,48 +4,10 @@
 //! native Skia export, and CanvasKit direct replay all consume the same
 //! filename-resolved layer state through `build_page_layer_tree`.
 
-use rhwp::wasm_api::HwpDocument;
-use serde_json::Value;
+#[path = "support/issue_1144_support.rs"]
+mod issue_1144_support;
 
-fn document_with_filename_footer() -> HwpDocument {
-    let mut doc = HwpDocument::create_empty();
-    doc.create_blank_document()
-        .expect("create blank document fixture");
-    doc.apply_hf_template(0, false, 0, 4)
-        .expect("apply footer template with page number and filename field");
-    doc
-}
-
-fn collect_text_runs(value: &Value, out: &mut Vec<String>) {
-    match value {
-        Value::Object(map) => {
-            if map.get("type").and_then(Value::as_str) == Some("textRun") {
-                if let Some(text) = map.get("text").and_then(Value::as_str) {
-                    out.push(text.to_string());
-                }
-            }
-            for child in map.values() {
-                collect_text_runs(child, out);
-            }
-        }
-        Value::Array(items) => {
-            for item in items {
-                collect_text_runs(item, out);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn layer_tree_texts(doc: &HwpDocument) -> Vec<String> {
-    let json = doc
-        .get_page_layer_tree_native(0)
-        .expect("page 1 PageLayerTree JSON");
-    let parsed: Value = serde_json::from_str(&json).expect("parse PageLayerTree JSON");
-    let mut texts = Vec::new();
-    collect_text_runs(&parsed, &mut texts);
-    texts
-}
+use issue_1144_support::{document_with_filename_footer, layer_tree_texts};
 
 #[test]
 fn issue_1144_page_layer_tree_uses_filename_context() {
@@ -113,30 +75,6 @@ fn issue_1144_canvas_kit_plan_entrypoint_does_not_freeze_filename_context() {
     );
 }
 
-#[cfg(all(not(target_arch = "wasm32"), feature = "native-skia"))]
-#[test]
-fn issue_1144_skia_png_export_entrypoint_does_not_freeze_filename_context() {
-    let mut doc = document_with_filename_footer();
-    doc.set_file_name("skia-old.hwp");
-
-    let png = doc
-        .render_page_png_native(0)
-        .expect("Skia PNG export should build through PageLayerTree");
-    assert!(!png.is_empty(), "Skia PNG export should produce bytes");
-
-    doc.set_file_name("skia-new.hwp");
-    let texts = layer_tree_texts(&doc);
-
-    assert!(
-        texts.iter().any(|text| text.contains("skia-new.hwp")),
-        "Skia export entrypoint should not leave stale cached filename. texts={texts:?}"
-    );
-    assert!(
-        texts.iter().all(|text| !text.contains("skia-old.hwp")),
-        "old filename from Skia export should not remain cached. texts={texts:?}"
-    );
-}
-
 #[test]
 fn issue_1144_empty_filename_context_resolves_to_empty_string() {
     let mut doc = document_with_filename_footer();
@@ -144,8 +82,10 @@ fn issue_1144_empty_filename_context_resolves_to_empty_string() {
 
     let texts = layer_tree_texts(&doc);
 
-    assert!(
-        texts.iter().any(|text| text == "1\t"),
+    // 필드는 제 런으로 떨어지므로(Task #3216) 줄 전체를 이어 붙여서 본다.
+    assert_eq!(
+        texts.concat(),
+        "1\t",
         "empty filename should resolve to empty string while preserving surrounding text. texts={texts:?}"
     );
     assert!(

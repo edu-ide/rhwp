@@ -10,6 +10,8 @@ use super::symbols::{DecoKind, FontStyleKind};
 /// 수식 전용 font-family
 /// 순서: Latin Modern Math (LaTeX 설치 시) → STIX Two Text (Mac/STIX 설치 시) → STIX Two Math → Times New Roman (Windows 기본) → serif
 /// Cambria Math 는 Windows 에서 "볼드 인상" 을 유발해 제외. Pretendard 는 산세리프라 수식 부적합으로 제외. (Task #280)
+pub const DEFAULT_EQUATION_FONT_FAMILY_ATTR: &str =
+    "font-family=\"'Latin Modern Math', 'STIX Two Text', 'STIX Two Math', 'Times New Roman', 'Times', serif\"";
 const EQ_FONT_FAMILY: &str = " font-family=\"'Latin Modern Math', 'STIX Two Text', 'STIX Two Math', 'Times New Roman', 'Times', serif\"";
 
 /// 수식을 SVG 조각 문자열로 렌더링
@@ -664,7 +666,13 @@ fn escape_xml(text: &str) -> String {
             '>' => result.push_str("&gt;"),
             '"' => result.push_str("&quot;"),
             '\'' => result.push_str("&apos;"),
-            _ => result.push(ch),
+            // XML 1.0 허용 문자: #x9 | #xA | #xD | [#x20-#xD7FF] | [#xE000-#xFFFD] | [#x10000-#x10FFFF]
+            // 그 외(제어문자, U+FFFE, U+FFFF 등)는 제거 — 방출된 SVG 가 불법 XML 이 되지 않도록 (#3382)
+            '\u{09}' | '\u{0A}' | '\u{0D}' => result.push(ch),
+            '\u{20}'..='\u{D7FF}' | '\u{E000}'..='\u{FFFD}' | '\u{10000}'..='\u{10FFFF}' => {
+                result.push(ch)
+            }
+            _ => {} // XML 무효 문자 제거
         }
     }
     result
@@ -690,6 +698,27 @@ mod tests {
         let ast = EqParser::new(tokens).parse();
         let layout = EqLayout::new(20.0).layout(&ast);
         render_equation_svg(&layout, "#000000", 20.0)
+    }
+
+    #[test]
+    fn escape_xml_drops_xml_invalid_control_chars() {
+        // #3382: 수식 SVG 는 본문 SVG(renderer/svg.rs)와 달리 XML 1.0 문자 필터가 없어,
+        // IR 텍스트에 섞인 제어문자를 그대로 방출하면 산출 SVG 가 불법 XML 이 된다
+        // ("PCDATA invalid Char value 3") — 뷰어가 해당 페이지 렌더를 중단한다.
+        assert_eq!(escape_xml("a\u{03}b"), "ab");
+        for c in ['\u{00}', '\u{08}', '\u{0B}', '\u{0C}', '\u{0E}', '\u{1F}'] {
+            assert_eq!(
+                escape_xml(&format!("x{c}y")),
+                "xy",
+                "control {:#04x}",
+                c as u32
+            );
+        }
+        assert_eq!(escape_xml("a\u{FFFE}\u{FFFF}b"), "ab");
+        // 탭·개행·복귀는 XML 1.0 허용 문자이므로 유지
+        assert_eq!(escape_xml("a\tb\nc\rd"), "a\tb\nc\rd");
+        // 기존 마크업 이스케이프는 무회귀
+        assert_eq!(escape_xml("<a & b>\"'"), "&lt;a &amp; b&gt;&quot;&apos;");
     }
 
     #[test]

@@ -1,10 +1,22 @@
 import type { LayerRenderProfile, PageInfo } from '@/core/types';
 
 export type RenderBackend = 'canvas2d' | 'canvaskit';
+export type RenderBackendPreference = 'auto' | RenderBackend;
 export type CanvasKitRenderMode = 'default' | 'compat';
+export type CanvasKitRenderModeUnsupportedReason = 'unsupportedCanvasKitMode';
+export type CanvasKitRenderModeRequestSource = 'default' | 'storage' | 'url';
 export type CanvasKitSurfacePreference = 'auto' | 'webgpu' | 'webgl' | 'software';
 export type CanvasKitSurfaceUnsupportedReason = 'unsupportedSurfaceBackend';
 export type RenderBackendUnsupportedReason = 'unsupportedRenderBackend';
+export type RenderBackendFallbackReason =
+  | RenderBackendUnsupportedReason
+  | 'canvaskitDocumentIneligible'
+  | 'canvaskitDocumentPreflightIncomplete'
+  | 'canvaskitRevisionInvalidated'
+  | 'canvaskitInitializationFailed'
+  | 'canvaskitResourcePreparationFailed'
+  | 'canvaskitRuntimeFailed';
+export type RenderBackendRequestSource = 'default' | 'url';
 
 export interface CanvasKitSurfaceRequest {
   preference: CanvasKitSurfacePreference;
@@ -12,8 +24,16 @@ export interface CanvasKitSurfaceRequest {
   unsupportedReason?: CanvasKitSurfaceUnsupportedReason;
 }
 
+export interface CanvasKitRenderModeRequest {
+  mode: CanvasKitRenderMode;
+  source: CanvasKitRenderModeRequestSource;
+  requested?: string;
+  unsupportedReason?: CanvasKitRenderModeUnsupportedReason;
+}
+
 export interface RenderBackendRequest {
-  backend: RenderBackend;
+  backend: RenderBackendPreference;
+  source: RenderBackendRequestSource;
   requested?: string;
   unsupportedReason?: RenderBackendUnsupportedReason;
 }
@@ -25,7 +45,6 @@ export const DEFAULT_CANVASKIT_SURFACE_REQUEST: CanvasKitSurfaceRequest = {
   requested: 'auto',
 };
 
-const BACKEND_STORAGE_KEY = 'rhwp.renderBackend';
 const CANVASKIT_MODE_STORAGE_KEY = 'rhwp.canvaskitMode';
 const RENDER_PROFILE_STORAGE_KEY = 'rhwp.renderProfile';
 
@@ -54,36 +73,54 @@ function searchParam(search: string, ...keys: string[]): string | null {
   return null;
 }
 
-export function resolveRenderBackend(search = ''): RenderBackend {
+export function resolveRenderBackend(search = ''): RenderBackendPreference {
   return resolveRenderBackendRequest(search).backend;
 }
 
 export function resolveRenderBackendRequest(search = ''): RenderBackendRequest {
   const explicit = searchParam(search, 'renderer', 'renderBackend', 'backend');
   const normalized = explicit?.trim().toLowerCase();
-  if (!normalized) return { backend: 'canvas2d' };
+  if (!normalized) return { backend: 'canvas2d', source: 'default' };
+  if (normalized === 'auto') {
+    return { backend: 'auto', source: 'url', requested: normalized };
+  }
   if (normalized === 'canvaskit' || normalized === 'skia') {
-    return { backend: 'canvaskit', requested: normalized };
+    return { backend: 'canvaskit', source: 'url', requested: normalized };
   }
   if (normalized === 'canvas' || normalized === 'canvas2d' || normalized === 'legacy') {
-    return { backend: 'canvas2d', requested: normalized };
+    return { backend: 'canvas2d', source: 'url', requested: normalized };
   }
   return {
     backend: 'canvas2d',
+    source: 'url',
     requested: explicit ?? normalized,
     unsupportedReason: 'unsupportedRenderBackend',
   };
 }
 
-export function persistRenderBackend(value: RenderBackend): void {
-  writeStorage(BACKEND_STORAGE_KEY, value);
+export function resolveCanvasKitRenderMode(search = ''): CanvasKitRenderMode {
+  return resolveCanvasKitRenderModeRequest(search).mode;
 }
 
-export function resolveCanvasKitRenderMode(search = ''): CanvasKitRenderMode {
-  const explicit = searchParam(search, 'canvaskitMode', 'skiaMode') ?? readStorage(CANVASKIT_MODE_STORAGE_KEY);
-  const normalized = explicit?.trim().toLowerCase();
-  if (normalized === 'compat' || normalized === 'compatibility') return 'compat';
-  return 'default';
+export function resolveCanvasKitRenderModeRequest(search = ''): CanvasKitRenderModeRequest {
+  const explicit = searchParam(search, 'canvaskitMode', 'skiaMode');
+  const stored = explicit === null ? readStorage(CANVASKIT_MODE_STORAGE_KEY) : null;
+  const requested = explicit ?? stored;
+  const normalized = requested?.trim().toLowerCase();
+  const source = explicit !== null ? 'url' : stored !== null ? 'storage' : 'default';
+  if (!normalized) return { mode: 'default', source: 'default' };
+  if (normalized === 'compat' || normalized === 'compatibility') {
+    return { mode: 'compat', source, requested: normalized };
+  }
+  if (normalized === 'default' || normalized === 'direct') {
+    return { mode: 'default', source, requested: normalized };
+  }
+  return {
+    mode: 'default',
+    source,
+    requested: requested ?? normalized,
+    unsupportedReason: 'unsupportedCanvasKitMode',
+  };
 }
 
 export function persistCanvasKitRenderMode(value: CanvasKitRenderMode): void {
@@ -118,7 +155,13 @@ export function persistRenderProfile(value: LayerRenderProfile): void {
 }
 
 export function clampRenderScale(pageInfo: PageInfo, requestedScale: number): number {
-  const scale = Number.isFinite(requestedScale) && requestedScale > 0 ? requestedScale : 1;
+  // Rust Canvas2D 경로의 normalize_canvas_scale()도 같은 하한을 적용한다.
+  // Studio가 더 작은 값을 DPR 계산에 쓰면, 렌더러가 0.25로 올린 bitmap을
+  // 원래 DPR로 나눠 저배율 페이지의 CSS 크기가 레이아웃 슬롯보다 커진다.
+  const scale = Math.max(
+    0.25,
+    Number.isFinite(requestedScale) && requestedScale > 0 ? requestedScale : 1,
+  );
   const maxPixels = 67_108_864;
   const pixels = pageInfo.width * scale * pageInfo.height * scale;
   if (pixels <= maxPixels) return scale;

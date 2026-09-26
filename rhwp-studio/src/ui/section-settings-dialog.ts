@@ -2,6 +2,9 @@ import { ModalDialog } from './dialog';
 import type { WasmBridge } from '@/core/wasm-bridge';
 import type { SectionDef } from '@/core/types';
 import type { EventBus } from '@/core/event-bus';
+import type { CommandServices } from '@/command/types';
+import { applyCommandThroughRouter } from './dialog-apply';
+import { SetSectionPropsAllCommand, SetSectionPropsCommand } from '@/engine/command';
 
 const HWPUNIT_PER_PT = 100; // 1pt = 100 HWPUNIT (HWP 내부 단위)
 
@@ -41,7 +44,7 @@ export class SectionSettingsDialog extends ModalDialog {
   private defaultTabSpacingInput!: HTMLInputElement;
   private applyScopeSelect!: HTMLSelectElement;
 
-  constructor(wasm: WasmBridge, eventBus: EventBus, sectionIdx: number) {
+  constructor(wasm: WasmBridge, eventBus: EventBus, sectionIdx: number, private services?: CommandServices) {
     super('구역 설정', 400);
     this.wasm = wasm;
     this.eventBus = eventBus;
@@ -122,7 +125,7 @@ export class SectionSettingsDialog extends ModalDialog {
     return body;
   }
 
-  protected onConfirm(): void {
+  protected onConfirm(): boolean {
     const pageComboVal = this.pageNumCombo.select.value;
     // pageNumType: 0=이어서, 1=홀수, 2=짝수
     // pageNum: 사용자 선택 시 입력값, 그 외 0
@@ -142,8 +145,10 @@ export class SectionSettingsDialog extends ModalDialog {
       pictureNum: this.getNumComboValue(this.pictureNumCombo),
       tableNum: this.getNumComboValue(this.tableNumCombo),
       equationNum: this.getNumComboValue(this.equationNumCombo),
-      columnSpacing: ptToHwpunit(parseFloat(this.columnSpacingInput.value) || 0),
-      defaultTabSpacing: ptToHwpunit(parseFloat(this.defaultTabSpacingInput.value) || 0),
+      // #2938: HTML min='0'은 .value를 자동 clamp하지 않으므로(#2845/#2847과 동일 패턴)
+      // 직접 타이핑한 음수가 그대로 WASM으로 넘어가지 않도록 여기서 하한을 강제한다.
+      columnSpacing: Math.max(0, ptToHwpunit(parseFloat(this.columnSpacingInput.value) || 0)),
+      defaultTabSpacing: Math.max(0, ptToHwpunit(parseFloat(this.defaultTabSpacingInput.value) || 0)),
       hideHeader: this.hideHeaderCheck.checked,
       hideFooter: this.hideHeaderCheck.checked,
       hideMasterPage: this.hideMasterPageCheck.checked,
@@ -153,16 +158,40 @@ export class SectionSettingsDialog extends ModalDialog {
     };
 
     const scope = this.applyScopeSelect.value;
-    let result: { ok: boolean };
-    if (scope === 'all') {
-      result = this.wasm.setSectionDefAll(newDef);
-    } else {
-      // 'current' 또는 'selection' (선택 문자열은 현재 구역과 동일하게 처리)
-      result = this.wasm.setSectionDef(this.sectionIdx, newDef);
+    // 'current'/'selection' 은 현재 구역과 동일 처리. all=전 구역(전문서 효과).
+    const apply = () => scope === 'all'
+      ? this.wasm.setSectionDefAll(newDef)
+      : this.wasm.setSectionDef(this.sectionIdx, newDef);
+    // [구역 설정 이관 → #5769 Stage 4 역연산화] 현재 구역 적용은 속성쌍 커맨드로
+    // 스냅샷 없이 되돌린다(raw 저널 포함 — SetSectionPropsCommand 참조).
+    if (scope !== 'all') {
+      // before 는 변경 전에 읽는다 — undo 가 이 값으로 되돌리고 raw 도 함께 복원한다.
+      const before = this.wasm.getSectionDef(this.sectionIdx);
+      return applyCommandThroughRouter({
+        services: this.services,
+        label: 'SectionSettingsDialog',
+        command: (ih) => ({
+          kind: 'command',
+          command: new SetSectionPropsCommand(this.sectionIdx, before, newDef, ih.getCursorPosition()),
+        }),
+        fallback: () => { if (apply().ok) this.eventBus.emit('document-changed'); },
+      });
     }
-    if (result.ok) {
-      this.eventBus.emit('document-changed');
-    }
+    // [#5769 후속2] 문서 전체(all)도 역연산화 — 구역별 before 를 변경 전에 읽어
+    // 다구역 raw 저널 커맨드로 되돌린다(SetSectionPropsAllCommand 참조).
+    const sections = Array.from({ length: this.wasm.getSectionCount() }, (_, idx) => ({
+      idx,
+      before: this.wasm.getSectionDef(idx),
+    }));
+    return applyCommandThroughRouter({
+      services: this.services,
+      label: 'SectionSettingsDialog',
+      command: (ih) => ({
+        kind: 'command',
+        command: new SetSectionPropsAllCommand(sections, newDef, ih.getCursorPosition()),
+      }),
+      fallback: () => { if (apply().ok) this.eventBus.emit('document-changed'); },
+    });
   }
 
   private populateFields(): void {

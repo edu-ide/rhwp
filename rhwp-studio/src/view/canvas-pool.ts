@@ -8,8 +8,17 @@ export class CanvasPool {
     if (!canvas) {
       canvas = document.createElement('canvas');
     }
+    canvas.classList.add('document-page-canvas');
     this.inUse.set(pageIdx, canvas);
     return canvas;
+  }
+
+  /** CanvasKit이 software fallback canvas로 교체한 경우 pool 소유권을 넘긴다. */
+  replace(pageIdx: number, current: HTMLCanvasElement, replacement: HTMLCanvasElement): void {
+    if (this.inUse.get(pageIdx) !== current) {
+      throw new Error(`페이지 ${pageIdx} Canvas 교체 대상이 현재 pool 항목과 다릅니다`);
+    }
+    this.inUse.set(pageIdx, replacement);
   }
 
   /** Canvas를 반환한다 (DOM에서 제거 후 풀에 반환) */

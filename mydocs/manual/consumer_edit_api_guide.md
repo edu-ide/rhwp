@@ -1,3 +1,10 @@
+---
+kind: reference
+status: active
+canonical: mydocs/manual/consumer_edit_api_guide.md
+last_verified: 2026-08-29
+---
+
 # @rhwp/core 편집 API 가이드 (소비자용)
 
 `@rhwp/core`(WASM) 를 앱에 임베드해 HWP 문서를 **생성·편집**하는 개발자를 위한 안내다.
@@ -15,9 +22,34 @@ const doc = HwpDocument.createEmpty();
 
 // 기존 파일 로드
 const doc2 = new HwpDocument(new Uint8Array(buffer));
+
+// 비밀번호 보호 HWP3/HWP5/HWPX 로드
+const doc3 = HwpDocument.openWithPassword(
+  new Uint8Array(protectedBuffer),
+  password,
+);
 ```
 
 > 텍스트 레이아웃 계산에는 `globalThis.measureTextWidth` 등록이 필요하다(README 참고).
+
+암호화 HWP3·HWP5·HWPX는 일반 읽기와 별도 경로이며, 암호 문서는
+`openWithPassword`로만 연다. 현재 입력 지원 상태는 다음과 같다.
+
+| 입력 형식 | 현재 상태 | API 동작 |
+|-----------|-----------|----------|
+| 암호화되지 않은 HWP3 | 지원 | `new HwpDocument(data)` |
+| HWP3 비밀번호 암호화, 압축 본문 | 읽기 지원 | `HwpDocument.openWithPassword(data, password)` |
+| HWP3 비밀번호 암호화, 비압축 본문 | 미지원 | 지원하지 않는 암호화 방식으로 예외 |
+| 암호화되지 않은 HWP5 | 지원 | `new HwpDocument(data)` |
+| HWP5 비밀번호 암호화, EncryptVersion 4 | 읽기 지원 | `HwpDocument.openWithPassword(data, password)` |
+| HWP5 EncryptVersion 1~3 | 미지원 | 지원하지 않는 암호화 방식으로 예외 |
+| 암호화되지 않은 HWPX | 지원 | `new HwpDocument(data)` |
+| 암호화 HWPX(ODF `encryption-data`, AES-256-CBC/PBKDF2) | 읽기 지원 | `HwpDocument.openWithPassword(data, password)` |
+| 암호화 HWPX(그 외 ODF 암호화 계약) | 미지원 | 지원하지 않는 암호화 방식으로 예외 |
+| DRM(Fasoo/SoftCamp 등) | 미지원 | 비밀번호 암호화와 다른 보호 방식 |
+
+> 비밀번호가 틀리거나 암호문이 손상되면 이를 구분할 수 없으므로 같은 JS 예외가
+> 발생한다.
 
 ## 2. 편집 API 한눈에
 
@@ -32,7 +64,7 @@ const doc2 = new HwpDocument(new Uint8Array(buffer));
 | 그림 | `insertPicture` |
 | 필드(누름틀) | `insertClickHereField`, `getFieldList`, `setFieldValueByName` |
 | 서식 | `applyCharFormat`, `applyParaFormat`, `setCharShapeId` |
-| 저장 | `exportHwp` (HWP 바이트 반환) |
+| 저장 | `exportHwp`, `exportHwpx`, `exportHwpWithPassword`, `exportHwpxWithPassword` |
 
 정확한 시그니처·반환은 패키지의 `rhwp.d.ts`(타입 정의)를 본다. IDE 자동완성으로 인자
 이름과 타입이 표시된다.
@@ -108,7 +140,45 @@ doc.applyCharFormatInCellEx(JSON.stringify({
 }));
 ```
 
-## 5. 0.x 버전 변경 대응
+## 5. 명시 variable-font instance 요청
+
+host가 확정한 variable font를 exact `(charShapeId, languageIndex)` slot에 연결할 때는 font bytes를 먼저
+`registerExactFontSource`로 등록하고, 별도 strict JSON command로 instance를 설정한다. 문서 parser·font name·bold·
+장평·자간으로 axis를 추측해 자동 호출하면 안 된다.
+
+```ts
+doc.registerExactFontSource(charShapeId, 0, fontBytes, 0);
+
+const setResult = JSON.parse(doc.setExactFontInstance(JSON.stringify({
+  charShapeId,
+  languageIndex: 0,
+  mode: 'boundedHorizontalLtrV1',
+  axes: [
+    { tag: 'wght', value: 650 },
+    { tag: 'opsz', value: 400 },
+  ],
+})));
+
+const clearResult = JSON.parse(doc.clearExactFontInstance(JSON.stringify({
+  charShapeId,
+  languageIndex: 0,
+  mode: 'boundedHorizontalLtrV1',
+})));
+```
+
+- options JSON은 16 KiB, axis는 16개, `languageIndex`는 0..6으로 제한된다.
+- unknown field/mode, 중복·잘못된 axis tag, 비유한 값, font의 `fvar` 범위 밖 값은 요청 snapshot 변경 전에
+  예외로 거절된다.
+- axis 순서는 canonical tag 순서로 정렬되고 `fvar` default 값은 응답 axis에서 생략된다. 빈 axis 또는 explicit
+  default 요청은 유효하며 clear와 같지 않다.
+- 같은 canonical request의 재설정과 이미 비어 있는 slot의 clear는 멱등이다. 응답의 `status`와
+  `requestGeneration`으로 effective mutation 여부를 확인할 수 있다.
+- 반환 JSON에는 상태·slot·canonical axis·source/request generation·request count만 있고 font bytes·문서 text·
+  host path는 포함되지 않는다.
+- 이 API는 명시 요청 owner다. 호출 성공 자체가 모든 문단·backend에서 variable instance가 시각적으로 게시됐다는
+  뜻은 아니며, 지원되지 않는 형상과 backend는 기존 default `TextRun`으로 결정론적으로 fallback한다.
+
+## 6. 0.x 버전 변경 대응
 
 `@rhwp/core` 는 0.x 단계라 편집 API 시그니처가 바뀔 수 있다. 업그레이드 비용을 줄이려면:
 
@@ -117,14 +187,25 @@ doc.applyCharFormatInCellEx(JSON.stringify({
 - 업그레이드 시 CHANGELOG 의 `### API` 항목을 확인한다(인자 추가·index 변경을 기록).
 - 타입 검사(`tsc`)로 시그니처 불일치를 빌드 단계에서 잡는다.
 
-## 6. 저장
+## 7. 저장
 
 ```ts
 const hwpBytes = doc.exportHwp(); // Uint8Array — .hwp 파일로 저장
+
+// HWP5 EncryptVersion 4 비밀번호 문서로 저장
+const protectedHwpBytes = doc.exportHwpWithPassword(password);
+
+// ODF AES-256-CBC/PBKDF2 비밀번호 HWPX로 저장
+const protectedHwpxBytes = doc.exportHwpxWithPassword(password);
 ```
 
-> 편집 결과를 원본 HWPX 형식으로 되돌려 저장하는 기능은 제한적이다. 현재는 HWP(.hwp)
-> 저장을 권장한다.
+`exportHwpWithPassword(password)`는 HWP5 EncryptVersion 4로, `exportHwpxWithPassword(password)`는
+ODF `encryption-data`의 AES-256-CBC/PBKDF2 계약으로 저장한다. HWPX 출처를 HWP로 저장할 때는
+일반 HWP 저장과 동일하게 HWPX-to-HWP adapter를 먼저 적용한다.
+
+`exportHwp()`와 `exportHwpx()`는 언제나 평문 출력이다. 비밀번호로 연 문서를 보호 상태로
+다시 저장하려면 명시적으로 `*WithPassword` 메서드를 호출해야 한다. 호출자는 비밀번호를
+로그, 파일명, URL, 브라우저 저장소에 기록하지 않아야 하며, 사용 뒤 참조를 즉시 비운다.
 
 ## 관련
 

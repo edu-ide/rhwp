@@ -19,14 +19,14 @@ fn svg_text_content(svg: &str) -> String {
 
     loop {
         match reader.read_event_into(&mut buf) {
-            Ok(quick_xml::events::Event::Start(e)) if e.name().as_ref() == b"text" => {
+            Ok(quick_xml::events::Event::Start(e)) if e.name().as_ref() == "text" => {
                 in_text = true;
             }
-            Ok(quick_xml::events::Event::End(e)) if e.name().as_ref() == b"text" => {
+            Ok(quick_xml::events::Event::End(e)) if e.name().as_ref() == "text" => {
                 in_text = false;
             }
             Ok(quick_xml::events::Event::Text(e)) if in_text => {
-                out.push_str(&e.decode().expect("decode SVG text node"));
+                out.push_str(e.as_ref());
             }
             Ok(quick_xml::events::Event::Eof) => break,
             Ok(_) => {}
@@ -126,6 +126,34 @@ fn issue_937_f081c_filler_should_not_render_as_text() {
         expand_pua_render_text("A\u{F081C}B"),
         "AB",
         "U+F081C filler 제거가 주변 텍스트 순서를 바꾸면 안 됨",
+    );
+}
+
+#[test]
+fn issue_937_f02fc_callout_bullet_should_render_as_pointer() {
+    assert_eq!(
+        expand_pua_render_text("\u{F02FC} 전자서명"),
+        "► 전자서명",
+        "U+F02FC 한컴 PUA callout bullet 는 missing glyph 대신 right pointer 로 표시되어야 함",
+    );
+    assert_eq!(
+        pua_to_display_text('\u{F02FC}').as_deref(),
+        Some("►"),
+        "CharOverlap/display helper 도 같은 U+F02FC 표시 문자열을 반환해야 함",
+    );
+}
+
+#[test]
+fn issue_937_f031c_toc_bullet_should_render_as_square() {
+    assert_eq!(
+        expand_pua_render_text("\u{F031C} 행정업무"),
+        "■ 행정업무",
+        "U+F031C 한컴 PUA TOC bullet 는 missing glyph 대신 black square 로 표시되어야 함",
+    );
+    assert_eq!(
+        pua_to_display_text('\u{F031C}').as_deref(),
+        Some("■"),
+        "CharOverlap/display helper 도 같은 U+F031C 표시 문자열을 반환해야 함",
     );
 }
 

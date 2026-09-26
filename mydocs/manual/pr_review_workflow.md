@@ -1,472 +1,372 @@
-# PR 리뷰 · 통합 워크플로우 매뉴얼
-
-**작성일**: 2026-04-23
-**대상**: rhwp 메인테이너 (외부 PR 처리 담당) + collaborator self-merge 후보 예외 경로
-**교훈 기반**: v0.2.1 사이클 외부 기여자 9명 / PR 10+ 건 통합 경험
-
+---
+kind: canonical
+status: active
+canonical: mydocs/manual/pr_review_workflow.md
+last_verified: 2026-08-30
 ---
 
-## 1. 개요
+# PR 리뷰 · 통합 워크플로우 매뉴얼
 
-rhwp 는 v0.2.1 사이클부터 외부 기여자 PR 이 급증했다. 하이퍼-워터폴 방법론에 맞춰 **PR 처리도 표준화된 절차** 로 운영한다. 본 매뉴얼의 기본 경로는 외부 PR 도착 시 메인테이너가 따르는 순서를 기록한다.
+**대상**: rhwp 메인테이너, collaborator, 외부 PR 처리 담당
+**역할**: 공통 계약과 조건별 절차의 라우터
 
-운영 경로는 다음 세 가지로 구분한다.
+이 문서는 안정적인 canonical 진입 경로다. 세부 명령과 역할별 절차를 모두 반복하지 않는다.
+PR review를 시작하는 에이전트는 이 문서와 [조건별 가이드 선택표](pr_review/README.md)를 먼저 읽고,
+선택표가 가리키는 자식 문서를 **작업 전에** 모두 읽는다.
 
-- **maintainer 일반 경로**: 메인테이너가 외부 기여자 PR 을 검토, merge, 후속 보고한다. 이 문서의 기본 절차다.
-- **collaborator self-merge 후보 예외 경로**: collaborator 가 본인 PR 을 merge 후보로 준비하면서 review 문서를 PR head 에 포함하는 경우다. 이 경로는 8장 조건을 만족할 때만 적용한다.
-- **collaborator-mediated 외부 PR 경로**: 외부 contributor PR 을 repository collaborator 가 검토·merge 준비하면서 review 문서를 PR head 에 포함하는 경우다. 이 경로는 9장 조건을 만족할 때만 적용한다.
+## 1. 공통 계약
 
-명령 예시는 원본 저장소 remote 가 `upstream` 인 현재 로컬 checkout 기준이다. 원본 저장소를 `origin` 으로 둔 maintainer checkout 에서는 같은 명령의 remote 이름만 `origin` 으로 치환한다.
+rhwp의 PR 처리는 외부 contributor PR, collaborator self PR, collaborator가 매개하는 외부 PR을
+구분한다. 권한과 변경 위치가 다르므로 한 경로의 예외를 다른 경로에 일반화하지 않는다.
 
-## 2. PR 도착 시 확인 체크리스트
+- **maintainer**는 원본 저장소의 admin 또는 branch-protection bypass 권한을 가진 사람이다.
+  코드 동작을 바꾸지 않는 merge 후 운영 기록만 devel에 직접 반영할 수 있다.
+- **collaborator**는 write 권한이 있지만 branch protection을 우회하지 않으며, 원칙적으로 PR로
+  변경을 반영한다.
+- **contributor**는 외부 fork 또는 contributor branch에서 PR을 제출한 사람이다.
 
-새 PR 이 열리면 다음을 순서대로 확인한다.
+소스, 테스트, CI workflow, golden/baseline, 기존 샘플 변경은 maintainer라도 일반 PR과 최신 CI를
+기본으로 한다. GitHub review, comment, push, ready 전환, merge, close는 각각 작업지시자의 명시 승인을
+받은 뒤에만 수행한다.
 
-### 2.1 기본 메타
+Rust source 또는 Rust test/baseline helper가 바뀐 PR은 `local_validation.md` 4.3의 Rust lint 묶음
+(format, native Clippy, WASM32 Clippy, workspace all-target Clippy)을 **PR 생성 전에** 통과해야 한다.
+focused test 또는 과거 녹색 CI는 이 선행 lint gate를 대체하지 않는다. GitHub Full CI 재사용은 정확한
+기존 code head를 재검토할 때의 광범위 회귀 생략 규칙일 뿐, maintainer 보정이나 새 code/test/baseline
+commit의 lint 생략 규칙이 아니다.
 
-- [ ] **base 브랜치**: `devel` 이어야 함. `main` 이면 rebase 요청 (이전 재리젝 사례: PR #234)
-- [ ] **연관 이슈**: PR description 에 `closes #N` 또는 `#N` 참조가 있어야 함. 없으면 코멘트로 요청
-- [ ] **mergeable state**: `MERGEABLE` + `CLEAN` / `BEHIND` / `DIRTY` 중 확인
-- [ ] **CI 상태**: `Build & Test` / `CodeQL` 실행 결과
+### 1.1 최종 판정 용어와 원격 조치의 분리
 
-### 2.2 규모 분석
+모든 정식 `pr_N_review.md`는 최종 판정을 아래 셋 중 **정확히 하나**로 적는다. `close`,
+`rebase 요청`, `comment 게시`, GitHub review의 `approve`, `merge`는 판정명이 아니라 그 판정 뒤에
+작업지시자 승인을 받아 수행할 수 있는 별도 조치다.
 
-```bash
-gh pr view N --repo edwardkim/rhwp --json additions,deletions,files,commits
+| 최종 판정 | 의미 | review 문서에 반드시 남길 내용 |
+| --- | --- | --- |
+| `승인` | 현재 검토 대상 head 또는 명시한 통합 head가 주장 범위의 증적과 적용 검증을 충족한다. | 검증한 SHA·범위·잔여 risk, merge 전 최신 head CI와 작업지시자 승인 조건 |
+| `머지 보류` | 현재 head는 병합하면 안 된다. 증적 부족, 재현된 결함, CI 실패, 범위 밖 위험 중 적어도 하나가 blocker다. | blocker와 근거, 보류를 해제할 정확한 증적·수정·CI 조건, 원격 조치를 하지 않는다는 상태 |
+| `메인터너 보정 후 수용 가능` | contributor 원 head 자체는 그대로 수용할 수 없지만, 범위를 제한한 maintainer 보정 commit을 적용한 통합 head는 수용 후보가 될 수 있다. | 원 head와 보정 SHA의 구분, 보정 이유·소유자, 보정 뒤 필요한 검증과 통합 PR 경로 |
+
+`승인`은 GitHub의 review event 또는 admin merge 권한 행사를 뜻하지 않는다. 세 판정 어느 것도
+최신 head의 required check, mergeability 재확인, 작업지시자의 원격 승인 게이트를 생략하지 않는다.
+`메인터너 보정 후 수용 가능`은 원 contributor PR을 직접 merge해도 된다는 뜻이 아니며, 보정이 포함된
+명시적 integration head만 다음 단계의 검토 대상이 된다.
+
+### 1.2 PR 번호 채번과 review 기록
+
+PR 번호는 PR을 생성할 때 채번된다. 따라서 collaborator self PR의 번호 기반 review 기록은
+다음 순서로 같은 PR에 포함한다.
+
+1. 구현과 로컬 검증이 끝난 후보 commit을 원격 작업 branch에 push한다.
+2. 작업지시자의 PR 생성 승인 후 Open PR을 생성해 번호 `N`을 받는다. 완료된 후보에
+   번호만 확보하려고 Draft를 생성하지 않는다.
+3. reviewer assign 승인과 역할별 접수 절차를 수행한 뒤 `pr_N_review.md`와 필요한 오늘할일을
+   작성해 같은 source branch에 review 기록 commit으로 push한다.
+4. review 기록이 포함된 최신 head의 required check를 확인하고, 작업지시자 승인 후 merge한다.
+
+외부 contributor PR처럼 PR이 이미 존재하는 경우에는 발급된 번호로 바로 review 접수를 시작한다.
+Draft는 WIP 공유나 조기 검토가 필요하고 그 상태 변경을 작업지시자가 명시적으로 승인한 경우에만
+사용한다. 정확한 생성 순서와 승인 게이트는 [문서와 Git 워크플로우](codex/docs_and_git_workflow.md#internal-task-pr-approval)를
+따른다.
+
+## 2. 필수 라우팅
+
+라우팅 판정에는 PR·이슈 metadata, diff, CI 상태를 읽는 행위만 사용한다. 이 판정 단계에서는 reviewer
+assign, branch fetch, comment, push 같은 상태 변경을 하지 않는다.
+
+1. 이 모 문서와 [조건별 가이드 선택표](pr_review/README.md)를 읽는다.
+2. 아래 표에서 **기본 경로 하나**를 고른다.
+3. 변경 범위와 현재 상태에 해당하는 **보조 경로를 모두** 고른다.
+4. reviewer assign, local fetch, review 문서 작성, GitHub 변경처럼 상태를 바꾸기 전에 다음 형식으로
+   상태 보고 또는 review 문서에 기록한다.
+
+~~~text
+base route: <문서명>
+modifiers: <없음 또는 문서명 목록>
+loaded documents: pr_review_workflow.md, pr_review/README.md, ...
+current head: <작성 시점 참고 SHA 또는 재확인 필요>
+~~~
+
+| 기본 경로 | 적용 조건 | 반드시 읽을 문서 |
+| --- | --- | --- |
+| maintainer 일반 | maintainer가 외부 PR을 검토·통합·후속 처리 | [maintainer 일반 경로](pr_review/maintainer_general.md) |
+| collaborator self-merge | collaborator가 본인 PR을 merge 후보로 준비 | [collaborator self-merge](pr_review/collaborator_self_merge.md) |
+| collaborator 매개 외부 PR | collaborator가 contributor PR head에 검토 기록 또는 보정을 더함 | [collaborator 매개 외부 PR](pr_review/collaborator_external_pr.md) |
+
+| 보조 경로 | 적용 조건 | 반드시 읽을 문서 |
+| --- | --- | --- |
+| 접수·리뷰 기록 | 모든 정식 PR review | [PR 접수와 리뷰 기록](pr_review/intake_and_review.md) |
+| 로컬 검증 | fetch, merge simulation, Cargo, npm, fixture 검증을 수행 | [로컬 검증](pr_review/local_validation.md) |
+| 첫 기여자 외부 PR | rhwp에 처음 기여하는 외부 contributor PR | [첫 기여자 외부 PR 처리](pr_review/first_time_contributor.md) |
+| 시각·fixture 증적 | renderer/layout/paint, HWP/HWPX/PDF sample, 기준 PDF, 페이지·표·wrap·clipping 주장 | [시각·fixture 증적](pr_review/visual_fixture_evidence.md) |
+| 다수 PR·update branch | 대량 유입, 누적 cherry-pick, stale SHA CI 취소, update branch 발생 | [다수 PR과 update branch](pr_review/multi_pr_update_branch.md) |
+| review-only fast-pass | code PR 뒤 review 기록만 추가하거나 PR 전체가 문서·허용된 신규 기준 자료뿐임 | [review-only fast-pass](pr_review/review_only_fast_pass.md) |
+| merge 후 | 원 코드 PR 또는 후속 기록 PR이 merge됨 | [merge 후속 처리](pr_review/post_merge.md) |
+| 재작업·예외 | close/rework, Dependabot, 오래된 base, 대형 PR | [재작업과 예외](pr_review/rework_and_exceptions.md) |
+
+기본 경로 또는 보조 경로가 애매하면, 상태 변경 없이 필요한 metadata를 더 확인한 뒤 작업지시자에게
+판단을 요청한다. 편의상 모든 자식 문서를 읽는 방식은 금지한다. 기본 경로 하나와 실제 조건에 맞는 보조
+문서만 읽어야 누락과 불필요한 절차를 함께 줄일 수 있다.
+
+## 3. 병렬 실행과 순차 게이트
+
+같은 checkout의 Cargo 검토 명령은 `target/pr-review`를 공유해 **순차 실행**한다. 긴 baseline은 별도
+Cargo 명령을 동시에 띄우지 말고 `.config/nextest.toml`의 nextest priority로 같은 run 안에서 먼저
+스케줄한다. 이는 고정 target cache의 재사용과 실행 중 산출물의 무결성을 함께 보장한다.
+
+### 3.1 GitHub Actions의 실제 병렬 구조
+
+[CI workflow](../../.github/workflows/ci.yml)는 다음 의존 그래프로 동작한다. PR review 담당자는 CI가
+모든 job을 순차 실행한다고 가정하지 않는다.
+
+~~~text
+CI preflight
+    ├─ Frontend unit/package gate (해당 mode만 실행)
+    ├─ Lint (rust=true일 때만)
+    ├─ Native Skia tests (native=true, lint 결과를 조건부 확인)
+    └─ Rust builders (rust=true, lint success, frontend 예상 결과)
+                         │
+          Default-feature tests: slow + 일반 shard 1/3, 2/3, 3/3
+          (자기 builder success, Native는 required→success / 미해당→skipped)
+                         │
+                 Build & Test 영향축 집계
+~~~
+
+- Frontend unit/package gate는 `frontend_mode`에 맞는 job 하나만 실행하고, Rust lint는
+  `rust_required=true`일 때만 실행한다. 둘은 preflight 뒤 서로 독립적으로 시작할 수 있다.
+- slow+`2` builder, regular `1` builder, regular `3` builder는 Rust가 필요하고 lint가 성공했으며,
+  frontend job이 mode에 맞게 success 또는 skipped인 뒤 실행한다. 각 builder는 자기 Cargo test
+  target만 빌드해 `slow`, `1`, `2`, `3` archive 중 맡은 항목만 upload한다.
+- Native Skia job은 `native_skia_required=true`일 때만 실행한다. Rust lane이 같이 필요하면 lint success,
+  Rust가 불필요하면 lint skipped를 요구하고 frontend mode의 예상 결과도 확인한다.
+- `slow shard`와 일반 `2/3`은 slow+`2` builder, 일반 `1/3`은 regular `1` builder, 일반 `3/3`은
+  regular `3` builder 성공 뒤 시작한다. Native가 필요하면 Native success, 필요하지 않으면
+  skipped를 요구한다. 네 worker는 독립 job이며 집계 job이 각 영향축의 `success|skipped` 조합을 확인한다.
+- review-only fast-pass는 heavy job이 skipped일 수 있다. 이때도 preflight와 branch protection이
+  요구하는 집계 상태를 최신 PR head 기준으로 확인한다.
+
+CodeQL, Render Diff 등 별도 workflow의 결과도 같은 PR head 기준으로 관찰할 수 있다. 이전 head의 run은
+현재 head의 required check로 취급하지 않으며, update branch가 있으면 해당 보조 경로의 stale-run 규칙을
+따른다.
+
+### 3.2 CI 대기 중 병렬로 가능한 일
+
+아래 작업은 같은 최신 head를 기준으로 하고 결과를 다시 확인하는 조건에서 CI 대기와 병렬로 수행할 수 있다.
+
+- PR/이슈 metadata, diff, 기존 보고서, 기존 CI log의 읽기 전용 조사
+- review 문서의 사실·검증 계획 초안, 시각 증적의 출처와 SHA-256 목록 작성
+- merge 후 사용할 issue/PR comment의 **초안** 작성
+- 다른 PR의 접수 분류. 단, 각 PR의 reviewer assign과 최종 판단은 해당 PR별로 기록한다.
+
+CI가 끝난 뒤 또는 contributor가 새 commit을 push한 뒤에는 head SHA, mergeable 상태, required check를
+다시 읽는다. 초안·이전 CI 결과를 최신 head의 최종 판정으로 재사용하지 않는다. 새 head가 최신
+`devel` 병합 또는 update branch를 포함하면 로컬 `devel`과 visibility review branch도 같은 기준선으로
+갱신하고, PR 고유 diff와 재실행할 검증 범위를 다시 판정한다. 상세 절차는
+[다수 PR과 update branch](pr_review/multi_pr_update_branch.md)의 "2.6 검토 중 기준선 갱신"을 따른다.
+collaborator가 contributor PR head에 review-only 기록을 직접 push할 예정이면, 최종 archive review·오늘할일·
+증적 commit은 새 head를 fetch하고 reviewer 기록을 그 위의 단순 trailing commit으로 정렬한 뒤에만 만든다.
+문서 기록만 만들기 위해 최신 `devel`을 contributor branch에 merge하거나 rebase하지 않는다. branch가 최신
+base 반영을 강제하지 않는 정책이면, 같은 PR·같은 source repository·같은 code candidate SHA의 녹색 aggregate를
+재사용해 trailing review-only commit을 fast-pass할 수 있다. contributor가 source·test를 새로 push한 경우에는
+그 새 code head의 CI를 먼저 통과시킨 뒤 review 기록을 한 번만 이어 붙인다.
+
+PR 자체가 workflow·action·CI impact 정책을 바꾼 경우에는 PR head의 이 판단을 그대로 신뢰하지 않는다.
+기본 브랜치 trusted controller가 exact Full candidate와 review-only tail을 증명한 same-repository PR만
+[review-only fast-pass의 A.1](pr_review/review_only_fast_pass.md#a1-ci-실행-정책을-바꾼-pr의-trusted-재사용)에
+따라 예외 처리한다. controller가 아직 `main`에 활성화되지 않았거나 status가 불완전하면 Full CI를 기다린다.
+
+단, GitHub의 `MERGEABLE` 표시는 텍스트 충돌이 없다는 참고값일 뿐 최신 `devel`과의 컴파일·테스트 호환을
+보장하지 않는다. source가 공용 struct·trait·API를 바꾼 뒤 최신 `devel`이 그 API의 초기화·호출부를
+추가했다면 current-base merge tree의 CI가 실패할 수 있다. 이 사실이 `git merge-tree` 또는 최신 PR head의
+GitHub CI로 확인된 경우에는 문서 기록 경로가 아니라 코드 호환 보정 경로로 전환한다. 외부 contributor commit은
+재작성하지 않고, 필요한 경우에만 현재 contributor source branch에 정확한 최신 `upstream/devel`을 merge한 뒤
+호환 보정 code/test commit을 분리한다. 이 경로는 [collaborator 매개 외부 PR의 최신 `devel` 호환 보정](pr_review/collaborator_external_pr.md#9314-최신-devel-호환-보정)을
+따르며, 새 code head는 반드시 Full CI를 다시 통과해야 한다.
+
+#### 3.2.1 최신 `devel` 오늘할일을 보존하는 trailing 기록
+
+contributor source branch의 `mydocs/orders/YYYYMMDD.md`가 최신 `upstream/devel`보다 오래될 수 있다.
+이 경우 review 기록을 추가하려고 최신 `devel`의 오늘할일 전체를 source에 복사하거나 `devel`을 merge/rebase하면,
+source에 없는 archive link를 도입하거나 today add/add 충돌과 불필요한 full CI를 만들 수 있다.
+
+1. `git fetch upstream devel` 뒤 `git diff HEAD..upstream/devel -- mydocs/orders/YYYYMMDD.md`로 최신 base의
+   변경 구간을 확인한다.
+2. contributor source에 이미 있는 오늘할일은 보존하고, 현재 PR의 항목만 위 diff에서 변경되지 않은 section
+   경계에 추가한다. 최신 `devel`의 다른 PR 기록을 source branch에 복사하지 않는다.
+3. trailing 문서 commit을 만든 뒤 최신 `upstream/devel`에서 merge simulation을 수행한다. merge tree의
+   `git diff --check`와 변경한 오늘할일·review 문서의 Markdown 링크 검사가 모두 통과해야 한다.
+
+이 방식은 source history를 선형으로 유지하면서, 실제 merge tree에는 최신 `devel`의 기존 오늘 기록과
+현재 PR 기록이 함께 남는지 확인한다. 변경되지 않은 경계를 찾을 수 없거나 simulation이 충돌하면 source에
+`devel`을 억지로 병합하지 말고 작업지시자에게 보고한다. 불가피하게 current base를 병합해 오늘할일 충돌을
+해소한 경우에는 [review-only fast-pass](pr_review/review_only_fast_pass.md)의 `mydocs/` 한정 bridge 검증을
+따르며, source·test·workflow·증적 파일 충돌 해소에는 이 예외를 적용하지 않는다.
+
+#### 3.2.2 녹색 GitHub code head의 중복 로컬 전체 회귀 생략
+
+외부 또는 collaborator PR을 **검토**하는 단계에서, 정확한 code head가 이미 GitHub의 Full CI와
+변경 범위에 맞는 별도 required check(CodeQL, Render Diff 등)를 모두 통과했고, 검토자가 그 뒤에
+source·test·fixture·workflow 보정을 추가하지 않았다면 같은 전체 Rust 회귀를 로컬에서 다시 실행하지
+않는다. 이 예외는 contributor의 PR 생성 전 사전 검증이나 maintainer 보정 뒤의 검증 의무를 줄이지 않는다.
+
+다음 조건을 모두 확인해야 한다.
+
+1. review 문서에 기록한 code candidate SHA와 GitHub 녹색 run의 head SHA가 정확히 같다.
+2. candidate 뒤의 변경은 review·오늘할일 등 review-only 문서이거나, 검증한 current-base merge tree의
+   `mydocs/` 한정 bridge다. 코드, test, fixture, baseline, workflow, PDF/asset 보정은 하나도 없다.
+3. 현재 `upstream/devel`과의 merge simulation이 충돌 없이 통과했거나, 허용된 `mydocs/` bridge 검증을
+   통과했다. 이때도 `git diff --check`와 변경 문서 링크 검사는 실행한다.
+4. renderer/layout 계열이면 focused Rust test와 실제 WASM/브라우저 또는 동등한 시각 검증을 별도로
+   실행해, GitHub 전체 회귀가 놓칠 수 있는 이번 검토의 핵심 경로를 확인한다.
+
+이 조건에서는 [로컬 검증의 `release-test` 전체 nextest 회귀](pr_review/local_validation.md)와 Native Skia 전체 묶음처럼 이미 같은 code
+candidate에서 성공한 광범위 로컬 회귀를 중복 실행하지 않는다. 이미 시작한 명령을 중지했다면 결과를
+`PASS`로 기록하지 말고 중지 사실과 이유를 적는다. review 문서에는 candidate SHA, 재사용한 GitHub
+run URL 또는 run 번호, 실행한 focused 검증, 생략한 전체 검증과 사유를 모두 남긴다. 최신 head의
+fast-pass 또는 Full CI aggregate 성공은 여전히 merge 직전 다시 확인한다.
+
+### 3.3 순차로 유지할 일
+
+공유 상태를 바꾸거나 선행 결과가 필요한 작업은 아래 순서를 지킨다.
+
+- 하나의 checkout, `target/pr-review`, Cargo cache를 공유하는 cargo test, cargo clippy, cargo build,
+  wasm-pack은 순차 실행한다. 로컬 검증을 CI처럼 여러 Cargo 실행으로 병렬화하지 않는다. 장시간 테스트는
+  `.config/nextest.toml`의 우선순위로 같은 nextest 실행 안에서 먼저 시작한다.
+- 전체 integration 회귀를 `cargo test --profile release-test --tests`로 대체하지 않는다. 이 명령은
+  unsharded libtest 경로이며, 표준 PR review 경로는
+  [로컬 검증](pr_review/local_validation.md#고정-review-target과-실행-환경)의 `--locked` nextest
+  명령이다. `cargo test`는 해당 문서가 이름을 지정한 focused 또는 Native Skia lib 검증에만 사용한다.
+- branch fetch 이후의 merge simulation, cherry-pick, conflict resolution, commit, push, update branch,
+  merge와 stale run force-cancel은 대상 SHA를 확인한 뒤 순차로 실행한다.
+- 실제 GitHub review/comment, issue close, PR close는 승인과 선행 조건이 갖춰진 뒤에만 게시한다.
+- merge 후에는 merge SHA 확인 → 문서·asset의 devel 반영 → 최종 devel sync → issue 상태 확인 및
+  comment → branch/worktree/검토 전용 target 정리 순서를 지킨다. 이때 worktree 정리에는 commit을
+  만들지 않았더라도 이번 PR의 diff·CI·재현·검증만을 위해 만든 local 검토 worktree를 포함한다. raw image
+  URL을 쓰는 comment는 asset이 devel에 존재한 뒤에만 게시한다.
+
+서로 다른 host, worktree, CARGO_TARGET_DIR, Cargo home이 실제로 분리된 경우에도 로컬 Cargo 병렬 실행은
+이 매뉴얼의 기본 경로가 아니다. 필요하면 별도 작업 계획과 작업지시자 승인을 받아 lock·disk·결과 귀속을
+명확히 한 뒤에만 사용한다.
+
+### 3.4 GitHub Markdown 본문 전송
+
+여러 단락의 review·comment·issue comment에는 실제 LF 줄바꿈을 전송한다. 셸 큰따옴표 안의 `\n`은
+줄바꿈이 아니라 문자 그대로이므로 `--body "...\n..."` 또는 `--comment "...\n..."`로 게시하지 않는다.
+
+- PR review와 PR comment는 실제 줄바꿈을 담은 임시 Markdown 파일을 만들고 `--body-file`로 보낸다.
+  `gh pr review N --repo edwardkim/rhwp --approve --body-file <review.md>`,
+  `gh pr comment N --repo edwardkim/rhwp --body-file <comment.md>`처럼 실행한다.
+- 여러 단락의 issue 후속 기록은 `gh issue close N`과 `gh issue comment N --body-file <comment.md>`로
+  분리한다. `gh issue close --comment`는 한 줄의 짧은 기록에만 쓴다.
+- `gh api --input <json>`을 쓸 때는 JSON의 `\n` escape가 실제 LF로 해석되는 유효 JSON인지 확인한다.
+- 게시 직후 해당 review/comment API의 `body`를 읽어 literal `\\n`이 남지 않았는지 확인하고, 임시 본문
+  파일은 정확한 경로만 정리한다.
+
+#### 3.4.1 Windows PowerShell 한글 본문
+
+Windows PowerShell 5.1의 here-string을 `gh ... --body-file -`에 직접 pipe하면 현재 console code page나
+UTF-8 BOM이 `gh` 표준입력에 섞일 수 있다. 그러면 GitHub에는 한글이 `??`로 치환되거나 본문 첫 글자
+앞에 보이지 않는 BOM이 남는다. 한글을 포함한 다단락 PR 본문·review·comment에는 **UTF-8 without BOM
+파일 경로**만 사용한다.
+
+```powershell
+$body = @'
+## 변경 요약
+
+- 한글 본문 예시
+'@
+$bodyPath = Join-Path $env:TEMP "rhwp-pr-body-$PID.md"
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+[System.IO.File]::WriteAllText($bodyPath, $body, $utf8NoBom)
+
+# 생성 또는 수정 중 하나를 사용한다.
+gh pr create --repo edwardkim/rhwp --base devel --head <branch> --body-file $bodyPath
+gh pr edit <N> --repo edwardkim/rhwp --body-file $bodyPath
+
+$posted = (gh pr view <N> --repo edwardkim/rhwp --json body | ConvertFrom-Json).body
+if ($posted.Length -eq 0 -or [int][char]$posted[0] -eq 0xFEFF -or $posted.Contains('??')) {
+    throw 'PR 본문 UTF-8 전송을 다시 확인하세요.'
+}
+Remove-Item -LiteralPath $bodyPath
 ```
 
-- 규모 파악 → 리뷰 시간 예측
-- **대형 PR** (>1000 라인) → 별도 검토 사이클, 바로 머지 불가
-- **소형 PR** (<100 라인) → admin merge 고려 가능
+`<N>`은 `gh pr create`가 성공한 뒤 실제 번호로 바꾼다. create 직후 본문을 검증할 때는 같은 방식으로
+`gh pr view`를 실행한다. `??`가 문서 내용으로 의도된 경우에는 그 검사 대신 예상한 한글 제목·문장을
+`Contains()`로 확인한다. 임시 파일은 정확한 `$bodyPath`만 정리하며, `.env`·token·server URL을 본문이나
+검증 출력에 넣지 않는다.
 
-### 2.3 작성자 확인
+## 4. review 산출물의 공통 규칙
 
-- **FIRST_TIME_CONTRIBUTOR**: 환영 인사 + 세심한 피드백 톤
-- **기존 기여자**: 이전 PR 컨텍스트 참고
+PR review 문서는 merge 후에도 모순되지 않아야 한다. draft, mergeable, head SHA, CI 상태는
+작성 시점 참고값으로만 적고, 최종 조건에는 항상 최신 head의 CI와 작업지시자 승인을 둔다.
 
-## 3. 리뷰 문서 작성
+### 4.1 완료한 검증의 시제
 
-maintainer 일반 경로에서는 각 PR 마다 리뷰 문서 2건을 active 경로에 작성한다.
-
-```text
-mydocs/pr/pr_{N}_review.md
-mydocs/pr/pr_{N}_review_impl.md
-```
-
-처리 완료 후 7.5 절에서 `mydocs/pr/archives/` 로 이동한다. collaborator self-merge 후보 또는
-collaborator-mediated 외부 PR 처럼 처음부터 archive 경로에 작성하는 방식은 8장·9장 예외 경로에서만
-사용한다.
-
-### 3.1 리뷰 문서 (`pr_N_review.md`)
-
-포함 항목:
-- PR 메타 표 (번호 / 작성자 / base / 규모 / mergeable 작성 시점 참고값)
-- 관련 이슈 요약
-- 변경 범위 분석 (핵심 기능 / 메타 변경 / 범위 외)
-- 사전 검증 결과 (로컬 빌드 / 테스트 / Clippy / doctest)
-- 주요 문제점 / 리스크
-- 최종 권고 (admin merge / rebase 요청 / 재작업 요청 / close)
-
-예시: `mydocs/pr/archives/pr_234_review.md` (재작업 요청), `mydocs/pr/archives/pr_251_review.md` (admin merge 권고)
-
-### 3.2 구현 계획서 (`pr_N_review_impl.md`)
-
-포함 항목:
-- 커밋별 SHA + 제목
-- Stage 구성 (승인 → merge → sync → cleanup)
-- 작업지시자 확인 필요 사항 (merge 방식, 코멘트 톤, 후속 이슈)
-
-### 3.3 volatile 상태값 기록 규칙
-
-PR review 문서는 merge 후에도 모순되지 않아야 한다. 따라서 다음 값은 확정 사실처럼 기록하지 않는다.
-
-- `draft`
-- `mergeable`
-- `head SHA`
-- `CI 상태`
-
-필요하면 다음 방식으로만 기록한다.
-
-- "문서 작성 시점 참고값: ..."
-- "merge 전 최신 상태 확인 필요"
-- "최종 merge 조건: PR head 최신 커밋 기준 GitHub Actions 통과 + 작업지시자 승인"
-
-금지 예시:
-
-- `draft: true` 를 현재 상태처럼 단정
-- `mergeable: CLEAN` 을 최종 merge 가능 판정처럼 기록
-- 특정 `head SHA` 를 "현재 head" 로만 적고 merge 전 재확인 조건을 남기지 않음
-- 과거 GitHub Actions 통과 상태를 최신 통과 조건 없이 최종 판정처럼 기록
-
-## 4. 로컬 사전 검증
-
-### 4.1 PR 브랜치 fetch
-
-```bash
-git fetch upstream pull/N/head:local/prN
-```
-
-### 4.2 Merge 시뮬레이션
-
-```bash
-git checkout -b prN-merge-test local/prN
-git merge upstream/devel --no-commit --no-ff
-# 충돌 여부 확인
-git status
-```
-
-충돌 없으면 그대로 진행, 충돌 시 해결 방침 작업지시자 결정 요청.
-
-### 4.3 빌드 · 테스트
-
-```bash
-cargo build --release
-cargo test --release --lib
-cargo test --profile release-test --tests
-cargo fmt --check
-git diff --check
-cargo clippy --all-targets -- -D warnings
-cargo test --doc
-cd rhwp-studio && npx tsc --noEmit
-cd rhwp-studio && npm test
-wasm-pack build --target web --out-dir pkg
-```
-
-**렌더 영향 PR 추가 체크**:
-
-```bash
-cargo test --test svg_snapshot
-```
-
-실패 시 `UPDATE_GOLDEN=1` 으로 재생성해야 하지만 **PR 머지 후가 아닌 머지 전에도 확인 필요**. 실패하면 작업지시자와 상의 (의도된 렌더 변경인지 버그인지).
-
-### 4.4 정리
-
-```bash
-git merge --abort
-git checkout local/devel
-git branch -D prN-merge-test
-```
-
-## 5. 작업지시자 승인 요청
-
-리뷰 문서 2건을 근거로 승인 요청. 예시 포맷:
-
-```
-PR #N 검토 결과 · admin merge 준비 완료.
-
-- mergeable: MERGEABLE / BEHIND (승인 요청 시점 참고값, merge 전 재확인)
-- 충돌 시뮬레이션: 0건
-- cargo test --lib: XYZ passed
-- Clippy: 0 warning
-- 리뷰 문서: mydocs/pr/pr_N_review.md
-- merge 전 조건: PR head 최신 커밋 기준 GitHub Actions 통과 + 작업지시자 승인
-
-어떻게 진행할까요?
-- A) admin merge
-- B) 추가 검증
-- C) 보류
-```
-
-## 6. Admin Merge 수행
-
-```bash
-gh pr merge N --repo edwardkim/rhwp --merge --admin
-```
-
-**주의**: `--admin` 플래그는 BEHIND 상태도 강제 머지한다. 프로젝트가 "devel 만 push · main 은 릴리즈 시" 정책이므로 `--admin` 이 기본.
-
-## 7. 후속 처리 (필수 순서)
-
-### 7.1 이슈 Close 확인
-
-GitHub auto-close 가 **자주 실패**한다. 수동 확인:
-
-```bash
-gh issue view N --repo edwardkim/rhwp --json state,closedAt
-```
-
-`state: OPEN` 이면 수동 close + 감사 코멘트:
-
-```bash
-gh issue close N --repo edwardkim/rhwp --comment "PR #M 머지로 해결 (by @작성자). ..."
-```
-
-### 7.2 기여자 감사 코멘트
-
-PR 에 감사 + 검증 결과 요약 + 다음 PR 격려:
-
-```
-@기여자 감사합니다. 머지 완료했습니다.
-
-[검증 결과 요약]
-- 충돌 0 / cargo test ... passed / Clippy 0 warning
-
-[재제출 피드백이 있었던 경우] 이번에 반영해주신 점:
-- ... (구체 항목 1)
-- ... (구체 항목 2)
-
-[다음 작업 언급 — 있으면] 후속 이슈 #X 도 같은 방식으로 올려주시면 됩니다.
-
-감사합니다.
-```
-
-### 7.3 devel Sync
-
-```bash
-git fetch upstream
-git checkout local/devel
-git rebase upstream/devel   # 로컬 작업분이 있으면 머지 커밋 위로 재적용
-```
-
-### 7.4 렌더 영향 PR 의 경우 · Golden 재생성 체크
-
-**반드시** 다음을 확인:
-
-```bash
-cargo test --test svg_snapshot
-```
-
-실패 시:
-
-```bash
-UPDATE_GOLDEN=1 cargo test --test svg_snapshot
-cargo test --test svg_snapshot   # 결정성 재확인
-git add tests/golden_svg/
-git commit -m "test(svg_snapshot): regenerate golden after #N (...)"
-git push upstream devel
-```
-
-2회 연속 재현된 실수 (PR #221 / PR #251 사이클) 로 인해 **체크리스트 수준의 필수 절차**.
-
-### 7.5 리뷰 문서 archives 이동
-
-maintainer 일반 경로의 PR 리뷰 문서는 처리 완료 후 archive 경로로 이동한다.
-
-```bash
-mv mydocs/pr/pr_N_review.md mydocs/pr/archives/
-mv mydocs/pr/pr_N_review_impl.md mydocs/pr/archives/
-```
-
-다음 커밋에 포함하거나 오늘할일 커밋에 동반한다. collaborator self-merge 후보 예외 경로에서는
-처음부터 archive 경로에 두므로 이 이동 단계를 수행하지 않는다.
-
-### 7.6 로컬/원격 PR 작업 브랜치 정리
-
-```bash
-git branch -D local/prN
-```
-
-collaborator self-merge 후보처럼 원본 저장소에 PR head 브랜치를 직접 만든 경우에는 merge 후 원격
-작업 브랜치도 삭제한다. 예를 들어 PR head 가 `upstream/task_m100_1470` 형태라면 다음을 수행한다.
-
-```bash
-git checkout devel
-git merge --ff-only upstream/devel
-git push upstream --delete task_m100_1470
-git branch -D task_m100_1470
-git fetch upstream --prune
-```
-
-삭제 후에는 로컬/원격 추적 브랜치가 남지 않았는지 확인한다.
-
-```bash
-git branch --list 'task_m100_1470'
-git branch -r | rg 'task_m100_1470' || true
-git ls-remote --heads upstream task_m100_1470
-```
-
-### 7.7 오늘할일 갱신
-
-`mydocs/orders/yyyymmdd.md` 에 해당 PR 처리 내역 기록:
-- PR 번호 + 제목 + 작성자
-- merge SHA
-- 관련 이슈 close 여부
-- 후속 작업 (있으면)
-
-## 8. Collaborator self-merge 후보 예외 경로
-
-이 절은 collaborator 가 본인 PR 을 self-merge 후보로 준비하는 경우에만 적용한다. maintainer 가 외부
-기여자 PR 을 검토하는 일반 경로를 대체하지 않는다.
-
-### 8.1 적용 조건
-
-- PR 작성자 또는 작업 준비자가 repository collaborator 이다.
-- PR 번호가 이미 생성되어 review 문서명을 확정할 수 있다.
-- merge 후 별도 문서 커밋을 만들지 않기 위해 review 문서를 PR diff 에 함께 포함해야 한다.
-- 작업지시자 승인 전에는 ready 전환 또는 merge 판단을 하지 않는다.
-
-### 8.2 문서 경로
-
-collaborator self-merge 후보에서는 처음부터 archive 경로에 review 문서 2건을 작성할 수 있다.
-
-```text
-mydocs/pr/archives/pr_{N}_review.md
-mydocs/pr/archives/pr_{N}_review_impl.md
-```
-
-이 방식은 PR head 에 운영 문서를 포함해 merge 후 추가 문서 커밋을 방지하기 위한 예외다.
-maintainer 일반 경로의 active 경로 작성 규칙까지 대체하지 않는다.
-
-이미 active 경로에 잘못 만들었더라도 다음 PR 에 임시 동반하는 식으로 일반화하지 말고, 같은 PR 준비
-단계에서 archive 경로로 바로 정리한 뒤 PR head 에 포함한다.
-
-### 8.3 remote push 규칙
-
-collaborator 는 PR용 작업 브랜치를 fork 저장소(`origin`)에 우회 생성하지 않는다. 로컬 브랜치에서
-원본 저장소 remote(`upstream`)의 작업 브랜치로 직접 push 하는 것을 기본 규칙으로 삼는다.
-
-```bash
-git push upstream HEAD:task_m100_1158
-```
-
-fork 브랜치를 head 로 쓰는 방식은 권한 제약 때문에 직접 push 가 불가능한 경우에만 예외로 둔다.
-
-### 8.4 merge 전 최종 조건
-
-collaborator self-merge 후보라도 최종 merge 판단은 다음 조건을 모두 만족해야 한다.
-
-- PR head 최신 커밋 기준 GitHub Actions 통과
-- review 문서와 처리 계획서가 PR diff 에 포함됨
-- 작업지시자 승인
-
-`draft`, `mergeable`, `head SHA`, `CI 상태`는 3.3 절에 따라 작성 시점 참고값 또는 merge 전 최신 확인
-조건으로만 기록한다.
-
-## 9. Collaborator-Mediated 외부 PR 처리 경로
-
-이 절은 외부 contributor PR 을 repository collaborator 가 검토하고 merge 준비하는 경우에 적용한다.
-maintainer 일반 경로를 대체하지 않으며, 별도 문서 PR 을 만들지 않기 위해 review 문서를 해당 PR head 에
-포함하는 예외 경로다.
-
-이 경로가 필요한 이유는 collaborator 권한 모델 때문이다. collaborator 는 원본 저장소 `devel` 에 직접
-문서 커밋을 push 하지 않고 PR 을 통해서만 변경을 반영한다. 따라서 외부 PR 을 merge 한 뒤
-`pr_{N}_report.md` 만 별도 문서 PR 로 올리는 방식은 PR 처리 비용을 불필요하게 늘린다. 또한 문서만 있는 PR 은
-CI `paths-ignore` 조건 때문에 핵심 검증이 실행되지 않을 수 있어, "처리 후 report 작성 -> 별도 문서 PR merge" 를
-기본 흐름으로 삼지 않는다.
-
-실제 선례:
-
-- PR #1376: `mrshinds` 외부 PR 에 maintainer 보정·review 문서·오늘할일을 PR head 에 포함한 뒤 merge
-- PR #1429: `seo-rii` 외부 PR 에 review 문서·오늘할일을 PR head 에 포함한 뒤 merge
-- PR #1447: `seo-rii` 외부 PR 에 review/report 문서·오늘할일을 PR head 에 포함한 뒤 merge
-
-### 9.1 적용 조건
-
-- PR 작성자는 외부 contributor 이다.
-- repository collaborator 가 리뷰, 문서화, merge 준비를 담당한다.
-- GitHub PR 의 `maintainer_can_modify` 가 `true` 이거나, contributor 가 collaborator 의 문서 커밋 push 를
-  명시적으로 허용한다.
-- review 문서만 별도 PR 로 만들지 않기 위해 PR head 에 운영 문서를 포함하는 편이 더 단순하다.
-- 작업지시자 승인 전에는 GitHub review approval, ready 전환, merge 판단을 완료하지 않는다.
-
-`maintainer_can_modify=false` 이면 이 경로를 쓰지 않는다. 이 경우 maintainer 일반 경로로 active review 문서를
-작성하거나, 작업지시자 지시에 따라 별도 문서 커밋/PR 로 처리한다.
-
-### 9.2 문서 경로
-
-collaborator-mediated 외부 PR 에서는 PR head 에 다음 문서를 직접 포함할 수 있다.
-
-```text
-mydocs/pr/archives/pr_{N}_review.md
-mydocs/pr/archives/pr_{N}_review_impl.md   # 필요 시
-mydocs/pr/archives/pr_{N}_report.md        # 필요 시, 사전 처리 판단 보고서로 작성
-```
-
-오늘할일 갱신이 필요한 경우 `mydocs/orders/{yyyymmdd}.md` 도 같은 PR head 에 포함한다.
-
-단순·소형 PR 은 `pr_{N}_review.md` 안에 처리 계획을 포함하고 별도 `review_impl` 을 생략할 수 있다.
-`pr_{N}_report.md` 를 함께 포함할 때는 merge 완료 후 사후 보고서가 아니라 **사전 처리 판단 보고서**로 작성한다.
-따라서 아직 확정되지 않은 merge SHA, 실제 merge 시각, 이슈 close 완료 여부를 단정하지 않는다. 대신 다음을
+로컬 CI 성격의 검증(Cargo, npm, lint, fixture, 시각 검증)을 이미 실행해 종료 결과를 얻었다면,
+review 문서에는 계획형이나 미래형으로 쓰지 않는다. 실행한 명령, 대상 head, 결과를 과거형 사실로
 기록한다.
 
-- merge 수용/보류/재작업 권고와 사유
-- merge 전 최종 조건
-- merge 후 확인해야 할 이슈 close, 감사 코멘트, 후속 작업
+- 올바른 예: "로컬 검증의 `release-test` 전체 nextest 회귀를 실행해 통과했다."
+- 잘못된 예: "PR 전에 전체 테스트를 실행할 예정이다."
 
-merge 완료 사실과 이슈 close 결과는 GitHub PR/Issue metadata 를 원천 기록으로 삼고, 별도 문서 PR 을 만들지
-않는다. 사후에 반드시 장기 보관 보고서가 필요한 예외는 작업지시자 승인 후 별도 PR 로 처리한다.
+아직 실행하지 않은 GitHub Actions, contributor의 새 push, 작업지시자 승인 뒤의 ready 전환·merge·
+후속 정리는 미래 조건으로 분리해 적을 수 있다. 완료된 로컬 결과와 대기 중인 외부 조건을 한 문장에
+섞어 검증 상태가 불명확해지지 않게 한다.
 
-### 9.3 PR head push 규칙
+review 문서 경로, review_impl 작성 조건, 사전 판단 report의 범위는 선택한 기본 경로와
+[PR 접수와 리뷰 기록](pr_review/intake_and_review.md)을 따른다. 시각 검증을 실제 판단 근거로 사용하면
+문서 비교 절차의 정본으로 [PDF/SVG visual sweep 가이드](verification/visual_sweep_guide.md#github-merge-comment)를
+사용한다. 임시 output 경로만 남기지 말고, 대표 review PNG를 mydocs/pr/assets 아래 안정 경로에 보존한 뒤
+그 경로를 review 문서와 실제 GitHub comment에 사용한다. 이때 대표 review PNG 자체를 열어 도구 라벨,
+한글 glyph, 수치 표기, overlay legend가 판독 가능한지 확인하고, 깨진 라벨이나 판정 오해 소지가 있으면
+merge 전 보정하거나 별도 issue로 분리해 review 문서에 적는다. merge 후 comment에는 Visual Sweep 정본
+link와 review 문서의 실제 수치·결론을 함께 남기며, PNG는 merge commit SHA 고정 raw URL로 표시한다.
 
-외부 contributor 브랜치에 collaborator 가 커밋을 얹을 때는 다음을 지킨다.
+renderer/layout/typeset/paint 등 사용자-visible 렌더링 변경에 HWP/HWPX/PDF fixture가 붙어 있으면
+"시각 검증을 판단 근거로 사용한 경우"가 아니라 **시각 검증 필요 후보**로 먼저 분류한다. 이때 원 PR의
+before/after 이미지나 한컴 수치만 확인하고 maintainer의 직접 visual sweep 또는 동등한 판정 없이
+최종 판정을 `승인`으로 내리지 않는다. 직접 수행하지 못했으면 review 문서와 PR comment에
+`visual sweep 미실행`, `원 PR 증적만 확인`, `보류/조건부 보류` 중 하나를 명시한다.
 
-- contributor 의 원 코드 커밋을 rewrite 하지 않는다.
-- review 문서, 오늘할일, maintainer 보정 코드는 별도 커밋으로 분리한다.
-- maintainer 보정 코드가 포함되면 review 문서에 contributor 원 변경과 collaborator 추가 변경을 구분한다.
-- 문서 커밋 push 후 GitHub Actions 재실행을 기다린다.
+### 4.2 시각 증적 PR comment 계획
 
-예시:
+시각 검증을 `승인`의 근거로 사용한 개별 review 문서는 최종 판정 전에
+`Merge 후 contributor PR comment 계획` 절을 포함해야 한다. 이 절은 merge 뒤 새로 추정하거나 임시
+output에서 수치를 옮기는 일을 막기 위한 사전 기록이며, 최소한 다음을 적는다.
 
-```bash
-git fetch upstream pull/N/head:local/prN
-git checkout local/prN
-# review 문서 작성 및 검증
-git commit -m "docs: PR #N 검토 기록"
-git push https://github.com/{contributor}/rhwp.git HEAD:{head-branch}
-```
+1. [Visual Sweep의 GitHub merge comment 정본](verification/visual_sweep_guide.md#github-merge-comment) direct link
+2. 실제 확인한 대상 페이지, flagged 후보 수, `pixel_match`, `visual_accuracy_proxy_percent`, 사람의 판정과 수치의 한계
+3. `mydocs/pr/assets/` 아래 representative review PNG의 안정 경로와 `<merge-commit-sha>`를 넣은 raw URL 형식
+4. asset이 merge commit을 통해 `devel`에 존재하고 최신 head의 merge가 완료된 뒤에만 `--body-file`로 게시하며,
+   게시 뒤 API 재조회로 실제 Markdown과 이미지를 확인한다는 조건
 
-### 9.4 merge 전 최종 조건
+시각 검증을 실행하지 못한 경우에도 같은 절에 미실행 범위와 보류 사유를 적는다. 이 상태에서는 없는 수치나
+이미지 URL을 계획으로 만들지 않으며, 최종 판정을 `승인`으로 쓸 수 없다. 임시 `output/` 경로만 적거나
+merge 뒤 게시할 comment를 review 기록에 남기지 않는 것은 완료된 시각 증적으로 인정하지 않는다.
 
-- PR head 최신 커밋 기준 GitHub Actions 통과
-- review 문서가 PR diff 에 포함됨
-- `pr_{N}_report.md` 를 작성한 경우 사전 판단 보고서 형식이며, merge 후 사실을 미리 단정하지 않음
-- GitHub review 또는 PR comment 로 검토 결과를 contributor 에게 남김
-- merge 전 최신 `mergeable` / `mergeStateStatus` 재확인
-- 작업지시자 승인
+## 5. 기존 절 번호 대응
 
-이 경로로 merge 한 뒤에는 7장 후속 처리를 동일하게 수행한다. 특히 `devel` 이 default branch 가 아니어서
-`closes #N` 자동 close 가 실패할 수 있으므로 관련 이슈 state 를 반드시 확인한다.
+기존 링크 경로인 이 파일은 유지한다. 과거 review 문서와 보고서에 남은 절 번호를 해석할 때는 아래 표를
+사용한다. 역사 문서를 이관만을 이유로 일괄 수정하지 않는다.
 
-## 10. 재작업 요청 패턴
+| 이전 절 | 현재 문서 |
+| --- | --- |
+| 2.0, 2.5, 4.2.1 | [다수 PR과 update branch](pr_review/multi_pr_update_branch.md) |
+| 2.1–2.4, 3.1–3.4 | [PR 접수와 리뷰 기록](pr_review/intake_and_review.md) |
+| 2.6, 3.5, 3.5.1 | [시각·fixture 증적](pr_review/visual_fixture_evidence.md) |
+| 4.1, 4.1.1, 4.2, 4.3, 4.3.1, 4.3.2, 4.4 | [로컬 검증](pr_review/local_validation.md) |
+| 5–6 | [maintainer 일반 경로](pr_review/maintainer_general.md) |
+| 7, 7.1–7.8 | [merge 후속 처리](pr_review/post_merge.md) |
+| 8, 8.2.1 | [collaborator self-merge](pr_review/collaborator_self_merge.md) |
+| 9, 9.2.1, 9.3.1 | [collaborator 매개 외부 PR](pr_review/collaborator_external_pr.md) |
+| 9.3.2 | [review-only fast-pass](pr_review/review_only_fast_pass.md) |
+| 10–13 | [재작업과 예외](pr_review/rework_and_exceptions.md) |
 
-리뷰 결과 **재작업이 필요**한 PR (예: base 가 main, 메타 변경 혼입, 관련 이슈 없음 등):
+## 6. 문서 유지 규칙
 
-1. **PR 에 정중한 피드백 코멘트** + 구체적 수정 요청 목록
-2. **PR close** (재제출 기대 의사 표명)
-3. 재제출 시 새 PR 번호로 처리
+새 규칙은 공통 계약이면 이 문서에, 특정 역할·변경 범위·상태에서만 필요한 절차이면
+pr_review/의 해당 자식 문서에 둔다. 같은 명령과 조건을 모 문서와 자식 문서에 복제하지 않는다.
 
-실제 성공 사례: PR #234 (close) → PR #251 (재제출, 모든 피드백 반영 후 admin merge).
-
-피드백 톤 가이드:
-- **결정 자체는 단호**: "현 상태로는 머지 불가"
-- **사유는 구체적**: "base 가 main 이라 릴리즈 브랜치에 직접 커밋되는 구조"
-- **재제출 경로는 명확**: "feature 브랜치에서 devel 타깃으로 재제출 부탁드립니다"
-- **크레딧 약속**: "재제출 시 PR description / commit author 보존 그대로"
-
-## 11. 예외 케이스
-
-### 11.1 Dependabot PR
-
-`dependabot/npm_and_yarn/...` 브랜치 PR:
-- 보통 base 가 `main` (설정 이슈) → `.github/dependabot.yml` 에 `target-branch: devel` 추가로 해결
-- 현재 main 타깃 PR 은 close + 수동으로 devel 에 버전 bump 커밋
-
-### 11.2 오래된 base PR (대량 커밋 혼입)
-
-예: PR #213 같이 수십 커밋 전의 base 에서 분기 → diff 에 이미 머지된 과거 커밋들이 포함됨
-
-처리:
-- 해당 기여자의 **신규 커밋만 cherry-pick** (저자 보존)
-- PR 은 close + 설명 코멘트 ("이번 기여 2 커밋만 cherry-pick 반영했습니다")
-- 중복 PR (같은 브랜치 main 타깃) 도 함께 close
-
-### 11.3 대형 PR (>1000 라인)
-
-- 즉시 admin merge 불가
-- 코드 검토 + 사전 시뮬레이션 충분히 수행 후 결정
-- 예: PR #165 (skia renderer · +100K 라인) — 장기 보류
-
-## 12. 메모리 등록 항목 (자동 참조)
-
-다음 상황은 `~/.claude/.../memory/` 에 등록되어 있다:
-
-- `feedback_search_troubleshootings_first.md` — 작업 전 트러블슈팅 폴더 검색
-- `feedback_external_docs_self_censor.md` — 외부 공개 문서 자기검열
-- (신규 제안) `feedback_golden_regen_after_render_pr.md` — 렌더 PR 머지 후 golden 재생성
-
-## 13. 참고 아카이브
-
-- `mydocs/pr/archives/pr_234_review.md` — 재작업 요청 사례
-- `mydocs/pr/archives/pr_235_review.md` · `pr_237_review.md` — 다양한 리뷰 패턴
-- `mydocs/pr/archives/pr_251_review.md` — 재제출 후 머지 사례 (모든 피드백 반영)
+새 자식 문서를 추가하거나 조건을 바꿀 때는 이 문서의 라우팅 표, pr_review/README.md,
+mydocs 문서 지도와 AGENTS.md의 로딩 지침을 같은 변경에서 함께 갱신한다. 정보구조 변경이므로
+문서 링크와 메타데이터 검사를 수행한다.

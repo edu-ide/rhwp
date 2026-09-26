@@ -17,9 +17,7 @@ use rhwp::renderer::svg::SvgRenderer;
 fn marker_node(id: u32, marker: &str) -> RenderNode {
     RenderNode::new(
         id,
-        RenderNodeType::RawSvg(RawSvgNode {
-            svg: format!("<!--{marker}-->\n"),
-        }),
+        RenderNodeType::RawSvg(RawSvgNode::new(format!("<!--{marker}-->\n"))),
         BoundingBox::new(0.0, 0.0, 1.0, 1.0),
     )
 }
@@ -35,6 +33,7 @@ fn table_with_label(tree: &mut PageRenderTree, label: &str, para_index: usize) -
             section_index: Some(0),
             para_index: Some(para_index),
             control_index: Some(0),
+            cell_context: None,
         }),
         BoundingBox::new(40.0, 40.0, 180.0, 40.0),
     );

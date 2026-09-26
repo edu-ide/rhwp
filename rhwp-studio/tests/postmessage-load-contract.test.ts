@@ -5,14 +5,15 @@ import test from 'node:test';
 
 const mainSource = readFileSync(resolve(import.meta.dirname, '../src/main.ts'), 'utf-8');
 const editorSource = readFileSync(resolve(import.meta.dirname, '../../npm/editor/index.js'), 'utf-8');
+const transportSource = readFileSync(resolve(import.meta.dirname, '../../npm/editor/transport.js'), 'utf-8');
 const keyboardSource = readFileSync(resolve(import.meta.dirname, '../src/engine/input-handler-keyboard.ts'), 'utf-8');
 const wasmBridgeSource = readFileSync(resolve(import.meta.dirname, '../src/core/wasm-bridge.ts'), 'utf-8');
 
 test('postMessage document loads run without interactive prompts', () => {
-  assert.match(mainSource, /interface LoadBytesOptions/);
-  assert.match(mainSource, /interactivePrompts\?: boolean/);
-  assert.match(mainSource, /initializeDocument\(docInfo,[\s\S]*interactivePrompts/);
-  assert.match(mainSource, /loadBytes\(bytes,[\s\S]*interactivePrompts: false/);
+  assert.match(mainSource, /suppressDialogs\?: boolean/);
+  assert.match(mainSource, /initializeDocument\(docInfo,[\s\S]*suppressDialogs: options\.suppressDialogs/);
+  assert.match(mainSource, /async loadFile\(data, fileName, skipUnsavedGuard, suppressDialogs\)/);
+  assert.match(mainSource, /loadBytes\(data, fileName, null, undefined, \{ suppressDialogs \}\)/);
 });
 
 test('URL parameter document loads run without interactive prompts', () => {
@@ -21,7 +22,7 @@ test('URL parameter document loads run without interactive prompts', () => {
   const end = mainSource.indexOf('function showFileUrlAccessGuidance', start);
   assert.notEqual(end, -1, 'loadFromUrlParam block end is present');
   const block = mainSource.slice(start, end);
-  const nonInteractiveLoads = block.match(/loadBytes\(data, fileName, null, performance\.now\(\), \{\s*interactivePrompts: false,\s*\}\)/g) ?? [];
+  const nonInteractiveLoads = block.match(/loadBytes\(data, fileName, null, performance\.now\(\), \{\s*suppressDialogs: true,\s*\}\)/g) ?? [];
   assert.equal(nonInteractiveLoads.length, 2, 'both URL fetch branches must suppress interactive prompts');
 });
 
@@ -114,24 +115,27 @@ test('postMessage API exposes realtime operation bridge for embedding hosts', ()
   assert.match(mainSource, /eventBus\.on\('realtime-operation'/);
   assert.match(mainSource, /case 'applyOperation'/);
   assert.match(mainSource, /inputHandler\.applyRealtimeOperation/);
-  assert.match(editorSource, /rhwp-event/);
+  assert.match(transportSource, /rhwp-event/);
+  assert.match(editorSource, /this\._transport\.on\('operation'/);
   assert.match(editorSource, /async applyOperation\(operation\)/);
   assert.match(editorSource, /this\._request\('applyOperation'/);
   assert.match(editorSource, /on\(eventName, handler\)/);
-  assert.match(editorSource, /removeEventListener\('message', this\._messageHandler\)/);
+  assert.match(editorSource, /this\._transport\.destroy\(\)/);
+  assert.match(transportSource, /removeEventListener\('message', this\._onLegacyMessage\)/);
 });
 
 test('npm editor ready handshake uses short probes instead of 10s RPC stalls', () => {
   assert.match(editorSource, /const READY_PROBE_TIMEOUT_MS = 750/);
-  assert.match(editorSource, /const DEFAULT_REQUEST_TIMEOUT_MS = 10000/);
+  assert.match(transportSource, /LONG_RUNNING_METHODS\.has\(method\) \? 60000 : 10000/);
   assert.match(editorSource, /_request\(method, params = \{\}, options = \{\}\)/);
-  assert.match(editorSource, /options\.timeoutMs \?\? DEFAULT_REQUEST_TIMEOUT_MS/);
+  assert.match(editorSource, /this\._transport\.request\(method, params, options\)/);
+  assert.match(transportSource, /options\.timeoutMs \?\? this\._requestTimeoutMs/);
   assert.match(editorSource, /this\._request\('ready', \{\}, \{ timeoutMs: READY_PROBE_TIMEOUT_MS \}\)/);
 });
 
 test('npm editor loadFile can receive an extended timeout for large documents', () => {
   assert.match(editorSource, /async loadFile\(data, fileName = 'document\.hwp', options = \{\}\)/);
-  assert.match(editorSource, /this\._request\('loadFile', \{ data: bytes, fileName \}, options\)/);
+  assert.match(editorSource, /this\._request\('loadFile', \{\s*data,\s*fileName,[\s\S]*?\}, options\)/);
 });
 
 test('npm editor installs iframe load listener before navigation starts', () => {

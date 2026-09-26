@@ -5,7 +5,9 @@
 (() => {
   'use strict';
 
-  const HWP_EXTENSIONS = /\.(hwp|hwpx)(\?.*)?$/i;
+  const HWP_EXTENSIONS = /\.(hwp|hwpx|hml)(\?.*)?$/i;
+  const DOCUMENT_PATH_EXTENSIONS = /\.(hwp|hwpx|hml)$/i;
+  const GITHUB_NON_DOCUMENT_MARKERS = new Set(['edit', 'commits', 'blame', 'tree']);
   const BADGE_CLASS = 'rhwp-badge';
   const HOVER_CLASS = 'rhwp-hover-card';
   const PROCESSED_ATTR = 'data-rhwp-processed';
@@ -35,17 +37,11 @@
   if (shouldAnnounce) {
     document.documentElement.setAttribute('data-hwp-extension', 'rhwp');
     window.dispatchEvent(new CustomEvent('hwp-extension-ready', {
-      detail: { name: 'rhwp', capabilities: ['preview'] }
+      detail: { name: 'rhwp', capabilities: ['preview', 'edit', 'print'] }
     }));
   }
 
   // ─── 유틸리티 ───
-
-  function escapeHtml(str) {
-    const div = document.createElement('div');
-    div.textContent = str;
-    return div.innerHTML;
-  }
 
   function extractFilename(anchor) {
     // URL에서 파일명 추출
@@ -67,10 +63,58 @@
 
   // ─── 링크 감지 ───
 
+  function hasDocumentPath(pathname) {
+    if (typeof pathname !== 'string') return false;
+    try {
+      return DOCUMENT_PATH_EXTENSIONS.test(decodeURIComponent(pathname).toLowerCase());
+    } catch {
+      return DOCUMENT_PATH_EXTENSIONS.test(pathname.toLowerCase());
+    }
+  }
+
+  function classifyDocumentHref(href) {
+    let parsed;
+    try {
+      parsed = new URL(href);
+    } catch {
+      return { status: 'unknown' };
+    }
+
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+      return { status: 'unknown' };
+    }
+
+    if (parsed.hostname === 'raw.githubusercontent.com') {
+      return hasDocumentPath(parsed.pathname)
+        ? { status: 'openable' }
+        : { status: 'not-document' };
+    }
+
+    if (parsed.hostname === 'github.com') {
+      const segments = parsed.pathname.split('/').filter(Boolean);
+      if (segments.length >= 3) {
+        const marker = segments[2];
+        if (marker === 'blob') {
+          const pathParts = segments.slice(4);
+          return pathParts.length > 0 && hasDocumentPath(pathParts.join('/'))
+            ? { status: 'openable' }
+            : { status: 'not-document' };
+        }
+        if (GITHUB_NON_DOCUMENT_MARKERS.has(marker)) {
+          return { status: 'not-document' };
+        }
+      }
+    }
+
+    return hasDocumentPath(parsed.pathname)
+      ? { status: 'openable' }
+      : { status: 'unknown' };
+  }
+
   function isHwpLink(anchor) {
     if (!anchor.href) return false;
     if (anchor.getAttribute('data-hwp') === 'true') return true;
-    return HWP_EXTENSIONS.test(anchor.href);
+    return classifyDocumentHref(anchor.href).status === 'openable';
   }
 
   function createBadge(anchor) {
@@ -89,9 +133,43 @@
 
   // ─── 호버 미리보기 카드 ───
 
+  const HOVER_SHOW_DELAY_MS = 250;
+  const HOVER_HIDE_DELAY_MS = 150;
   let activeCard = null;
   let activeAnchor = null;
-  let hoverTimeout = null;
+  let pendingAnchor = null;
+  let showHoverTimeout = null;
+  let hideHoverTimeout = null;
+
+  function clearShowHoverTimer() {
+    if (showHoverTimeout !== null) {
+      clearTimeout(showHoverTimeout);
+      showHoverTimeout = null;
+    }
+  }
+
+  function clearHideHoverTimer() {
+    if (hideHoverTimeout !== null) {
+      clearTimeout(hideHoverTimeout);
+      hideHoverTimeout = null;
+    }
+  }
+
+  function removeActiveHoverCard() {
+    if (activeCard) {
+      activeCard.remove();
+      activeCard = null;
+      activeAnchor = null;
+    }
+  }
+
+  function scheduleHideHoverCard() {
+    clearHideHoverTimer();
+    hideHoverTimeout = setTimeout(() => {
+      hideHoverTimeout = null;
+      hideHoverCard();
+    }, HOVER_HIDE_DELAY_MS);
+  }
 
   // 보안: 텍스트 길이 제한
   function truncate(str, max) {
@@ -126,10 +204,22 @@
   }
 
   function showHoverCard(anchor) {
-    if (!settings.hoverPreview) return;
-    if (activeAnchor === anchor && activeCard) return;
+    if (!settings.hoverPreview) {
+      if (pendingAnchor === anchor) pendingAnchor = null;
+      return;
+    }
+    if (pendingAnchor !== anchor) return;
+    if (!anchor.isConnected) {
+      pendingAnchor = null;
+      return;
+    }
+    if (typeof anchor.matches === 'function' && !anchor.matches(':hover')) {
+      pendingAnchor = null;
+      return;
+    }
 
-    hideHoverCard();
+    clearHideHoverTimer();
+    removeActiveHoverCard();
 
     const card = document.createElement('div');
     card.className = HOVER_CLASS;
@@ -157,7 +247,9 @@
           .then(response => {
             if (response && response.dataUri) {
               thumbnailCache.set(anchor.href, response);
-              insertThumbnail(thumbContainer, response.dataUri);
+              if (activeCard === card && activeAnchor === anchor) {
+                insertThumbnail(thumbContainer, response.dataUri);
+              }
             } else {
               thumbnailCache.set(anchor.href, null);
             }
@@ -198,7 +290,7 @@
         card.appendChild(createDiv('rhwp-hover-desc', truncate(description, 500)));
       }
     } else {
-      const ext = filename.match(/\.(hwp|hwpx)$/i)?.[1]?.toUpperCase() || 'HWP';
+      const ext = filename.match(/\.(hwp|hwpx|hml)$/i)?.[1]?.toUpperCase() || 'HWP';
       card.appendChild(createDiv('rhwp-hover-title', truncate(filename, 200)));
       card.appendChild(createDiv('rhwp-hover-meta', `${ext} \uBB38\uC11C`));
     }
@@ -234,11 +326,10 @@
 
     activeCard = card;
     activeAnchor = anchor;
+    pendingAnchor = null;
 
-    card.addEventListener('mouseenter', () => clearTimeout(hoverTimeout));
-    card.addEventListener('mouseleave', () => {
-      hoverTimeout = setTimeout(() => hideHoverCard(), 150);
-    });
+    card.addEventListener('mouseenter', () => clearHideHoverTimer());
+    card.addEventListener('mouseleave', () => scheduleHideHoverCard());
     card.addEventListener('click', () => {
       hideHoverCard();
       browser.runtime.sendMessage({
@@ -250,23 +341,36 @@
   }
 
   function hideHoverCard() {
-    clearTimeout(hoverTimeout);
-    if (activeCard) {
-      activeCard.remove();
-      activeCard = null;
-      activeAnchor = null;
-    }
+    clearShowHoverTimer();
+    clearHideHoverTimer();
+    pendingAnchor = null;
+    removeActiveHoverCard();
   }
 
   function attachHoverEvents(anchor) {
     if (!settings.hoverPreview) return;
     anchor.addEventListener('mouseenter', () => {
-      clearTimeout(hoverTimeout);
-      hoverTimeout = setTimeout(() => showHoverCard(anchor), 250);
+      clearShowHoverTimer();
+      clearHideHoverTimer();
+      if (activeAnchor === anchor && activeCard) {
+        pendingAnchor = null;
+        return;
+      }
+      pendingAnchor = anchor;
+      removeActiveHoverCard();
+      showHoverTimeout = setTimeout(() => {
+        showHoverTimeout = null;
+        showHoverCard(anchor);
+      }, HOVER_SHOW_DELAY_MS);
     });
     anchor.addEventListener('mouseleave', () => {
-      clearTimeout(hoverTimeout);
-      hoverTimeout = setTimeout(() => hideHoverCard(), 150);
+      if (pendingAnchor === anchor) {
+        pendingAnchor = null;
+      }
+      clearShowHoverTimer();
+      if (activeAnchor === anchor && activeCard) {
+        scheduleHideHoverCard();
+      }
     });
   }
 
@@ -386,7 +490,8 @@
   // ─── 링크 처리 ───
 
   function processLinks(root = document) {
-    const anchors = root.querySelectorAll('a[href]');
+    const anchors = root.matches?.('a[href]') ? [root] : [];
+    anchors.push(...root.querySelectorAll('a[href]'));
     for (const anchor of anchors) {
       if (anchor.hasAttribute(PROCESSED_ATTR)) continue;
       if (!isHwpLink(anchor)) continue;

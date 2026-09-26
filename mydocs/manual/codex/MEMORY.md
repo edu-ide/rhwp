@@ -1,52 +1,40 @@
-# Codex Memory Dump
+---
+kind: memory
+status: active
+canonical: mydocs/manual/codex/MEMORY.md
+last_verified: 2026-08-08
+---
 
-덤프 시점: 2026-05-22, Asia/Seoul
+# Codex 프로젝트 메모리 덤프
 
-이 폴더는 Codex가 현재 세션에서 들고 있는 작업 기억을 재사용 가능한 형태로 분류한 덤프이다.
-`mydocs/manual/memory/`의 Claude 메모리 덤프를 읽어 Codex 작업 방식에 반영한 내용과, Task #854 진행 중 새로 확인된 세션 기억을 함께 정리한다.
+이 문서는 rhwp 작업지시자가 세션에서 확정한 프로젝트 운영 규칙을 Codex가 다음 세션에서도
+재사용하도록 보존하는 활성 메모리 진입점이다. 세션의 현재 브랜치나 종료된 task 상태는 기록하지
+않으며, 그런 스냅샷은 [`archive/`](archive/)에 historical 문서로 보존한다.
 
-## Index
+세부 절차가 활성 canonical manual에 반영되어 있으면 해당 manual을 함께 따른다. 현재 작업지시자의
+명시적 지시와 이 덤프가 다르면 현재 지시가 우선하며, 추정으로 충돌을 해소하지 않는다.
 
-- [현재 세션 상태](current_session.md)
-- [운영 규칙과 작업 태도](operating_rules.md)
-- [문서·Git 워크플로](docs_and_git_workflow.md)
-- [검증 기준과 권위 자료](validation_policy.md)
-- [HWPX to HWP 변환기 기억](hwp_hwpx_converter_memory.md)
-- [Task #854 재시도 기억](task_m100_854_memory.md)
-- [프로젝트·참조 메모리](references_and_project_notes.md)
-- [로딩한 Claude 메모리 인벤토리](loaded_claude_memory_inventory.md)
+## 유지보수자 PR 1차 트리야지
 
-## Highest Priority Reminder
+2026-08-07 작업지시자가 확정한 열린 PR 목록의 1차 트리야지는 다음 세 가지 메타데이터 작업이다.
 
-Codex는 이 프로젝트에서 구현부터 시작하면 안 된다.
+1. PR의 `Assignees`에 해당 PR의 author를 지정한다.
+2. `Milestone`을 `v1.0.0`으로 지정한다.
+3. PR 제목·본문·변경 파일 등 실제 내용을 근거로 저장소의 기존 `Labels`를 추가한다.
 
-하이퍼-워터폴 순서를 따른다:
+적용 후 열린 PR 전체를 다시 조회해 세 필드의 누락 여부를 확인한다. PR 댓글, 리뷰, 브랜치 갱신,
+merge, close는 별도 작업지시가 필요한 후속 단계이며 1차 트리야지에 포함하지 않는다.
 
-1. 이슈와 현재 브랜치 확인
-2. 관련 트러블슈팅과 기존 문서 검색
-3. 분석 문서 또는 계획서 작성
-4. 작업지시자 승인
-5. 구현
-6. 테스트와 한컴 검증 준비
-7. 보고서와 커밋
+## Node 자식 프로세스 테스트의 샌드박스 가드레일
 
-Task #854의 현재 교훈은 특히 강하다. HWPX 파싱, IR 매핑, rhwp-studio 렌더링은 일단 정상 영역으로 보고, 문제는 IR clone/materialize 후 HWP5 저장에서 누락되거나 잘못 매핑되는 구조를 찾는 것이다.
+`rhwp-studio`의 일부 Node 테스트는 `spawnSync()`로 별도 Node 드라이버를 실행한다. Codex
+샌드박스에서는 이 자식 프로세스 생성이 `EPERM`으로 차단될 수 있으므로, 이런 테스트가 포함된
+`npm test`는 처음부터 샌드박스 밖에서 실행한다.
 
-## 2026-05-22 Addendum
+차단 시 자식의 `status`가 정상처럼 보이면서 `stdout`·`stderr`가 비고, 부모 테스트에는 "결과 JSON
+없음" 또는 "성공 마커 없음"만 나타날 수 있다. 이 패턴을 코드 결함으로 분류하거나 같은 sandbox
+명령을 반복하지 않는다. 필요하면 작은 `spawnSync` 진단으로 `error: EPERM`을 한 번 확인한 뒤 전체
+테스트를 escalation으로 재실행하고, 그 결과를 공식 판정으로 기록한다.
 
-- 현재 macOS 작업 경로는 `/Users/edwardkim/vspace/rhwp` 이다.
-- GitHub connector가 mutation 권한 부족으로 403을 반환할 수 있다.
-- 이슈 assignee 지정, 이슈/PR 메타데이터 수정 등 GitHub 변경 작업은 로컬 인증된 `gh` CLI를 사용한다.
-- 예: `gh issue edit 1063 --add-assignee edwardkim -R edwardkim/rhwp`
-- sandbox 네트워크 제한으로 `gh`가 `api.github.com` 연결 실패를 내면, 동일 명령을 escalation으로 재시도한다.
-- Task #1063은 `local/task_m100_1063` 브랜치에서 시작했고, 계획서 작성, assignee 지정, Stage 1 방향 아이콘 정정, Stage 2 새 빈 문서 A4 프리셋 매칭 정정, E2E 검증, Stage 1/2 작업지시자 시각 판정, 보고서 작성까지 완료했다. 커밋 및 이후 merge/close 절차는 작업지시자 지시에 따른다.
-
-## 2026-05-25 Addendum
-
-- `local/devel` 브랜치를 원격 `devel`로 직접 push하지 않는다.
-- 금지 예: `git push origin local/devel:devel`
-- 올바른 순서:
-  1. `local/devel`의 작업을 로컬 `devel`에 merge한다.
-  2. 로컬 `devel`에서 필요한 compile/test/wasm build 검증을 수행한다.
-  3. 검증 통과 후 `git push origin devel`로 원격 `devel`에 push한다.
-- `local/devel`과 `local/task*`는 로컬 유지 브랜치이며, 원격 push 대상은 검증된 `devel`이다.
+2026-08-08 WSL2 Node v24.15.0 환경에서 sandbox 실행은 해당 드라이버 테스트 5건이 위 패턴으로
+실패했고, 동일 `npm test`를 sandbox 밖에서 실행하자 802/802건이 통과했다.
