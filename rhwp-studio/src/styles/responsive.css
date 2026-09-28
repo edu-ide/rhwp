@@ -196,6 +196,9 @@
 
 /* ─── 인쇄 ──────────────────────────────────────────── */
 @media print {
+  .office-evidence-annotations {
+    display: none !important;
+  }
   #menu-bar, #icon-toolbar, #style-bar, #status-bar,
   #ruler-corner, #h-ruler, #v-ruler {
     display: none !important;

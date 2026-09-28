@@ -6,6 +6,7 @@ import { CanvasView } from '@/view/canvas-view';
 import { InputHandler } from '@/engine/input-handler';
 import { Toolbar } from '@/ui/toolbar';
 import { EvidenceNotesOverlay, type EvidenceNote } from '@/ui/evidence-notes';
+import { parseEvidenceClaims } from '@/ui/evidence-claims';
 import { initIconToolbarScroller } from '@/ui/icon-toolbar-scroller';
 import { initStyleToolbarOverflow } from '@/ui/style-toolbar-overflow';
 import {
@@ -1966,6 +1967,7 @@ installEmbedRuntime({
   parentWindow: window.parent,
   subscribeDocumentChanged: (listener) => eventBus.on('document-agent-changed', listener),
   subscribeRealtimeOperation: listener => eventBus.on('realtime-operation', listener),
+  subscribeEvidenceAnnotationSelect: listener => eventBus.on('evidence-annotation-select', listener),
   handlers: {
     officeRequest: async (method, params) => {
       let result: unknown;
@@ -2012,6 +2014,18 @@ installEmbedRuntime({
         await initPromise;
         evidenceOverlay?.clear();
         reply({ ok: true });
+        break;
+      }
+      case 'evidenceAnnotateClaims': {
+        await initPromise;
+        const claims = parseEvidenceClaims(params.links);
+        reply(evidenceOverlay ? evidenceOverlay.annotateClaims(claims) : {resolved: 0, unresolved: claims.length});
+        break;
+      }
+      case 'evidenceClearClaimAnnotations': {
+        await initPromise;
+        evidenceOverlay?.clearClaimAnnotations();
+        reply({resolved: 0, unresolved: 0});
         break;
       }
       case 'evidenceHighlightExactSource': {

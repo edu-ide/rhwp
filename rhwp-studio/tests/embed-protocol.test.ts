@@ -1158,6 +1158,8 @@ test('Office opaque embedding requires the parent handshake, gates RPC capabilit
   const localListeners = new Map<string, (event: Event) => void>();
   let emitOperation: (payload: unknown) => void = () => {};
   let subscribed = 0;
+  let emitAnnotation: (payload: unknown) => void = () => {};
+  let annotationSubscriptions = 0;
   let calls = 0;
   const host = {
     addEventListener(type: string, fn: (event: Event) => void) {
@@ -1174,6 +1176,7 @@ test('Office opaque embedding requires the parent handshake, gates RPC capabilit
     hostWindow: host as unknown as Window, parentWindow: parent as unknown as Window,
     handlers: { officeRequest: async (_method: string, params: unknown) => { calls++; return params; } } as EmbedRpcHandlers,
     subscribeRealtimeOperation(fn) { emitOperation = fn; subscribed++; return () => { subscribed--; }; },
+    subscribeEvidenceAnnotationSelect(fn) { emitAnnotation = fn; annotationSubscriptions++; return () => { annotationSubscriptions--; }; },
   });
   function port() {
     return { onmessage: null as any, closed: false, messages: [] as any[], start() {},
@@ -1197,13 +1200,18 @@ test('Office opaque embedding requires the parent handshake, gates RPC capabilit
     method: 'dispatchCommand', params: { cmdId: 'edit:undo' } } });
   assert.equal(first.messages.at(-1).error.code, 'UNSUPPORTED_CAPABILITY');
   assert.equal(subscribed, 0);
+  assert.equal(annotationSubscriptions, 0);
   const replacement = port(); connect(replacement, parent, ['transferable-array-buffer', 'office-realtime-v1']);
   assert.equal(first.closed, true);
   assert.equal(subscribed, 1);
+  assert.equal(annotationSubscriptions, 1);
   await replacement.onmessage({ data: { type: 'rhwp-request', version: 1, sessionId: 'office', id: 3,
     method: 'dispatchCommand', params: { cmdId: 'edit:undo' } } });
   assert.equal(calls, 1);
   assert.deepEqual(replacement.messages.at(-1).result, { cmdId: 'edit:undo' });
+  emitAnnotation({ id: 'claim-1', rect: { left: 10, top: 20, width: 26, height: 26 } });
+  assert.deepEqual(replacement.messages.at(-1), { type: 'rhwp-event', version: 1, sessionId: 'office',
+    event: 'evidenceAnnotationSelect', payload: { id: 'claim-1', rect: { left: 10, top: 20, width: 26, height: 26 } } });
   emitOperation({ kind: 'insertText', text: '안녕' });
   assert.deepEqual(replacement.messages.at(-1), { type: 'rhwp-event', version: 1, sessionId: 'office',
     event: 'operation', payload: { kind: 'insertText', text: '안녕' } });
@@ -1222,6 +1230,7 @@ test('Office opaque embedding requires the parent handshake, gates RPC capabilit
   assert.equal(wrongSession.closed, true);
   cleanup();
   assert.equal(subscribed, 0); assert.equal(replacement.closed, true);
+  assert.equal(annotationSubscriptions, 0);
   assert.equal(localListeners.has('rhwp-host-command'), false);
   hostCommand();
   assert.equal(replacement.messages.length, beforeInvalid);
@@ -1231,5 +1240,7 @@ test('Office RPC rejects legacy transport even for a valid HTTP parent', async (
   let calls = 0;
   const handlers = { officeRequest: async () => { calls++; return true; } } as EmbedRpcHandlers;
   await assert.rejects(routeEmbedRequest('applyOperation', { operation: {} }, handlers, true), /MessagePort/);
+  await assert.rejects(routeEmbedRequest('evidenceAnnotateClaims', { links: [] }, handlers, true), /MessagePort/);
+  await assert.rejects(routeEmbedRequest('evidenceClearClaimAnnotations', {}, handlers, true), /MessagePort/);
   assert.equal(calls, 0);
 });

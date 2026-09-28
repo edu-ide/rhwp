@@ -17,6 +17,7 @@ interface EmbedRuntimeOptions {
   handlers: EmbedRpcHandlers;
   subscribeDocumentChanged?: (listener: (payload: unknown) => void) => () => void;
   subscribeRealtimeOperation?: (listener: (payload: unknown) => void) => () => void;
+  subscribeEvidenceAnnotationSelect?: (listener: (payload: unknown) => void) => () => void;
 }
 
 function errorText(error: unknown): string {
@@ -49,6 +50,7 @@ function bindPort(
   handlers: EmbedRpcHandlers,
   subscribeDocumentChanged?: (listener: (payload: unknown) => void) => () => void,
   subscribeRealtimeOperation?: (listener: (payload: unknown) => void) => () => void,
+  subscribeEvidenceAnnotationSelect?: (listener: (payload: unknown) => void) => () => void,
 ): () => void {
   port.onmessage = async ({ data }) => {
     if (!isRequestAttempt(data, sessionId)) return;
@@ -107,7 +109,8 @@ function bindPort(
   });
   const offDocument = subscribe('documentChanged', subscribeDocumentChanged);
   const offOperation = subscribe('operation', subscribeRealtimeOperation);
-  return () => { offDocument?.(); offOperation?.(); };
+  const offEvidence = subscribe('evidenceAnnotationSelect', subscribeEvidenceAnnotationSelect);
+  return () => { offDocument?.(); offOperation?.(); offEvidence?.(); };
 
 }
 
@@ -227,6 +230,7 @@ export function installEmbedRuntime(options: EmbedRuntimeOptions): () => void {
           ? options.subscribeDocumentChanged
           : undefined,
         event.data.capabilities.includes('office-realtime-v1') ? options.subscribeRealtimeOperation : undefined,
+        event.data.capabilities.includes('office-realtime-v1') ? options.subscribeEvidenceAnnotationSelect : undefined,
       );
       binding = { origin: event.origin, sessionId: event.data.sessionId, port,
         officeRealtime: event.data.capabilities.includes('office-realtime-v1'), offDocumentChanged };

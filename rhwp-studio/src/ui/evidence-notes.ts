@@ -16,6 +16,8 @@
  * 재활용되어도 오버레이는 남는다.
  */
 import { exactEvidenceRange } from './evidence-exact';
+import { resolveEvidenceClaim } from './evidence-claims';
+import type { EvidenceClaim } from './evidence-claims';
 import type { WasmBridge } from '@/core/wasm-bridge';
 import type { EventBus } from '@/core/event-bus';
 import type { VirtualScroll } from '@/view/virtual-scroll';
@@ -80,22 +82,31 @@ export class EvidenceNotesOverlay {
   private blockSeq = 0;
   private cellDepth = 0;
   private exactSource: { quote: string; page?: number } | null = null;
+  private claims: EvidenceClaim[] = [];
+  private claimLayers = new Map<number, HTMLElement>();
+  private claimFrame: number | null = null;
+  private resizeObserver: ResizeObserver | null = null;
 
   constructor(
     private scrollContent: HTMLElement,
     private wasm: WasmBridge,
     private virtualScroll: VirtualScroll,
     private viewportManager: ViewportManager,
-    eventBus: EventBus,
+    private eventBus: EventBus,
   ) {
-    const onZoom = () => this.relayout();
-    const onMutation = () => this.clearExactSource();
-    eventBus.on('zoom-changed', onZoom);
-    eventBus.on('document-mutated', onMutation);
-    this.unsubscribe = () => {
-      (eventBus as any).off?.('zoom-changed', onZoom);
-      (eventBus as any).off?.('document-mutated', onMutation);
-    };
+    const off = [
+      eventBus.on('zoom-changed', () => { this.relayout(); this.scheduleClaims(); }),
+      eventBus.on('document-mutated', () => { this.clearExactSource(); this.scheduleClaims(); }),
+      eventBus.on('document-changed', () => this.scheduleClaims()),
+      eventBus.on('document-view-changed', () => this.scheduleClaims()),
+      eventBus.on('viewport-resize', () => this.scheduleClaims()),
+      eventBus.on('page-view-settings-changed', () => this.scheduleClaims()),
+    ];
+    this.unsubscribe = () => off.forEach(unsubscribe => unsubscribe());
+    if (typeof ResizeObserver !== 'undefined') {
+      this.resizeObserver = new ResizeObserver(() => this.scheduleClaims());
+      this.resizeObserver.observe(scrollContent);
+    }
   }
 
   /** 전 페이지 렌더 트리에서 줄 텍스트·좌표를 모으고 감사용 전문을 돌려준다. */
@@ -313,8 +324,7 @@ export class EvidenceNotesOverlay {
   }
 
   /** 페이지 캔버스와 동일한 배치 규칙으로 오버레이 층을 앉힌다. */
-  private placeLayer(page: number): void {
-    const el = this.layers[page];
+  private placeLayer(page: number, el = this.layers[page]): void {
     if (!el) return;
     const zoom = this.viewportManager.getZoom();
     el.style.top = `${this.virtualScroll.getPageOffset(page)}px`;
@@ -531,6 +541,112 @@ export class EvidenceNotesOverlay {
     this.scrollContent.querySelectorAll('[data-office-evidence-highlight]').forEach(node => node.remove());
   }
 
+  /** Claim annotations are view-only and independent from source navigation marks. */
+  annotateClaims(claims: EvidenceClaim[]): { resolved: number; unresolved: number } {
+    this.clearClaimAnnotations();
+    this.claims = claims.map(claim => ({ ...claim }));
+    return this.drawClaims();
+  }
+
+  private removeClaimLayers(): void {
+    this.claimLayers.forEach(layer => layer.remove());
+    this.claimLayers.clear();
+  }
+
+  clearClaimAnnotations(): void {
+    if (this.claimFrame !== null) cancelAnimationFrame(this.claimFrame);
+    this.claimFrame = null;
+    this.claims = [];
+    this.removeClaimLayers();
+  }
+
+  private scheduleClaims(): void {
+    // A changed document must never display stale coordinates, even for one frame.
+    this.removeClaimLayers();
+    if (this.claimFrame !== null) cancelAnimationFrame(this.claimFrame);
+    this.claimFrame = null;
+    if (!this.claims.length) return;
+    this.claimFrame = requestAnimationFrame(() => {
+      this.claimFrame = null;
+      try { this.drawClaims(); }
+      catch (error) {
+        this.removeClaimLayers();
+        console.warn('[Evidence] Could not resolve document annotations', error);
+      }
+    });
+  }
+
+  private claimLayer(page: number): HTMLElement {
+    const existing = this.claimLayers.get(page);
+    if (existing) return existing;
+    const layer = document.createElement('div');
+    layer.className = 'office-evidence-annotations';
+    layer.dataset.page = String(page);
+    layer.style.cssText = 'position:absolute;pointer-events:none;z-index:31;';
+    this.scrollContent.appendChild(layer);
+    this.claimLayers.set(page, layer);
+    this.placeLayer(page, layer);
+    return layer;
+  }
+
+  private drawClaims(): { resolved: number; unresolved: number } {
+    this.removeClaimLayers();
+    if (!this.claims.length) return { resolved: 0, unresolved: 0 };
+    this.collect();
+    const zoom = this.viewportManager.getZoom();
+    const badgePositions = new Map<number, { x: number; y: number }[]>();
+    let resolved = 0;
+    this.claims.forEach((claim, index) => {
+      const hits = resolveEvidenceClaim(this.lines, claim);
+      if (!hits.length) return;
+      resolved++;
+      const confirmed = claim.review_status === 'reviewed';
+      const color = confirmed ? '#0f766e' : '#a16207';
+      for (const line of hits) {
+        const mark = document.createElement('div');
+        mark.dataset.officeEvidenceClaim = claim.id;
+        mark.setAttribute('aria-hidden', 'true');
+        mark.style.cssText = `position:absolute;left:${line.x * zoom}px;top:${line.y * zoom}px;` +
+          `width:${line.w * zoom}px;height:${line.h * zoom}px;pointer-events:none;` +
+          `background:${confirmed ? 'rgba(20,184,166,.13)' : 'rgba(250,204,21,.20)'};` +
+          `border-bottom:2px dotted ${color};box-sizing:border-box;border-radius:2px;`;
+        this.claimLayer(line.page).appendChild(mark);
+      }
+      const first = hits[0];
+      const badge = document.createElement('button');
+      badge.type = 'button';
+      badge.dataset.testid = 'office-evidence-annotation';
+      badge.dataset.evidenceLinkId = claim.id;
+      badge.textContent = String(index + 1);
+      badge.title = `근거 ${index + 1} 보기`;
+      badge.setAttribute('aria-label', badge.title);
+      const occupied = badgePositions.get(first.page) ?? [];
+      const position = { x: Math.max(2, first.x * zoom - 34), y: first.y * zoom - 3 };
+      while (occupied.some(other => Math.abs(other.x - position.x) < 29 && Math.abs(other.y - position.y) < 27)) {
+        position.y += 28;
+      }
+      occupied.push(position);
+      badgePositions.set(first.page, occupied);
+      badge.style.cssText = `position:absolute;left:${position.x}px;top:${position.y}px;` +
+        `min-width:26px;height:26px;padding:0 4px;border:1px solid ${color};border-radius:7px;` +
+        `background:#fff;color:${color};font:600 12px/24px system-ui;cursor:pointer;pointer-events:auto;`;
+      // Keep keyboard focus on the native button; the editor must not move its caret.
+      badge.addEventListener('pointerdown', event => event.stopPropagation());
+      badge.addEventListener('mousedown', event => event.stopPropagation());
+      badge.addEventListener('keydown', event => event.stopPropagation());
+      badge.addEventListener('click', event => {
+        event.stopPropagation();
+        if (!this.claims.some(current => current.id === claim.id)) return;
+        const rect = badge.getBoundingClientRect();
+        this.eventBus.emit('evidence-annotation-select', {
+          id: claim.id, rect: { left: rect.left, top: rect.top, width: rect.width, height: rect.height },
+        });
+      });
+      this.claimLayer(first.page).appendChild(badge);
+    });
+    return { resolved, unresolved: this.claims.length - resolved };
+  }
+
   /** 지정한 쪽(0부터)으로 스크롤한다 — 출처 링크로 문서를 열 때 쓴다. */
   scrollToPage(pageIdx: number): { ok: boolean } {
     const y = this.virtualScroll.getPageOffset(Math.max(0, pageIdx));
@@ -574,6 +690,8 @@ export class EvidenceNotesOverlay {
   }
 
   destroy(): void {
+    this.clearClaimAnnotations();
+    this.resizeObserver?.disconnect();
     this.clear();
     this.unsubscribe?.();
     this.unsubscribe = null;
