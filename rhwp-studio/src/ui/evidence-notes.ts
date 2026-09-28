@@ -15,6 +15,7 @@
  * 중앙 정렬)을 따르는 페이지별 오버레이 층에 얹는다 — 캔버스가 가상 스크롤로
  * 재활용되어도 오버레이는 남는다.
  */
+import { exactEvidenceRange } from './evidence-exact';
 import type { WasmBridge } from '@/core/wasm-bridge';
 import type { EventBus } from '@/core/event-bus';
 import type { VirtualScroll } from '@/view/virtual-scroll';
@@ -78,6 +79,7 @@ export class EvidenceNotesOverlay {
   private visible = true;
   private blockSeq = 0;
   private cellDepth = 0;
+  private exactSource: { quote: string; page?: number } | null = null;
 
   constructor(
     private scrollContent: HTMLElement,
@@ -87,8 +89,13 @@ export class EvidenceNotesOverlay {
     eventBus: EventBus,
   ) {
     const onZoom = () => this.relayout();
+    const onMutation = () => this.clearExactSource();
     eventBus.on('zoom-changed', onZoom);
-    this.unsubscribe = () => (eventBus as any).off?.('zoom-changed', onZoom);
+    eventBus.on('document-mutated', onMutation);
+    this.unsubscribe = () => {
+      (eventBus as any).off?.('zoom-changed', onZoom);
+      (eventBus as any).off?.('document-mutated', onMutation);
+    };
   }
 
   /** 전 페이지 렌더 트리에서 줄 텍스트·좌표를 모으고 감사용 전문을 돌려준다. */
@@ -487,6 +494,43 @@ export class EvidenceNotesOverlay {
     return { ok: true, matched: onPage.length, page };
   }
 
+  /** Office source links require a unique complete quote; page is one-based. */
+  highlightExactSnippet(quote: string, page?: number): { status: string; matched: number; page: number | null } {
+    this.clearExactSource();
+    this.collect();
+    const scoped = page === undefined ? this.lines : this.lines.filter(line => line.page === page - 1);
+    const text = scoped.map(line => line.text).join('\n');
+    const match = exactEvidenceRange(text, quote);
+    if (match.status !== 'resolved') return { status: match.status, matched: 0, page: null };
+    let offset = 0;
+    const hits = scoped.filter(line => {
+      const end = offset + line.text.length;
+      const overlaps = end > match.start && offset < match.end;
+      offset = end + 1;
+      return overlaps;
+    });
+    if (!hits.length) return { status: 'missing', matched: 0, page: null };
+    this.exactSource = { quote, page };
+    const zoom = this.viewportManager.getZoom();
+    for (const line of hits) {
+      const mark = document.createElement('div');
+      mark.dataset.officeEvidenceHighlight = 'text';
+      mark.className = 'evidence-source-flash';
+      mark.style.cssText = `position:absolute;left:${line.x * zoom}px;top:${line.y * zoom}px;` +
+        `width:${line.w * zoom}px;height:${line.h * zoom}px;background:rgba(250,204,21,.32);` +
+        'outline:2px solid #d97706;pointer-events:none;border-radius:2px;';
+      this.layer(line.page).appendChild(mark);
+    }
+    const y = this.virtualScroll.getPageOffset(hits[0].page) + hits[0].y * zoom;
+    this.viewportManager.setScrollTop(Math.max(0, y - 120));
+    return { status: 'resolved', matched: hits.length, page: hits[0].page + 1 };
+  }
+
+  clearExactSource(): void {
+    this.exactSource = null;
+    this.scrollContent.querySelectorAll('[data-office-evidence-highlight]').forEach(node => node.remove());
+  }
+
   /** 지정한 쪽(0부터)으로 스크롤한다 — 출처 링크로 문서를 열 때 쓴다. */
   scrollToPage(pageIdx: number): { ok: boolean } {
     const y = this.virtualScroll.getPageOffset(Math.max(0, pageIdx));
@@ -497,13 +541,19 @@ export class EvidenceNotesOverlay {
 
   /** 줌이 바뀌면 저장된 노트로 전부 다시 그린다. */
   private relayout(): void {
-    if (this.notes.length === 0) return;
+    const exact = this.exactSource;
+    if (this.notes.length === 0) {
+      if (exact) this.highlightExactSnippet(exact.quote, exact.page);
+      return;
+    }
     const notes = this.notes;
     this.clear(false);
     this.show(notes);
+    if (exact) this.highlightExactSnippet(exact.quote, exact.page);
   }
 
   clear(reset = true): void {
+    this.clearExactSource();
     this.closePopover();
     for (const layer of this.layers) layer?.remove();
     this.layers = [];

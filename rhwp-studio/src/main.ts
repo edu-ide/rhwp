@@ -2014,6 +2014,17 @@ installEmbedRuntime({
         reply({ ok: true });
         break;
       }
+      case 'evidenceHighlightExactSource': {
+        await initPromise;
+        if (!evidenceOverlay) { reply({ status: 'unavailable' }); break; }
+        const q = params as { quote?: string; page?: number; clear?: boolean } | undefined;
+        if (q?.clear === true) { evidenceOverlay.clearExactSource(); reply({ status: 'cleared' }); break; }
+        if (typeof q?.quote !== 'string' || (q.page !== undefined && (!Number.isInteger(q.page) || q.page < 1))) {
+          reply({ status: 'missing' }); break;
+        }
+        reply(evidenceOverlay.highlightExactSnippet(q.quote, q.page));
+        break;
+      }
       case 'evidenceHighlightSource': {
         await initPromise;
         if (!evidenceOverlay) { reply({ ok: false }); break; }

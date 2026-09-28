@@ -28,7 +28,7 @@ export interface EmbedNotifySavedResult {
   wasDirty: boolean;
 }
 
-export const OFFICE_EMBED_METHODS = new Set(['dispatchCommand', 'evidenceCollect', 'evidenceShow', 'evidenceClear', 'evidenceHighlightSource', 'evidenceScrollToPage', 'evidenceSetVisible', 'openCommandPalette', 'getAutosaveRecoveryState', 'resolveAutosaveRecovery', 'getCursorPosition', 'canUndo', 'canRedo', 'undo', 'redo', 'getTextRange', 'getCharProperties', 'getParagraphInfo', 'applyOperation']);
+export const OFFICE_EMBED_METHODS = new Set(['dispatchCommand', 'evidenceCollect', 'evidenceShow', 'evidenceClear', 'evidenceHighlightSource', 'evidenceHighlightExactSource', 'evidenceScrollToPage', 'evidenceSetVisible', 'openCommandPalette', 'getAutosaveRecoveryState', 'resolveAutosaveRecovery', 'getCursorPosition', 'canUndo', 'canRedo', 'undo', 'redo', 'getTextRange', 'getCharProperties', 'getParagraphInfo', 'applyOperation']);
 
 export interface EmbedRpcHandlers {
   officeRequest?(method: string, params: Record<string, any>): Promise<unknown>;
