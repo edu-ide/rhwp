@@ -16,7 +16,7 @@
  * 재활용되어도 오버레이는 남는다.
  */
 import { exactEvidenceRange } from './evidence-exact';
-import { resolveEvidenceClaim } from './evidence-claims';
+import { claimAnnotationStyle, resolveEvidenceClaim } from './evidence-claims';
 import type { EvidenceClaim } from './evidence-claims';
 import type { WasmBridge } from '@/core/wasm-bridge';
 import type { EventBus } from '@/core/event-bus';
@@ -600,16 +600,15 @@ export class EvidenceNotesOverlay {
       const hits = resolveEvidenceClaim(this.lines, claim);
       if (!hits.length) return;
       resolved++;
-      const confirmed = claim.review_status === 'reviewed';
-      const color = confirmed ? '#0f766e' : '#a16207';
+      const style = claimAnnotationStyle(claim), color = style.color;
       for (const line of hits) {
         const mark = document.createElement('div');
         mark.dataset.officeEvidenceClaim = claim.id;
+        mark.dataset.evidenceState = claim.evidence_state;
         mark.setAttribute('aria-hidden', 'true');
         mark.style.cssText = `position:absolute;left:${line.x * zoom}px;top:${line.y * zoom}px;` +
-          `width:${line.w * zoom}px;height:${line.h * zoom}px;pointer-events:none;` +
-          `background:${confirmed ? 'rgba(20,184,166,.13)' : 'rgba(250,204,21,.20)'};` +
-          `border-bottom:2px dotted ${color};box-sizing:border-box;border-radius:2px;`;
+          `width:${line.w * zoom}px;height:${line.h * zoom}px;pointer-events:none;background:${style.background};` +
+          `border-bottom:2px ${style.line} ${color};box-sizing:border-box;border-radius:2px;`;
         this.claimLayer(line.page).appendChild(mark);
       }
       const first = hits[0];
@@ -617,8 +616,9 @@ export class EvidenceNotesOverlay {
       badge.type = 'button';
       badge.dataset.testid = 'office-evidence-annotation';
       badge.dataset.evidenceLinkId = claim.id;
+      badge.dataset.evidenceState = claim.evidence_state;
       badge.textContent = String(index + 1);
-      badge.title = `근거 ${index + 1} 보기`;
+      badge.title = `${style.label} ${index + 1} 보기`;
       badge.setAttribute('aria-label', badge.title);
       const occupied = badgePositions.get(first.page) ?? [];
       const position = { x: Math.max(2, first.x * zoom - 34), y: first.y * zoom - 3 };
@@ -628,8 +628,8 @@ export class EvidenceNotesOverlay {
       occupied.push(position);
       badgePositions.set(first.page, occupied);
       badge.style.cssText = `position:absolute;left:${position.x}px;top:${position.y}px;` +
-        `min-width:26px;height:26px;padding:0 4px;border:1px solid ${color};border-radius:7px;` +
-        `background:#fff;color:${color};font:600 12px/24px system-ui;cursor:pointer;pointer-events:auto;`;
+        `min-width:26px;height:26px;padding:0 4px;border:1px ${style.line === 'dashed' ? 'dashed' : 'solid'} ${color};` +
+        `border-radius:7px;background:${style.badgeBackground};color:${color};font:600 12px/24px system-ui;cursor:pointer;pointer-events:auto;`;
       // Keep keyboard focus on the native button; the editor must not move its caret.
       badge.addEventListener('pointerdown', event => event.stopPropagation());
       badge.addEventListener('mousedown', event => event.stopPropagation());
