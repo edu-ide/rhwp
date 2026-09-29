@@ -52,3 +52,14 @@ test('claims without evidence are painted apart from linked and reviewed claims'
   assert.equal(new Set([linked.color, reviewed.color, missing.color]).size, 3);
   assert.equal(linked.line, 'dotted');
 });
+
+test('a judgment backed by reasoning is painted in its own colour, dashed when a premise does not hold', () => {
+  const claim = { id: 'j', quote: '그래서 필요합니다', review_status: 'unreviewed', evidence_state: 'reasoned' as const };
+  const reasoned = claimAnnotationStyle(claim), weak = claimAnnotationStyle({ ...claim, premise_problem: true });
+  const others = ['linked', 'missing'].map(state => claimAnnotationStyle({ ...claim, evidence_state: state as 'linked' | 'missing' }));
+  assert.equal(reasoned.label, '논리 근거');
+  assert.deepEqual([reasoned.line, reasoned.lineWidth, weak.line, weak.lineWidth], ['double', 3, 'dashed', 2]);
+  assert.ok(others.every(style => style.color !== reasoned.color));
+  assert.deepEqual(parseEvidenceClaims([{ ...claim, premise_problem: true }]).map(item => [item.evidence_state, item.premise_problem]), [['reasoned', true]]);
+  assert.throws(() => parseEvidenceClaims([{ ...claim, premise_problem: 'yes' }]));
+});

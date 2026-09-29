@@ -608,7 +608,7 @@ export class EvidenceNotesOverlay {
         mark.setAttribute('aria-hidden', 'true');
         mark.style.cssText = `position:absolute;left:${line.x * zoom}px;top:${line.y * zoom}px;` +
           `width:${line.w * zoom}px;height:${line.h * zoom}px;pointer-events:none;background:${style.background};` +
-          `border-bottom:2px ${style.line} ${color};box-sizing:border-box;border-radius:2px;`;
+          `border-bottom:${style.lineWidth}px ${style.line} ${color};box-sizing:border-box;border-radius:2px;`;
         this.claimLayer(line.page).appendChild(mark);
       }
       const first = hits[0];

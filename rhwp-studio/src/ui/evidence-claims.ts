@@ -3,8 +3,10 @@ export interface EvidenceClaim {
   quote: string;
   page?: number;
   review_status: string;
-  /** missing: the claim has no source yet and must stay visibly apart from linked claims. */
-  evidence_state: 'linked' | 'missing';
+  /** missing: no source yet · reasoned: a judgment resting on earlier claims. Each stays visibly apart. */
+  evidence_state: 'linked' | 'reasoned' | 'missing';
+  /** A reasoned claim whose premise was deleted or has no evidence. */
+  premise_problem?: boolean;
 }
 
 export interface EvidenceClaimLine {
@@ -20,7 +22,9 @@ export interface EvidenceClaimStyle {
   label: string;
   color: string;
   background: string;
-  line: 'dotted' | 'dashed';
+  line: 'dotted' | 'dashed' | 'double';
+  /** A double line needs 3px to show two strokes. */
+  lineWidth: number;
   badgeBackground: string;
 }
 
@@ -51,15 +55,20 @@ export function resolveEvidenceClaim(lines: EvidenceClaimLine[], claim: Evidence
   return scoped.slice(owners[start], owners[start + needle.length - 1] + 1);
 }
 
-/** One palette with the Office panel and the Word view: linked, reviewed, and still needing evidence. */
+/** One palette with the Office panel and the Word view: linked, reviewed, reasoned, and still needing evidence. */
 export function claimAnnotationStyle(claim: EvidenceClaim): EvidenceClaimStyle {
   if (claim.evidence_state === 'missing') {
-    return { label: '근거 필요', color: '#be123c', background: 'rgba(244,63,94,.16)', line: 'dashed', badgeBackground: '#fff1f2' };
+    return { label: '근거 필요', color: '#be123c', background: 'rgba(244,63,94,.16)', line: 'dashed', lineWidth: 2, badgeBackground: '#fff1f2' };
+  }
+  if (claim.evidence_state === 'reasoned') {
+    // Dashed once a premise no longer holds, so the state is not told by colour alone.
+    const weak = claim.premise_problem === true;
+    return { label: '논리 근거', color: '#7e22ce', background: 'rgba(168,85,247,.14)', line: weak ? 'dashed' : 'double', lineWidth: weak ? 2 : 3, badgeBackground: '#faf5ff' };
   }
   if (claim.review_status === 'reviewed') {
-    return { label: '근거', color: '#0f766e', background: 'rgba(20,184,166,.13)', line: 'dotted', badgeBackground: '#fff' };
+    return { label: '근거', color: '#0f766e', background: 'rgba(20,184,166,.13)', line: 'dotted', lineWidth: 2, badgeBackground: '#fff' };
   }
-  return { label: '근거', color: '#a16207', background: 'rgba(250,204,21,.20)', line: 'dotted', badgeBackground: '#fff' };
+  return { label: '근거', color: '#a16207', background: 'rgba(250,204,21,.20)', line: 'dotted', lineWidth: 2, badgeBackground: '#fff' };
 }
 
 export function parseEvidenceClaims(value: unknown): EvidenceClaim[] {
@@ -70,11 +79,12 @@ export function parseEvidenceClaims(value: unknown): EvidenceClaim[] {
       || typeof item.quote !== 'string' || item.quote.length > 20000
       || typeof item.review_status !== 'string'
       || (item.page !== undefined && (!Number.isSafeInteger(item.page) || item.page < 1))
-      || (item.evidence_state !== undefined && item.evidence_state !== 'linked' && item.evidence_state !== 'missing')
+      || (item.evidence_state !== undefined && !['linked', 'reasoned', 'missing'].includes(item.evidence_state))
+      || (item.premise_problem !== undefined && typeof item.premise_problem !== 'boolean')
       || ids.has(item.id)) throw new Error('Invalid evidence claim');
     ids.add(item.id);
     // An Office host from before 근거 필요 sends only linked claims.
     return {id: item.id, quote: item.quote, page: item.page, review_status: item.review_status,
-      evidence_state: item.evidence_state ?? 'linked'};
+      evidence_state: item.evidence_state ?? 'linked', premise_problem: item.premise_problem === true};
   });
 }
