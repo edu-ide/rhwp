@@ -605,6 +605,7 @@ export class EvidenceNotesOverlay {
         const mark = document.createElement('div');
         mark.dataset.officeEvidenceClaim = claim.id;
         mark.dataset.evidenceState = claim.evidence_state;
+        mark.dataset.annotationLayer = claim.annotation_layer ?? (claim.evidence_state === 'annotation' ? 'annotation' : 'evidence');
         mark.setAttribute('aria-hidden', 'true');
         mark.style.cssText = `position:absolute;left:${line.x * zoom}px;top:${line.y * zoom}px;` +
           `width:${line.w * zoom}px;height:${line.h * zoom}px;pointer-events:none;background:${style.background};` +
@@ -617,8 +618,11 @@ export class EvidenceNotesOverlay {
       badge.dataset.testid = 'office-evidence-annotation';
       badge.dataset.evidenceLinkId = claim.id;
       badge.dataset.evidenceState = claim.evidence_state;
-      badge.textContent = String(index + 1);
-      badge.title = `${style.label} ${index + 1} 보기`;
+      badge.dataset.annotationLayer = claim.annotation_layer ?? (claim.evidence_state === 'annotation' ? 'annotation' : 'evidence');
+      if (claim.editorial_kind) badge.dataset.editorialKind = claim.editorial_kind;
+      const number = claim.annotation_number ?? index + 1;
+      badge.textContent = String(number);
+      badge.title = `${style.label} ${number} 보기`;
       badge.setAttribute('aria-label', badge.title);
       const occupied = badgePositions.get(first.page) ?? [];
       const position = { x: Math.max(2, first.x * zoom - 34), y: first.y * zoom - 3 };

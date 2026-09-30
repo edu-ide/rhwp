@@ -63,3 +63,21 @@ test('a judgment backed by reasoning is painted in its own colour, dashed when a
   assert.deepEqual(parseEvidenceClaims([{ ...claim, premise_problem: true }]).map(item => [item.evidence_state, item.premise_problem]), [['reasoned', true]]);
   assert.throws(() => parseEvidenceClaims([{ ...claim, premise_problem: 'yes' }]));
 });
+
+test('semantic view styles stay apart from evidence and preserve filtered annotation numbers', () => {
+  const claim = {id: 's', quote: '의미 있는 문장', review_status: 'reviewed', evidence_state: 'annotation' as const};
+  const parsed = parseEvidenceClaims([{...claim, annotation_number: 19, annotation_layer: 'intent', annotation_label: '의도 · 문제 제기'}])[0];
+  assert.equal(parsed.annotation_number, 19);
+  assert.equal(claimAnnotationStyle(parsed).label, '의도 · 문제 제기');
+  const intent = claimAnnotationStyle(parsed), concept = claimAnnotationStyle({...claim, annotation_layer: 'concept'});
+  const editorial = claimAnnotationStyle({...claim, annotation_layer: 'editorial', editorial_kind: 'unnecessary'});
+  const good = claimAnnotationStyle({...claim, annotation_layer: 'editorial', editorial_kind: 'good'});
+  assert.equal(new Set([intent.color, concept.color, editorial.color, good.color]).size, 4);
+  assert.equal(editorial.line, 'dashed');
+  assert.equal(claimAnnotationStyle({...parsed, evidence_state: 'linked'}).color, intent.color);
+  assert.equal(claimAnnotationStyle(claim).label, '의미 표시');
+  for (const invalid of [{annotation_number: 0}, {annotation_number: 1.2}, {annotation_layer: 'verified'},
+    {annotation_label: 'x'.repeat(241)}, {editorial_kind: 'delete-automatically'}]) {
+    assert.throws(() => parseEvidenceClaims([{...claim, ...invalid}]));
+  }
+});

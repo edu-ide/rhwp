@@ -4,9 +4,13 @@ export interface EvidenceClaim {
   page?: number;
   review_status: string;
   /** missing: no source yet · reasoned: a judgment resting on earlier claims. Each stays visibly apart. */
-  evidence_state: 'linked' | 'reasoned' | 'missing';
+  evidence_state: 'linked' | 'reasoned' | 'missing' | 'annotation';
   /** A reasoned claim whose premise was deleted or has no evidence. */
   premise_problem?: boolean;
+  annotation_number?: number;
+  annotation_layer?: 'evidence' | 'intent' | 'concept' | 'editorial' | 'annotation';
+  annotation_label?: string;
+  editorial_kind?: 'unnecessary' | 'redundant' | 'unclear' | 'good';
 }
 
 export interface EvidenceClaimLine {
@@ -57,6 +61,14 @@ export function resolveEvidenceClaim(lines: EvidenceClaimLine[], claim: Evidence
 
 /** One palette with the Office panel and the Word view: linked, reviewed, reasoned, and still needing evidence. */
 export function claimAnnotationStyle(claim: EvidenceClaim): EvidenceClaimStyle {
+  const layer = claim.annotation_layer;
+  if (layer === 'intent') return {label: claim.annotation_label ?? '의도', color: '#2563eb', background: 'rgba(37,99,235,.12)', line: 'dotted', lineWidth: 2, badgeBackground: '#eff6ff'};
+  if (layer === 'concept') return {label: claim.annotation_label ?? '개념', color: '#0891b2', background: 'rgba(8,145,178,.12)', line: 'double', lineWidth: 3, badgeBackground: '#ecfeff'};
+  if (layer === 'editorial') {
+    if (claim.editorial_kind === 'good') return {label: claim.annotation_label ?? '유지할 표현', color: '#4d7c0f', background: 'rgba(77,124,15,.12)', line: 'dotted', lineWidth: 2, badgeBackground: '#f7fee7'};
+    return {label: claim.annotation_label ?? '다듬기', color: '#ea580c', background: 'rgba(234,88,12,.12)', line: 'dashed', lineWidth: 2, badgeBackground: '#fff7ed'};
+  }
+  if (claim.evidence_state === 'annotation') return {label: '의미 표시', color: '#64748b', background: 'rgba(100,116,139,.10)', line: 'dotted', lineWidth: 2, badgeBackground: '#f8fafc'};
   if (claim.evidence_state === 'missing') {
     return { label: '근거 필요', color: '#be123c', background: 'rgba(244,63,94,.16)', line: 'dashed', lineWidth: 2, badgeBackground: '#fff1f2' };
   }
@@ -79,12 +91,20 @@ export function parseEvidenceClaims(value: unknown): EvidenceClaim[] {
       || typeof item.quote !== 'string' || item.quote.length > 20000
       || typeof item.review_status !== 'string'
       || (item.page !== undefined && (!Number.isSafeInteger(item.page) || item.page < 1))
-      || (item.evidence_state !== undefined && !['linked', 'reasoned', 'missing'].includes(item.evidence_state))
+      || (item.evidence_state !== undefined && !['linked', 'reasoned', 'missing', 'annotation'].includes(item.evidence_state))
       || (item.premise_problem !== undefined && typeof item.premise_problem !== 'boolean')
+      || (item.annotation_number !== undefined && (!Number.isSafeInteger(item.annotation_number) || item.annotation_number < 1 || item.annotation_number > 2000))
+      || (item.annotation_layer !== undefined && !['evidence', 'intent', 'concept', 'editorial', 'annotation'].includes(item.annotation_layer))
+      || (item.annotation_label !== undefined && (typeof item.annotation_label !== 'string' || item.annotation_label.length > 240))
+      || (item.editorial_kind !== undefined && !['unnecessary', 'redundant', 'unclear', 'good'].includes(item.editorial_kind))
       || ids.has(item.id)) throw new Error('Invalid evidence claim');
     ids.add(item.id);
     // An Office host from before 근거 필요 sends only linked claims.
     return {id: item.id, quote: item.quote, page: item.page, review_status: item.review_status,
-      evidence_state: item.evidence_state ?? 'linked', premise_problem: item.premise_problem === true};
+      evidence_state: item.evidence_state ?? 'linked', premise_problem: item.premise_problem === true,
+      ...(item.annotation_number === undefined ? {} : {annotation_number: item.annotation_number}),
+      ...(item.annotation_layer === undefined ? {} : {annotation_layer: item.annotation_layer}),
+      ...(item.annotation_label === undefined ? {} : {annotation_label: item.annotation_label}),
+      ...(item.editorial_kind === undefined ? {} : {editorial_kind: item.editorial_kind})};
   });
 }
