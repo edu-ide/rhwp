@@ -8,9 +8,8 @@ use super::super::render_tree::*;
 use super::super::style_resolver::ResolvedStyleSet;
 use super::super::{hwpunit_to_px, px_to_hwpunit};
 use super::border_rendering::{
-    create_border_line_nodes,
-    build_row_col_x, collect_cell_borders, mark_cell_span_interior_covered, render_edge_borders,
-    render_transparent_borders,
+    build_row_col_x, collect_cell_borders, create_border_line_nodes,
+    mark_cell_span_interior_covered, render_edge_borders, render_transparent_borders,
 };
 use super::table_layout::{
     calc_nested_split_rows, effective_margin_left_line, extend_completed_nested_table_border_clips,
@@ -3847,7 +3846,11 @@ impl LayoutEngine {
                     width: 1,
                     color: 0,
                 };
-                let x1 = table_x + row_col_x.first().and_then(|r| r.first().copied()).unwrap_or(0.0);
+                let x1 = table_x
+                    + row_col_x
+                        .first()
+                        .and_then(|r| r.first().copied())
+                        .unwrap_or(0.0);
                 let x2 = table_x
                     + row_col_x
                         .first()

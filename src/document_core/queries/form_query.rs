@@ -500,7 +500,10 @@ fn insert_form_into_paragraph(
 
     let form = FormObject {
         common: crate::model::shape::CommonObjAttr {
-            treat_as_char: true, width, height, ..Default::default()
+            treat_as_char: true,
+            width,
+            height,
+            ..Default::default()
         },
         form_type,
         name: name.trim().to_string(),

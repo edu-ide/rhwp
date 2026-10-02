@@ -1371,7 +1371,12 @@ impl DocumentCore {
             return Err(HwpError::RenderError("경로가 비어있습니다".to_string()));
         }
         self.apply_char_format_in_cell_by_path(
-            sec_idx, parent_para_idx, path, start_offset, end_offset, props_json,
+            sec_idx,
+            parent_para_idx,
+            path,
+            start_offset,
+            end_offset,
+            props_json,
         )
     }
 
@@ -2403,8 +2408,7 @@ mod cell_para_format_reflow_tests {
     const CELL_PARA: usize = 0;
 
     fn load() -> DocumentCore {
-        let bytes =
-            std::fs::read("samples/pic-in-table-01.hwp").expect("read pic-in-table-01.hwp");
+        let bytes = std::fs::read("samples/pic-in-table-01.hwp").expect("read pic-in-table-01.hwp");
         DocumentCore::from_bytes(&bytes).expect("parse pic-in-table-01.hwp")
     }
 
@@ -2428,14 +2432,25 @@ mod cell_para_format_reflow_tests {
     fn line_spacing_change_wraps_at_the_cell_width_not_the_page_width() {
         let mut doc = load();
         let before = line_count(&doc);
-        assert!(before > 1, "셀 폭에서 이미 여러 줄이어야 의미 있는 검증이다");
+        assert!(
+            before > 1,
+            "셀 폭에서 이미 여러 줄이어야 의미 있는 검증이다"
+        );
 
-        doc.apply_para_format_in_cell_native(0, PARA, CTRL, CELL, CELL_PARA, r#"{"lineSpacing":130}"#)
-            .expect("셀 문단 서식 변경 실패");
+        doc.apply_para_format_in_cell_native(
+            0,
+            PARA,
+            CTRL,
+            CELL,
+            CELL_PARA,
+            r#"{"lineSpacing":130}"#,
+        )
+        .expect("셀 문단 서식 변경 실패");
 
         // 단 폭으로 리플로우하면 줄이 합쳐져 줄 수가 줄어든다. 셀 폭이면 유지된다.
         assert_eq!(
-            line_count(&doc), before,
+            line_count(&doc),
+            before,
             "줄간격만 바꿨는데 줄 수가 변했다 — 단 폭으로 줄을 나눈 것"
         );
     }
@@ -2443,15 +2458,23 @@ mod cell_para_format_reflow_tests {
     #[test]
     fn line_spacing_change_leaves_the_paragraph_already_cell_reflowed() {
         let mut doc = load();
-        doc.apply_para_format_in_cell_native(0, PARA, CTRL, CELL, CELL_PARA, r#"{"lineSpacing":130}"#)
-            .expect("셀 문단 서식 변경 실패");
+        doc.apply_para_format_in_cell_native(
+            0,
+            PARA,
+            CTRL,
+            CELL,
+            CELL_PARA,
+            r#"{"lineSpacing":130}"#,
+        )
+        .expect("셀 문단 서식 변경 실패");
         let after_format = line_tops(&doc);
 
         // 올바른 셀 리플로우를 한 번 더 돌려도 결과가 같아야 한다. 서식 경로가
         // 다른 폭을 썼다면 여기서 좌표가 달라진다.
         doc.reflow_cell_paragraph(0, PARA, CTRL, CELL, CELL_PARA);
         assert_eq!(
-            line_tops(&doc), after_format,
+            line_tops(&doc),
+            after_format,
             "서식 변경이 남긴 줄 좌표가 셀 리플로우 결과와 다르다"
         );
     }
@@ -2460,8 +2483,15 @@ mod cell_para_format_reflow_tests {
     fn line_spacing_change_actually_widens_the_line_pitch() {
         let mut doc = load();
         let before = line_tops(&doc);
-        doc.apply_para_format_in_cell_native(0, PARA, CTRL, CELL, CELL_PARA, r#"{"lineSpacing":200}"#)
-            .expect("셀 문단 서식 변경 실패");
+        doc.apply_para_format_in_cell_native(
+            0,
+            PARA,
+            CTRL,
+            CELL,
+            CELL_PARA,
+            r#"{"lineSpacing":200}"#,
+        )
+        .expect("셀 문단 서식 변경 실패");
         let after = line_tops(&doc);
         assert_eq!(after.len(), before.len(), "줄 수는 그대로");
         let pitch_before = before[1] - before[0];
@@ -2477,12 +2507,21 @@ mod cell_para_format_reflow_tests {
         let mut doc = load();
         let before = line_tops(&doc);
         doc.apply_para_format_in_cell_native(
-            0, PARA, CTRL, CELL, CELL_PARA, r#"{"spacingBefore":1000}"#,
+            0,
+            PARA,
+            CTRL,
+            CELL,
+            CELL_PARA,
+            r#"{"spacingBefore":1000}"#,
         )
         .expect("셀 문단 서식 변경 실패");
         let after = line_tops(&doc);
 
-        assert_eq!(after.len(), before.len(), "간격만 바꿨으니 줄 수는 그대로여야 한다");
+        assert_eq!(
+            after.len(),
+            before.len(),
+            "간격만 바꿨으니 줄 수는 그대로여야 한다"
+        );
         // ParaShape 는 문단 간격을 HWPUNIT 2배로 저장한다(style_resolver 규약).
         assert_eq!(
             after[0] - before[0],
@@ -2498,7 +2537,12 @@ mod cell_para_format_reflow_tests {
         let mut doc = load();
         let before = line_tops(&doc);
         doc.apply_para_format_in_cell_native(
-            0, PARA, CTRL, CELL, CELL_PARA, r#"{"spacingBefore":0}"#,
+            0,
+            PARA,
+            CTRL,
+            CELL,
+            CELL_PARA,
+            r#"{"spacingBefore":0}"#,
         )
         .expect("셀 문단 서식 변경 실패");
         assert_eq!(line_tops(&doc), before, "간격 0인데 좌표가 움직였다");

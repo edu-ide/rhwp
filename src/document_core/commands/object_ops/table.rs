@@ -1616,141 +1616,6 @@ impl DocumentCore {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use crate::document_core::DocumentCore;
-    use crate::model::control::Control;
-    use crate::model::paragraph::CharShapeRef;
-    use crate::model::table::Table;
-
-    /// 표를 삽입한 문단에 서식을 심고, 그 문서에서 표를 만든다.
-    fn core_with_shaped_paragraph() -> DocumentCore {
-        let mut core = DocumentCore::new_empty();
-        core.create_blank_document_native().unwrap();
-        let para = &mut core.document.sections[0].paragraphs[0];
-        para.para_shape_id = 12;
-        para.char_shapes = vec![CharShapeRef {
-            start_pos: 0,
-            char_shape_id: 7,
-        }];
-        core
-    }
-
-    fn table_of(core: &DocumentCore) -> &Table {
-        core.document.sections[0]
-            .paragraphs
-            .iter()
-            .find_map(|p| {
-                p.controls.iter().find_map(|c| match c {
-                    Control::Table(t) => Some(t.as_ref()),
-                    _ => None,
-                })
-            })
-            .expect("표 컨트롤")
-    }
-
-    /// Cell::new_empty() 의 문단은 char_shapes 가 비어 있고, 저장기는 그것을
-    /// charPrIDRef="0" 으로 쓴다 — 새 표의 셀에 글자를 입력하면 문서의 0번
-    /// 글자모양이 나온다. 표를 삽입한 문단의 글자모양을 상속해야 한다.
-    fn assert_cells_inherit_shape(table: &Table) {
-        assert!(!table.cells.is_empty(), "셀이 있어야 한다");
-        for cell in &table.cells {
-            let para = &cell.paragraphs[0];
-            assert_eq!(
-                para.para_shape_id, 12,
-                "셀 ({},{}) para_shape_id",
-                cell.row, cell.col
-            );
-            assert_eq!(
-                para.char_shapes.first().map(|cs| cs.char_shape_id),
-                Some(7),
-                "셀 ({},{}) char_shapes — 비면 charPrIDRef=0",
-                cell.row,
-                cell.col
-            );
-        }
-    }
-
-    #[test]
-    fn create_table_native_cells_inherit_char_shape() {
-        let mut core = core_with_shaped_paragraph();
-        core.create_table_native(0, 0, 0, 2, 3).unwrap();
-        assert_cells_inherit_shape(table_of(&core));
-    }
-
-    #[test]
-    fn create_table_ex_native_cells_inherit_char_shape() {
-        let mut core = core_with_shaped_paragraph();
-        core.create_table_ex_native(0, 0, 0, 2, 3, false, None, None)
-            .unwrap();
-        assert_cells_inherit_shape(table_of(&core));
-    }
-
-    /// 혼합 글자모양 문단: 텍스트 20자, 글자 인덱스 0~9 는 34, 10~ 는 37.
-    /// 커서 offset 10 의 글자모양(37)은 첫 엔트리(34)와 다르다 — 첫 엔트리를
-    /// 상속 기준으로 쓰는 회귀를 잡는다.
-    fn core_with_mixed_shape_paragraph() -> DocumentCore {
-        let mut core = DocumentCore::new_empty();
-        core.create_blank_document_native().unwrap();
-        core.insert_text_native(0, 0, 0, "0123456789abcdefghij")
-            .unwrap();
-        let para = &mut core.document.sections[0].paragraphs[0];
-        para.para_shape_id = 12;
-        // 컨트롤(SectionDef 등)이 UTF-16 앞자리를 차지하므로 경계는 char_offsets 로 계산.
-        let boundary = para.char_offsets[10];
-        para.char_shapes = vec![
-            CharShapeRef {
-                start_pos: 0,
-                char_shape_id: 34,
-            },
-            CharShapeRef {
-                start_pos: boundary,
-                char_shape_id: 37,
-            },
-        ];
-        core
-    }
-
-    fn assert_cells_inherit_cursor_shape(table: &Table) {
-        assert!(!table.cells.is_empty(), "셀이 있어야 한다");
-        for cell in &table.cells {
-            let para = &cell.paragraphs[0];
-            assert_eq!(
-                para.char_shapes.first().map(|cs| cs.char_shape_id),
-                Some(37),
-                "셀 ({},{}) — 커서 offset 의 글자모양(37)이 아니라 첫 엔트리(34)를 상속",
-                cell.row,
-                cell.col
-            );
-        }
-    }
-
-    #[test]
-    fn create_table_native_inherits_char_shape_at_cursor_offset() {
-        let mut core = core_with_mixed_shape_paragraph();
-        core.create_table_native(0, 0, 10, 2, 2).unwrap();
-        assert_cells_inherit_cursor_shape(table_of(&core));
-    }
-
-    #[test]
-    fn create_table_ex_native_inherits_char_shape_at_cursor_offset() {
-        let mut core = core_with_mixed_shape_paragraph();
-        core.create_table_ex_native(0, 0, 10, 2, 2, false, None, None)
-            .unwrap();
-        assert_cells_inherit_cursor_shape(table_of(&core));
-    }
-
-    /// treat_as_char=true 인라인 경로는 create_table_native 로 위임하지 않는
-    /// 별도 구현이므로 따로 검증한다.
-    #[test]
-    fn create_table_ex_native_tac_inherits_char_shape_at_cursor_offset() {
-        let mut core = core_with_mixed_shape_paragraph();
-        core.create_table_ex_native(0, 0, 10, 2, 2, true, None, None)
-            .unwrap();
-        assert_cells_inherit_cursor_shape(table_of(&core));
-    }
-}
-
 impl DocumentCore {
     pub fn move_table_to_cell_native(
         &mut self,
@@ -1971,7 +1836,9 @@ impl DocumentCore {
         for sec in self.document.sections.iter_mut() {
             for para in sec.paragraphs.iter_mut() {
                 for ctrl in para.controls.iter_mut() {
-                    let Control::Table(outer) = ctrl else { continue };
+                    let Control::Table(outer) = ctrl else {
+                        continue;
+                    };
                     if outer.raw_ctrl_data.len() >= common_obj_offsets::MIN_LEN {
                         used.insert(u32::from_le_bytes(
                             outer.raw_ctrl_data[common_obj_offsets::INSTANCE_ID]
@@ -2030,9 +1897,8 @@ impl DocumentCore {
                     // 머리행 문항 제목이 한 줄에서 두 줄로 접히는 사고가 났다.
                     for cell in outer.cells.iter_mut() {
                         if cell.raw_list_extra.len() >= 4 {
-                            let cur = u32::from_le_bytes(
-                                cell.raw_list_extra[0..4].try_into().unwrap(),
-                            );
+                            let cur =
+                                u32::from_le_bytes(cell.raw_list_extra[0..4].try_into().unwrap());
                             if cur != cell.width {
                                 cell.raw_list_extra[0..4]
                                     .copy_from_slice(&cell.width.to_le_bytes());
@@ -2087,8 +1953,7 @@ impl DocumentCore {
         let table_box = {
             let section = &mut self.document.sections[section_idx];
             section.raw_stream = None;
-            let cell_para =
-                Self::resolve_cell_paragraph_mut(section, src_para_idx, src_cell_path)?;
+            let cell_para = Self::resolve_cell_paragraph_mut(section, src_para_idx, src_cell_path)?;
             match cell_para.controls.last() {
                 Some(Control::Table(_)) => {}
                 _ => {
@@ -2165,5 +2030,140 @@ impl DocumentCore {
             "\"paraIdx\":{},\"controlIdx\":0,\"container\":\"body\"",
             dst_para_idx
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::document_core::DocumentCore;
+    use crate::model::control::Control;
+    use crate::model::paragraph::CharShapeRef;
+    use crate::model::table::Table;
+
+    /// 표를 삽입한 문단에 서식을 심고, 그 문서에서 표를 만든다.
+    fn core_with_shaped_paragraph() -> DocumentCore {
+        let mut core = DocumentCore::new_empty();
+        core.create_blank_document_native().unwrap();
+        let para = &mut core.document.sections[0].paragraphs[0];
+        para.para_shape_id = 12;
+        para.char_shapes = vec![CharShapeRef {
+            start_pos: 0,
+            char_shape_id: 7,
+        }];
+        core
+    }
+
+    fn table_of(core: &DocumentCore) -> &Table {
+        core.document.sections[0]
+            .paragraphs
+            .iter()
+            .find_map(|p| {
+                p.controls.iter().find_map(|c| match c {
+                    Control::Table(t) => Some(t.as_ref()),
+                    _ => None,
+                })
+            })
+            .expect("표 컨트롤")
+    }
+
+    /// Cell::new_empty() 의 문단은 char_shapes 가 비어 있고, 저장기는 그것을
+    /// charPrIDRef="0" 으로 쓴다 — 새 표의 셀에 글자를 입력하면 문서의 0번
+    /// 글자모양이 나온다. 표를 삽입한 문단의 글자모양을 상속해야 한다.
+    fn assert_cells_inherit_shape(table: &Table) {
+        assert!(!table.cells.is_empty(), "셀이 있어야 한다");
+        for cell in &table.cells {
+            let para = &cell.paragraphs[0];
+            assert_eq!(
+                para.para_shape_id, 12,
+                "셀 ({},{}) para_shape_id",
+                cell.row, cell.col
+            );
+            assert_eq!(
+                para.char_shapes.first().map(|cs| cs.char_shape_id),
+                Some(7),
+                "셀 ({},{}) char_shapes — 비면 charPrIDRef=0",
+                cell.row,
+                cell.col
+            );
+        }
+    }
+
+    #[test]
+    fn create_table_native_cells_inherit_char_shape() {
+        let mut core = core_with_shaped_paragraph();
+        core.create_table_native(0, 0, 0, 2, 3).unwrap();
+        assert_cells_inherit_shape(table_of(&core));
+    }
+
+    #[test]
+    fn create_table_ex_native_cells_inherit_char_shape() {
+        let mut core = core_with_shaped_paragraph();
+        core.create_table_ex_native(0, 0, 0, 2, 3, false, None, None)
+            .unwrap();
+        assert_cells_inherit_shape(table_of(&core));
+    }
+
+    /// 혼합 글자모양 문단: 텍스트 20자, 글자 인덱스 0~9 는 34, 10~ 는 37.
+    /// 커서 offset 10 의 글자모양(37)은 첫 엔트리(34)와 다르다 — 첫 엔트리를
+    /// 상속 기준으로 쓰는 회귀를 잡는다.
+    fn core_with_mixed_shape_paragraph() -> DocumentCore {
+        let mut core = DocumentCore::new_empty();
+        core.create_blank_document_native().unwrap();
+        core.insert_text_native(0, 0, 0, "0123456789abcdefghij")
+            .unwrap();
+        let para = &mut core.document.sections[0].paragraphs[0];
+        para.para_shape_id = 12;
+        // 컨트롤(SectionDef 등)이 UTF-16 앞자리를 차지하므로 경계는 char_offsets 로 계산.
+        let boundary = para.char_offsets[10];
+        para.char_shapes = vec![
+            CharShapeRef {
+                start_pos: 0,
+                char_shape_id: 34,
+            },
+            CharShapeRef {
+                start_pos: boundary,
+                char_shape_id: 37,
+            },
+        ];
+        core
+    }
+
+    fn assert_cells_inherit_cursor_shape(table: &Table) {
+        assert!(!table.cells.is_empty(), "셀이 있어야 한다");
+        for cell in &table.cells {
+            let para = &cell.paragraphs[0];
+            assert_eq!(
+                para.char_shapes.first().map(|cs| cs.char_shape_id),
+                Some(37),
+                "셀 ({},{}) — 커서 offset 의 글자모양(37)이 아니라 첫 엔트리(34)를 상속",
+                cell.row,
+                cell.col
+            );
+        }
+    }
+
+    #[test]
+    fn create_table_native_inherits_char_shape_at_cursor_offset() {
+        let mut core = core_with_mixed_shape_paragraph();
+        core.create_table_native(0, 0, 10, 2, 2).unwrap();
+        assert_cells_inherit_cursor_shape(table_of(&core));
+    }
+
+    #[test]
+    fn create_table_ex_native_inherits_char_shape_at_cursor_offset() {
+        let mut core = core_with_mixed_shape_paragraph();
+        core.create_table_ex_native(0, 0, 10, 2, 2, false, None, None)
+            .unwrap();
+        assert_cells_inherit_cursor_shape(table_of(&core));
+    }
+
+    /// treat_as_char=true 인라인 경로는 create_table_native 로 위임하지 않는
+    /// 별도 구현이므로 따로 검증한다.
+    #[test]
+    fn create_table_ex_native_tac_inherits_char_shape_at_cursor_offset() {
+        let mut core = core_with_mixed_shape_paragraph();
+        core.create_table_ex_native(0, 0, 10, 2, 2, true, None, None)
+            .unwrap();
+        assert_cells_inherit_cursor_shape(table_of(&core));
     }
 }

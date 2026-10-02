@@ -78,7 +78,6 @@ fn outline_level(text: &str) -> u8 {
     }
 }
 
-
 /// 쪽 내지(본문이 놓이는) 높이. 셀이 이만큼 크면 그 셀 경계가 곧 쪽 경계다.
 fn page_body_height(sec: &crate::model::document::Section) -> i64 {
     let pd = &sec.section_def.page_def;
@@ -111,16 +110,11 @@ impl DocumentCore {
 
             for (pi, para) in sec.paragraphs.iter().enumerate() {
                 for (ci, ctrl) in para.controls.iter().enumerate() {
-                    let Control::Table(outer) = ctrl else { continue };
+                    let Control::Table(outer) = ctrl else {
+                        continue;
+                    };
                     let loc = format!("sec{} para{} ctrl{}", si, pi, ci);
-                    Self::lint_table_common(
-                        outer,
-                        &loc,
-                        false,
-                        &mut findings,
-                        &mut iids,
-                        bf_count,
-                    );
+                    Self::lint_table_common(outer, &loc, false, &mut findings, &mut iids, bf_count);
 
                     for (cell_i, cell) in outer.cells.iter().enumerate() {
                         let cloc = format!("{} cell{}(r{}c{})", loc, cell_i, cell.row, cell.col);
@@ -191,7 +185,8 @@ impl DocumentCore {
                                 }
                             }
                         }
-                        content += cell.padding.top.max(0) as i64 + cell.padding.bottom.max(0) as i64;
+                        content +=
+                            cell.padding.top.max(0) as i64 + cell.padding.bottom.max(0) as i64;
 
                         if (cell.height as i64) > body_height {
                             findings.push(Finding {
@@ -207,10 +202,8 @@ impl DocumentCore {
 
                         // 세로 가운데/아래 + 남는 공간 → 위 공백으로 보인다 (양식 셀에서 실측)
                         let slack = cell.height as i64 - content;
-                        let is_center_or_bottom = !matches!(
-                            cell.vertical_align,
-                            crate::model::table::VerticalAlign::Top
-                        );
+                        let is_center_or_bottom =
+                            !matches!(cell.vertical_align, crate::model::table::VerticalAlign::Top);
                         if is_center_or_bottom && slack > 3_000 && !cell.paragraphs.is_empty() {
                             findings.push(Finding {
                                 level: "warn",
@@ -413,14 +406,18 @@ impl DocumentCore {
                                 );
                             }
                         }
-                        used += above.padding.top.max(0) as i64 + above.padding.bottom.max(0) as i64;
+                        used +=
+                            above.padding.top.max(0) as i64 + above.padding.bottom.max(0) as i64;
                         let slack = above.height as i64 - used;
                         if slack <= 0 {
                             continue;
                         }
 
-                        let Some((hi, head)) =
-                            below.paragraphs.iter().enumerate().find(|(_, p)| meaningful(p))
+                        let Some((hi, head)) = below
+                            .paragraphs
+                            .iter()
+                            .enumerate()
+                            .find(|(_, p)| meaningful(p))
                         else {
                             continue;
                         };
@@ -513,7 +510,12 @@ impl DocumentCore {
             if bf_id == 0 {
                 return "none".into();
             }
-            match self.document.doc_info.border_fills.get((bf_id - 1) as usize) {
+            match self
+                .document
+                .doc_info
+                .border_fills
+                .get((bf_id - 1) as usize)
+            {
                 Some(bf) => match &bf.fill.solid {
                     Some(sf) if bf.fill.fill_type == FillType::Solid => {
                         color_ref_to_css(sf.background_color).to_lowercase()
@@ -602,7 +604,9 @@ impl DocumentCore {
         for (si, sec) in self.document.sections.iter().enumerate() {
             for (pi, para) in sec.paragraphs.iter().enumerate() {
                 for (ci, ctrl) in para.controls.iter().enumerate() {
-                    let Control::Table(outer) = ctrl else { continue };
+                    let Control::Table(outer) = ctrl else {
+                        continue;
+                    };
                     let loc = format!("sec{} para{} ctrl{}", si, pi, ci);
                     collect(outer, loc.clone(), &mut top);
                     for cell in &outer.cells {
@@ -625,8 +629,7 @@ impl DocumentCore {
         // 우리가 넣은 표(중첩)가 있으면 그것만 본다 — 양식 표는 손댈 수 없다
         let use_nested = !nested.is_empty();
         let styles = if use_nested { nested } else { top };
-        let keep: std::collections::HashSet<&str> =
-            styles.iter().map(|s| s.loc.as_str()).collect();
+        let keep: std::collections::HashSet<&str> = styles.iter().map(|s| s.loc.as_str()).collect();
         for f in shade_warn {
             if keep.contains(f.location.as_str()) {
                 findings.push(f);
@@ -639,7 +642,8 @@ impl DocumentCore {
 
         // 항목별 다수값을 구해 어긋난 표를 짚는다
         let mode = |vals: Vec<String>| -> String {
-            let mut cnt: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            let mut cnt: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
             for v in vals {
                 *cnt.entry(v).or_insert(0) += 1;
             }
@@ -1157,8 +1161,9 @@ impl DocumentCore {
                 level: "warn",
                 code: "nested-table-pagebreak",
                 location: loc.to_string(),
-                message: "셀 안 표가 쪽 경계 나눔 허용 — 간이 뷰어에서 반쯤 잘린다 (나누지 않음 권장)"
-                    .into(),
+                message:
+                    "셀 안 표가 쪽 경계 나눔 허용 — 간이 뷰어에서 반쯤 잘린다 (나누지 않음 권장)"
+                        .into(),
             });
         }
         if iid == 0 {
@@ -1198,7 +1203,10 @@ mod orphan_heading_tests {
     use crate::model::table::{Cell, Table};
 
     fn para(text: &str) -> Paragraph {
-        Paragraph { text: text.to_string(), ..Default::default() }
+        Paragraph {
+            text: text.to_string(),
+            ..Default::default()
+        }
     }
 
     fn cell(row: u16, texts: &[&str]) -> Cell {
@@ -1231,7 +1239,10 @@ mod orphan_heading_tests {
         let mut findings = Vec::new();
         let mut scan = super::LintScan::default();
         d.lint_orphan_heading(&mut findings, &mut scan);
-        assert_eq!(scan.cell_seams, 1, "이음매를 못 찾았으면 검사가 죽은 것이다");
+        assert_eq!(
+            scan.cell_seams, 1,
+            "이음매를 못 찾았으면 검사가 죽은 것이다"
+        );
         findings
             .iter()
             .filter(|f| f.code == "heading-orphaned-at-cell-end")
@@ -1241,42 +1252,72 @@ mod orphan_heading_tests {
 
     #[test]
     fn section_heading_left_alone_is_reported() {
-        let d = doc(&["◦ 앞 내용", "□ 문서 호환성 검증 결과"], &["◦ 사내 실무 문서 표본으로 검증함"]);
+        let d = doc(
+            &["◦ 앞 내용", "□ 문서 호환성 검증 결과"],
+            &["◦ 사내 실무 문서 표본으로 검증함"],
+        );
         let got = orphans(&d);
-        assert_eq!(got.len(), 1, "□ 표제가 칸 끝에 혼자 남았는데 안 잡혔다: {got:?}");
+        assert_eq!(
+            got.len(),
+            1,
+            "□ 표제가 칸 끝에 혼자 남았는데 안 잡혔다: {got:?}"
+        );
         assert!(got[0].contains("문서 호환성"), "{got:?}");
     }
 
     #[test]
     fn item_heading_whose_children_are_overleaf_is_reported() {
-        let d = doc(&["□ 절", "◦ 경쟁 분석"], &["- 코난테크놀로지·솔트룩스", "- 올거나이즈"]);
-        assert_eq!(orphans(&d).len(), 1, "◦ 표제의 - 자식이 다음 쪽인데 안 잡혔다");
+        let d = doc(
+            &["□ 절", "◦ 경쟁 분석"],
+            &["- 코난테크놀로지·솔트룩스", "- 올거나이즈"],
+        );
+        assert_eq!(
+            orphans(&d).len(),
+            1,
+            "◦ 표제의 - 자식이 다음 쪽인데 안 잡혔다"
+        );
     }
 
     #[test]
     fn heading_with_its_content_in_the_same_cell_is_silent() {
-        let d = doc(&["□ 절", "◦ 내용이 같은 칸에 있음"], &["□ 다음 절", "◦ 그 내용"]);
+        let d = doc(
+            &["□ 절", "◦ 내용이 같은 칸에 있음"],
+            &["□ 다음 절", "◦ 그 내용"],
+        );
         assert!(orphans(&d).is_empty(), "정상인데 잡혔다");
     }
 
     #[test]
     fn list_continuing_across_the_page_is_silent() {
         let d = doc(&["◦ 항목", "- 첫째"], &["- 둘째", "- 셋째"]);
-        assert!(orphans(&d).is_empty(), "쪽을 넘어 이어지는 목록은 표제가 아니다");
+        assert!(
+            orphans(&d).is_empty(),
+            "쪽을 넘어 이어지는 목록은 표제가 아니다"
+        );
     }
 
     #[test]
     fn leaf_item_followed_by_a_figure_is_silent() {
         // 실제 오탐 사례: `-` 목록이 끝나고 다음 쪽이 그림으로 시작한다.
-        let d = doc(&["◦ 항목", "- 타깃은 업종명이 아니라 구조임"], &[" ", "[그림] 업무 화면 구성안"]);
-        assert!(orphans(&d).is_empty(), "잎 항목은 표제가 아니다: {:?}", orphans(&d));
+        let d = doc(
+            &["◦ 항목", "- 타깃은 업종명이 아니라 구조임"],
+            &[" ", "[그림] 업무 화면 구성안"],
+        );
+        assert!(
+            orphans(&d).is_empty(),
+            "잎 항목은 표제가 아니다: {:?}",
+            orphans(&d)
+        );
     }
 
     #[test]
     fn a_long_bullet_sentence_followed_by_prose_is_silent() {
         // `◦` 는 짧은 표제일 수도, 완결된 서술일 수도 있다. 자식(`-`)이 없으면
         // 표제로 단정하지 않는다.
-        let d = doc(&["□ 절", "◦ 사내 문서 표본으로 형식별 처리 능력을 검증함"], &["앞에서 본 것처럼 결과는 다음과 같습니다."]);
+        let d = doc(
+            &["□ 절", "◦ 사내 문서 표본으로 형식별 처리 능력을 검증함"],
+            &["앞에서 본 것처럼 결과는 다음과 같습니다."],
+        );
         assert!(orphans(&d).is_empty(), "자식 없는 ◦ 를 표제로 단정했다");
     }
 }
@@ -1361,11 +1402,22 @@ mod pushed_paragraph_tests {
     fn a_leaf_item_that_fits_in_the_room_above_is_reported() {
         // 앞 칸은 쪽만큼 크고 두 줄만 썼다 — 뒤 칸 첫 줄이 넉넉히 들어간다.
         let d = doc(
-            cell(0, PAGE, &["◦ 시장 진입 전략", "- 협회·파트너 채널로 무료 베타 5곳 확보"]),
+            cell(
+                0,
+                PAGE,
+                &[
+                    "◦ 시장 진입 전략",
+                    "- 협회·파트너 채널로 무료 베타 5곳 확보",
+                ],
+            ),
             cell(1, PAGE, &["- 이후 정부 조달·바우처로 확산", "□ 추진 일정"]),
         );
         let got = pushed(&d);
-        assert_eq!(got.len(), 1, "앞 쪽이 비었는데 밀려간 문단을 못 잡았다: {got:?}");
+        assert_eq!(
+            got.len(),
+            1,
+            "앞 쪽이 비었는데 밀려간 문단을 못 잡았다: {got:?}"
+        );
         assert!(got[0].contains("정부 조달"), "{got:?}");
     }
 
@@ -1374,8 +1426,15 @@ mod pushed_paragraph_tests {
         // 앞 칸이 꽉 찼다 — 끌어올릴 자리가 없다.
         let texts: Vec<String> = (0..36).map(|i| format!("- 줄 {i}")).collect();
         let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
-        let d = doc(cell(0, PAGE, &refs), cell(1, PAGE, &["- 다음 줄", "□ 다음 절"]));
-        assert!(pushed(&d).is_empty(), "자리가 없는데 올리라고 했다: {:?}", pushed(&d));
+        let d = doc(
+            cell(0, PAGE, &refs),
+            cell(1, PAGE, &["- 다음 줄", "□ 다음 절"]),
+        );
+        assert!(
+            pushed(&d).is_empty(),
+            "자리가 없는데 올리라고 했다: {:?}",
+            pushed(&d)
+        );
     }
 
     #[test]
@@ -1383,7 +1442,11 @@ mod pushed_paragraph_tests {
         // ◦+자식 전부가 덩어리로 올라가면 출발 칸이 비어 버린다.
         let d = doc(
             cell(0, PAGE, &["□ 절", "◦ 앞 항목"]),
-            cell(1, PAGE, &["◦ 경쟁 분석", "- 코난테크놀로지", "- 올거나이즈"]),
+            cell(
+                1,
+                PAGE,
+                &["◦ 경쟁 분석", "- 코난테크놀로지", "- 올거나이즈"],
+            ),
         );
         assert!(pushed(&d).is_empty(), "출발 칸을 비우는 이동을 권했다");
     }
@@ -1394,10 +1457,23 @@ mod pushed_paragraph_tests {
         // 단일 문단 판정이던 시절 이 모양의 17줄 구멍을 규칙이 못 봤다.
         let d = doc(
             cell(0, PAGE, &["□ 절", "◦ 앞 항목"]),
-            cell(1, PAGE, &["◦ 경쟁 분석", "- 코난테크놀로지", "- 올거나이즈", "□ 다음 절"]),
+            cell(
+                1,
+                PAGE,
+                &[
+                    "◦ 경쟁 분석",
+                    "- 코난테크놀로지",
+                    "- 올거나이즈",
+                    "□ 다음 절",
+                ],
+            ),
         );
         let got = pushed(&d);
-        assert_eq!(got.len(), 1, "통째로 들어가는 표제 덩어리를 못 봤다: {got:?}");
+        assert_eq!(
+            got.len(),
+            1,
+            "통째로 들어가는 표제 덩어리를 못 봤다: {got:?}"
+        );
         assert!(got[0].contains("3문단"), "{got:?}");
     }
 
@@ -1408,21 +1484,40 @@ mod pushed_paragraph_tests {
         let mut above: Vec<&str> = vec!["□ 절"];
         above.extend(texts.iter().map(|s| s.as_str()));
         let d = doc(
-            cell(0, PAGE, &above),                       // 여유 ~2줄
-            cell(1, PAGE, &["◦ 경쟁 분석", "- 코난테크놀로지", "- 올거나이즈", "□ 다음 절"]),
+            cell(0, PAGE, &above), // 여유 ~2줄
+            cell(
+                1,
+                PAGE,
+                &[
+                    "◦ 경쟁 분석",
+                    "- 코난테크놀로지",
+                    "- 올거나이즈",
+                    "□ 다음 절",
+                ],
+            ),
         );
-        assert!(pushed(&d).is_empty(), "자식이 못 들어가는 표제 덩어리를 올리라고 했다");
+        assert!(
+            pushed(&d).is_empty(),
+            "자식이 못 들어가는 표제 덩어리를 올리라고 했다"
+        );
     }
 
     #[test]
     fn an_object_with_caption_that_fits_is_reported_as_one_unit() {
         // 개체+캡션은 한 몸으로만 움직인다 — 따로 가면 그림·캡션이 쪽으로 갈라진다.
         let mut obj = line(" ", 0);
-        obj.controls.push(Control::Table(Box::new(Table::default())));
+        obj.controls.push(Control::Table(Box::default()));
         let below = Cell {
-            row: 1, col: 0, col_span: 3, row_span: 1, height: PAGE,
-            paragraphs: vec![obj, line("[그림] 목표 시장 규모", 1860),
-                             line("◦ 확인 방법", 3720)],
+            row: 1,
+            col: 0,
+            col_span: 3,
+            row_span: 1,
+            height: PAGE,
+            paragraphs: vec![
+                obj,
+                line("[그림] 목표 시장 규모", 1860),
+                line("◦ 확인 방법", 3720),
+            ],
             border_fill_id: 1,
             ..Default::default()
         };
@@ -1436,14 +1531,19 @@ mod pushed_paragraph_tests {
     fn a_label_row_that_does_not_break_the_page_is_silent() {
         // 표지의 멘토기관/이름 같은 라벨 행 — 위아래로 이어져도 쪽을 안 가른다.
         let d = doc(cell(0, 2_331, &["멘토기관"]), cell(1, 2_331, &["이름"]));
-        assert!(pushed(&d).is_empty(), "쪽을 가르지 않는 이음매에 대고 말했다");
+        assert!(
+            pushed(&d).is_empty(),
+            "쪽을 가르지 않는 이음매에 대고 말했다"
+        );
     }
 
     #[test]
     fn a_bare_object_paragraph_is_movable_on_its_own() {
         // 캡션 없는 개체 문단은 홑덩어리로 움직여도 갈라질 짝이 없다.
         let mut below = cell(1, PAGE, &["", "□ 다음 절"]);
-        below.paragraphs[0].controls.push(Control::Table(Box::new(Table::default())));
+        below.paragraphs[0]
+            .controls
+            .push(Control::Table(Box::default()));
         let d = doc(cell(0, PAGE, &["◦ 앞 항목"]), below);
         assert_eq!(pushed(&d).len(), 1, "캡션 없는 개체 문단을 못 봤다");
     }

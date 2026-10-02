@@ -2302,10 +2302,8 @@ impl Paginator {
                 caption_extra_for_current,
             );
         } else if is_tac_table
-            && (matches!(
-                table.page_break,
-                crate::model::table::TablePageBreak::None
-            ) || effective_height + host_spacing <= base_available_height + 0.5
+            && (matches!(table.page_break, crate::model::table::TablePageBreak::None)
+                || effective_height + host_spacing <= base_available_height + 0.5
                 || measured_table.is_none())
         {
             // 글자처럼 취급 표: 빈 페이지에 들어가는 크기(또는 나눔 금지 설정)면

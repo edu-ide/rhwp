@@ -2429,7 +2429,11 @@ mod tests {
             arrow_advance
         );
         for c in ['\u{2190}', '\u{2191}', '\u{2193}', '\u{21D2}', '\u{2194}'] {
-            assert!(is_fullwidth_symbol(c), "U+{:04X} should be fullwidth", c as u32);
+            assert!(
+                is_fullwidth_symbol(c),
+                "U+{:04X} should be fullwidth",
+                c as u32
+            );
         }
         // 수학 기호는 전각이 아니다 (∀ 실측 0.696 em) — 과확장 방지.
         assert!(!is_fullwidth_symbol('\u{2200}'));

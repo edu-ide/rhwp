@@ -15,7 +15,7 @@ use crate::model::paragraph::{LineSeg, ParaMeta, Paragraph};
 use crate::model::shape::{common_obj_offsets, ShapeObject, TextWrap, VertRelTo};
 use crate::model::style::Alignment;
 use crate::renderer::composer::{
-    compose_paragraph, ComposedParagraph, layout_picture_band, reflow_line_segs, ParagraphBox,
+    compose_paragraph, layout_picture_band, reflow_line_segs, ComposedParagraph, ParagraphBox,
 };
 use crate::renderer::page_layout::PageLayoutInfo;
 use crate::renderer::pagination::PageItem;
@@ -1280,6 +1280,27 @@ impl DocumentCore {
         delete_count: usize,
         text: &str,
     ) -> Result<String, HwpError> {
+        if delete_count > 8
+            || text.chars().count() > 8
+            || text.chars().any(|ch| matches!(ch, '\r' | '\n' | '\t'))
+        {
+            return Err(HwpError::RenderError(
+                "local 본문 편집은 줄바꿈·탭 없는 최대 8자만 지원합니다".to_string(),
+            ));
+        }
+        self.replace_body_text_native(section_idx, para_idx, char_offset, delete_count, text)
+    }
+
+    /// Replace a body text range atomically, preserving formatting outside it
+    /// and reflowing only after both deletion and insertion have been applied.
+    pub fn replace_body_text_native(
+        &mut self,
+        section_idx: usize,
+        para_idx: usize,
+        char_offset: usize,
+        delete_count: usize,
+        text: &str,
+    ) -> Result<String, HwpError> {
         if section_idx >= self.document.sections.len() {
             return Err(HwpError::RenderError(format!(
                 "구역 인덱스 {} 범위 초과 (총 {}개)",
@@ -1296,14 +1317,12 @@ impl DocumentCore {
             )));
         }
         let new_chars_count = text.chars().count();
-        if delete_count > 8
-            || new_chars_count > 8
-            || text.chars().any(|ch| matches!(ch, '\r' | '\n' | '\t'))
-        {
-            return Err(HwpError::RenderError(
-                "local 본문 편집은 줄바꿈·탭 없는 최대 8자만 지원합니다".to_string(),
-            ));
-        }
+        // Equal stream-width replacement keeps every existing style boundary,
+        // including a run beginning at the first replaced character. Separate
+        // delete/insert operations would move that boundary to the right.
+        let original_para = &self.document.sections[section_idx].paragraphs[para_idx];
+        let original_char_count = original_para.char_count;
+        let preserved_char_shapes = (delete_count > 0).then(|| original_para.char_shapes.clone());
 
         let flow_before = body_paragraph_flow_signature(
             &self.document.sections[section_idx].paragraphs[para_idx],
@@ -1350,6 +1369,14 @@ impl DocumentCore {
             keep_inactive_field_end_outside(para, &outside_insertions, new_chars_count);
             if has_clickhere_field_range(para) {
                 rebuild_char_offsets(para);
+            }
+        }
+
+        if let Some(char_shapes) = preserved_char_shapes {
+            let paragraph = &mut self.document.sections[section_idx].paragraphs[para_idx];
+            // Tabs occupy eight HWP stream units, unlike their UTF-16 string width.
+            if paragraph.char_count == original_char_count {
+                paragraph.char_shapes = char_shapes;
             }
         }
 
@@ -1822,6 +1849,43 @@ impl DocumentCore {
         )
     }
 
+    /// 표 셀 내부 텍스트를 원자적으로 교체하고 페이지네이션한다.
+    pub fn replace_text_in_cell_native(
+        &mut self,
+        section_idx: usize,
+        parent_para_idx: usize,
+        control_idx: usize,
+        cell_idx: usize,
+        cell_para_idx: usize,
+        char_offset: usize,
+        delete_count: usize,
+        text: &str,
+    ) -> Result<String, HwpError> {
+        let text_len = self.get_cell_paragraph_length_native(
+            section_idx,
+            parent_para_idx,
+            control_idx,
+            cell_idx,
+            cell_para_idx,
+        )?;
+        if char_offset > text_len || delete_count > text_len.saturating_sub(char_offset) {
+            return Err(HwpError::RenderError(
+                "셀 replace 범위가 문단 텍스트를 벗어났습니다".to_string(),
+            ));
+        }
+        self.replace_text_in_cell_native_impl(
+            section_idx,
+            parent_para_idx,
+            control_idx,
+            cell_idx,
+            cell_para_idx,
+            char_offset,
+            delete_count,
+            text,
+            true,
+        )
+    }
+
     /// 표 셀 내부 단일 텍스트 삽입 후 전체 페이지네이션을 호출자가 지연한다.
     /// 결과 JSON의 `cellFlowChanged`는 상대 line advance 변화 여부다.
     pub fn insert_text_in_cell_native_deferred_pagination(
@@ -1953,6 +2017,8 @@ impl DocumentCore {
             cell_para_idx,
         )?;
         let old_text_len = cell_para.text.chars().count();
+        let original_char_count = cell_para.char_count;
+        let original_shapes = (delete_count > 0).then(|| cell_para.char_shapes.clone());
         let flow_advance_before = relative_paragraph_flow_advance(cell_para);
         let local_contribution_before =
             crate::renderer::layout::LayoutEngine::paragraph_contributes_to_table_nested_text_flag(
@@ -1987,6 +2053,11 @@ impl DocumentCore {
             keep_inactive_field_end_outside(cell_para, &outside_insertions, new_chars_count);
             if has_clickhere_field_range(cell_para) {
                 rebuild_char_offsets(cell_para);
+            }
+        }
+        if cell_para.char_count == original_char_count {
+            if let Some(shapes) = original_shapes {
+                cell_para.char_shapes = shapes;
             }
         }
         debug_assert_eq!(deleted_count, delete_count);
@@ -3092,8 +3163,7 @@ impl DocumentCore {
             let Some(Control::Table(table)) = para.controls.get_mut(control_idx) else {
                 return;
             };
-            let line_height_extra =
-                (existing_line_height - table.common.height as i32).max(0);
+            let line_height_extra = (existing_line_height - table.common.height as i32).max(0);
             let required: i64 = {
                 let Some(cell) = table.cells.get_mut(cell_idx) else {
                     return;
@@ -3117,8 +3187,7 @@ impl DocumentCore {
                         .unwrap_or(0);
                     for seg in &mut cell_para.line_segs {
                         let rel = seg.vertical_pos as i64 - base;
-                        seg.vertical_pos =
-                            (running + rel).clamp(0, i32::MAX as i64) as i32;
+                        seg.vertical_pos = (running + rel).clamp(0, i32::MAX as i64) as i32;
                     }
                     if let Some(last) = cell_para.line_segs.last() {
                         running = last.vertical_pos as i64
@@ -3127,9 +3196,7 @@ impl DocumentCore {
                     }
                     running += space_after.max(0);
                 }
-                running
-                    + cell.padding.top.max(0) as i64
-                    + cell.padding.bottom.max(0) as i64
+                running + cell.padding.top.max(0) as i64 + cell.padding.bottom.max(0) as i64
             };
             if required > 0 {
                 if let Some(cell) = table.cells.get_mut(cell_idx) {
@@ -6865,7 +6932,8 @@ impl DocumentCore {
         if path.is_empty() {
             return Err(HwpError::RenderError("경로가 비어있습니다".to_string()));
         }
-        let count = self.resolve_container_para_count_by_path(section_idx, parent_para_idx, path)?;
+        let count =
+            self.resolve_container_para_count_by_path(section_idx, parent_para_idx, path)?;
         let mut items = Vec::with_capacity(count);
         let mut probe = path.to_vec();
         for idx in 0..count {

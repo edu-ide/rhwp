@@ -498,7 +498,10 @@ fn serialize_hwp_verified_for_cli(
         .serialize_hwp_with_verify()
         .map_err(|e| format!("HWP 직렬화/재로드 검증 실패: {}", e))?;
     if !verification.recovered
-        && page_verify_should_block(verification.page_count_before, verification.page_count_after)
+        && page_verify_should_block(
+            verification.page_count_before,
+            verification.page_count_after,
+        )
     {
         return Err(format!(
             "HWP 재로드 검증 실패: page_count_before={}, page_count_after={}",
@@ -2470,6 +2473,24 @@ fn extract_hwp_structure_json_for_cli(data: &[u8]) -> Result<serde_json::Value, 
     }))
 }
 
+fn minimal_paragraph_text_replacement(old_text: &str, text: &str) -> (usize, usize, String) {
+    let old_chars: Vec<char> = old_text.chars().collect();
+    let new_chars: Vec<char> = text.chars().collect();
+    let prefix = old_chars
+        .iter()
+        .zip(&new_chars)
+        .take_while(|(old, new)| old == new)
+        .count();
+    let suffix = old_chars[prefix..]
+        .iter()
+        .rev()
+        .zip(new_chars[prefix..].iter().rev())
+        .take_while(|(old, new)| old == new)
+        .count();
+    let replacement = new_chars[prefix..new_chars.len() - suffix].iter().collect();
+    (prefix, old_chars.len() - prefix - suffix, replacement)
+}
+
 fn set_hwp_paragraph_text_bytes_for_cli(
     data: &[u8],
     section_idx: usize,
@@ -2478,26 +2499,37 @@ fn set_hwp_paragraph_text_bytes_for_cli(
 ) -> Result<HwpEditCliResult, String> {
     let mut core = rhwp::document_core::DocumentCore::from_bytes(data)
         .map_err(|e| format!("HWP 파싱 실패: {}", e))?;
+    let old_text = core
+        .document()
+        .sections
+        .get(section_idx)
+        .and_then(|section| section.paragraphs.get(para_idx))
+        .ok_or_else(|| "문단 인덱스 범위 초과".to_string())?
+        .text
+        .clone();
+    let details = serde_json::json!({
+        "ok": true,
+        "section": section_idx,
+        "paragraph": para_idx,
+        "text": text,
+    });
+    if old_text == text {
+        return Ok(HwpEditCliResult {
+            bytes: data.to_vec(),
+            details,
+            page_count_before: core.page_count(),
+            page_count_after: core.page_count(),
+        });
+    }
     core.convert_to_editable_native()
         .map_err(|e| format!("편집 가능 변환 실패: {}", e))?;
-    let len = core
-        .get_paragraph_length_native(section_idx, para_idx)
-        .map_err(|e| format!("문단 길이 조회 실패: {}", e))?;
-    if len > 0 {
-        core.delete_text_native(section_idx, para_idx, 0, len)
-            .map_err(|e| format!("문단 텍스트 삭제 실패: {}", e))?;
-    }
-    core.insert_text_native(section_idx, para_idx, 0, text)
-        .map_err(|e| format!("문단 텍스트 삽입 실패: {}", e))?;
+    let (prefix, delete_count, replacement) = minimal_paragraph_text_replacement(&old_text, text);
+    core.replace_body_text_native(section_idx, para_idx, prefix, delete_count, &replacement)
+        .map_err(|e| format!("문단 텍스트 치환 실패: {}", e))?;
     let (bytes, page_count_before, page_count_after) = serialize_hwp_verified_for_cli(&mut core)?;
     Ok(HwpEditCliResult {
         bytes,
-        details: serde_json::json!({
-            "ok": true,
-            "section": section_idx,
-            "paragraph": para_idx,
-            "text": text,
-        }),
+        details,
         page_count_before,
         page_count_after,
     })
@@ -3147,23 +3179,19 @@ fn delete_hwp_table_bytes_for_cli(
     })
 }
 
-fn set_hwp_cell_text_bytes_for_cli(
+fn set_hwp_cell_text_in_core_for_cli(
     data: &[u8],
-    table_para_idx: usize,
-    control_idx: usize,
-    cell_idx: usize,
-    cell_para_idx: usize,
+    mut core: rhwp::document_core::DocumentCore,
+    cell_address: (usize, usize, usize, usize),
     text: &str,
+    details: serde_json::Value,
 ) -> Result<HwpEditCliResult, String> {
-    let mut core = rhwp::document_core::DocumentCore::from_bytes(data)
-        .map_err(|e| format!("HWP 파싱 실패: {}", e))?;
-    core.convert_to_editable_native()
-        .map_err(|e| format!("편집 가능 변환 실패: {}", e))?;
+    let (table_para_idx, control_idx, cell_idx, cell_para_idx) = cell_address;
     let len = core
         .get_cell_paragraph_length_native(0, table_para_idx, control_idx, cell_idx, cell_para_idx)
         .map_err(|e| format!("셀 문단 길이 조회 실패: {}", e))?;
-    if len > 0 {
-        core.delete_text_in_cell_native(
+    let old_text = core
+        .get_text_in_cell_native(
             0,
             table_para_idx,
             control_idx,
@@ -3172,22 +3200,54 @@ fn set_hwp_cell_text_bytes_for_cli(
             0,
             len,
         )
-        .map_err(|e| format!("셀 텍스트 삭제 실패: {}", e))?;
+        .map_err(|e| format!("셀 텍스트 조회 실패: {}", e))?;
+    if old_text == text {
+        return Ok(HwpEditCliResult {
+            bytes: data.to_vec(),
+            details,
+            page_count_before: core.page_count(),
+            page_count_after: core.page_count(),
+        });
     }
-    core.insert_text_in_cell_native(
+    core.convert_to_editable_native()
+        .map_err(|e| format!("편집 가능 변환 실패: {}", e))?;
+    let (prefix, delete_count, replacement) = minimal_paragraph_text_replacement(&old_text, text);
+    core.replace_text_in_cell_native(
         0,
         table_para_idx,
         control_idx,
         cell_idx,
         cell_para_idx,
-        0,
-        text,
+        prefix,
+        delete_count,
+        &replacement,
     )
-    .map_err(|e| format!("셀 텍스트 삽입 실패: {}", e))?;
+    .map_err(|e| format!("셀 텍스트 치환 실패: {}", e))?;
     let (bytes, page_count_before, page_count_after) = serialize_hwp_verified_for_cli(&mut core)?;
     Ok(HwpEditCliResult {
         bytes,
-        details: serde_json::json!({
+        details,
+        page_count_before,
+        page_count_after,
+    })
+}
+
+fn set_hwp_cell_text_bytes_for_cli(
+    data: &[u8],
+    table_para_idx: usize,
+    control_idx: usize,
+    cell_idx: usize,
+    cell_para_idx: usize,
+    text: &str,
+) -> Result<HwpEditCliResult, String> {
+    let core = rhwp::document_core::DocumentCore::from_bytes(data)
+        .map_err(|e| format!("HWP 파싱 실패: {}", e))?;
+    set_hwp_cell_text_in_core_for_cli(
+        data,
+        core,
+        (table_para_idx, control_idx, cell_idx, cell_para_idx),
+        text,
+        serde_json::json!({
             "ok": true,
             "tableParagraph": table_para_idx,
             "control": control_idx,
@@ -3195,9 +3255,7 @@ fn set_hwp_cell_text_bytes_for_cli(
             "cellParagraph": cell_para_idx,
             "text": text,
         }),
-        page_count_before,
-        page_count_after,
-    })
+    )
 }
 
 fn set_hwp_cell_text_by_position_bytes_for_cli(
@@ -3209,42 +3267,17 @@ fn set_hwp_cell_text_by_position_bytes_for_cli(
     cell_para_idx: usize,
     text: &str,
 ) -> Result<HwpEditCliResult, String> {
-    let mut core = rhwp::document_core::DocumentCore::from_bytes(data)
+    let core = rhwp::document_core::DocumentCore::from_bytes(data)
         .map_err(|e| format!("HWP 파싱 실패: {}", e))?;
-    core.convert_to_editable_native()
-        .map_err(|e| format!("편집 가능 변환 실패: {}", e))?;
     let cell_idx = core
         .get_table_cell_index_native(0, table_para_idx, control_idx, row, col)
         .map_err(|e| format!("셀 좌표 조회 실패: {}", e))?;
-    let len = core
-        .get_cell_paragraph_length_native(0, table_para_idx, control_idx, cell_idx, cell_para_idx)
-        .map_err(|e| format!("셀 문단 길이 조회 실패: {}", e))?;
-    if len > 0 {
-        core.delete_text_in_cell_native(
-            0,
-            table_para_idx,
-            control_idx,
-            cell_idx,
-            cell_para_idx,
-            0,
-            len,
-        )
-        .map_err(|e| format!("셀 텍스트 삭제 실패: {}", e))?;
-    }
-    core.insert_text_in_cell_native(
-        0,
-        table_para_idx,
-        control_idx,
-        cell_idx,
-        cell_para_idx,
-        0,
+    set_hwp_cell_text_in_core_for_cli(
+        data,
+        core,
+        (table_para_idx, control_idx, cell_idx, cell_para_idx),
         text,
-    )
-    .map_err(|e| format!("셀 텍스트 삽입 실패: {}", e))?;
-    let (bytes, page_count_before, page_count_after) = serialize_hwp_verified_for_cli(&mut core)?;
-    Ok(HwpEditCliResult {
-        bytes,
-        details: serde_json::json!({
+        serde_json::json!({
             "ok": true,
             "tableParagraph": table_para_idx,
             "control": control_idx,
@@ -3254,9 +3287,7 @@ fn set_hwp_cell_text_by_position_bytes_for_cli(
             "cellParagraph": cell_para_idx,
             "text": text,
         }),
-        page_count_before,
-        page_count_after,
-    })
+    )
 }
 
 fn add_cell_text_edit_details(
@@ -4111,8 +4142,13 @@ fn set_hwp_table_column_widths_bytes_for_cli(
     widths: Vec<u32>,
 ) -> Result<HwpEditCliResult, String> {
     edit_hwp_table_structure_bytes_for_cli(data, "set-table-column-widths", |core| {
-        core.set_table_column_widths_native(section_idx, table_para_idx, control_idx, widths.clone())
-            .map_err(|e| format!("표 열 폭 설정 실패: {}", e))
+        core.set_table_column_widths_native(
+            section_idx,
+            table_para_idx,
+            control_idx,
+            widths.clone(),
+        )
+        .map_err(|e| format!("표 열 폭 설정 실패: {}", e))
     })
 }
 
@@ -10732,8 +10768,16 @@ fn cell_paragraph_cli(args: &[String], merge: bool) {
     }
 
     let para = parse_usize_cli(para, "--para");
-    let ctrl = if cell_path.is_some() { 0 } else { parse_usize_cli(ctrl, "--ctrl") };
-    let cell_para = if cell_path.is_some() { 0 } else { parse_usize_cli(cell_para, "--cell-para") };
+    let ctrl = if cell_path.is_some() {
+        0
+    } else {
+        parse_usize_cli(ctrl, "--ctrl")
+    };
+    let cell_para = if cell_path.is_some() {
+        0
+    } else {
+        parse_usize_cli(cell_para, "--cell-para")
+    };
     let output = output_path.unwrap_or_else(|| input.clone());
     let data = fs::read(&input)
         .unwrap_or_else(|e| exit_cli_error(&format!("파일 읽기 실패 - {}: {}", input, e)));
@@ -11883,9 +11927,9 @@ fn set_table_column_widths_cli(args: &[String]) {
         .unwrap_or_else(|| exit_cli_error("--widths 가 필요합니다."))
         .split(',')
         .map(|t| {
-            t.trim()
-                .parse::<u32>()
-                .unwrap_or_else(|_| exit_cli_error("--widths 는 쉼표로 구분한 양의 정수여야 합니다."))
+            t.trim().parse::<u32>().unwrap_or_else(|_| {
+                exit_cli_error("--widths 는 쉼표로 구분한 양의 정수여야 합니다.")
+            })
         })
         .collect();
     if widths.is_empty() {
@@ -12305,7 +12349,9 @@ fn set_format_cli(args: &[String], kind: &str) {
         "cell-char" if cell_path.is_some() => {
             // 중첩 표 셀: 경로가 바깥 표 ctrl 부터 담으므로 --ctrl/--cell 과 같이 쓰지 않는다.
             if ctrl.is_some() || cell.is_some() || row.is_some() || col.is_some() {
-                exit_cli_error("--cell-path 는 --ctrl/--cell/--row/--col 과 함께 사용할 수 없습니다.");
+                exit_cli_error(
+                    "--cell-path 는 --ctrl/--cell/--row/--col 과 함께 사용할 수 없습니다.",
+                );
             }
             let start = parse_usize_cli(start, "--start");
             let end = parse_usize_cli(end, "--end");
@@ -15281,7 +15327,6 @@ fn delete_master_page_cli(args: &[String]) {
     print_hwp_edit_cli_result(output, result);
 }
 
-
 // [#5511] 최상위 dispatch 끝 — 소유 모듈 이동과 무관한 characterization 경계다.
 
 /// [#3346] `export-tables --json` 과 `batch export-tables` 가 공유하는 봉투.
@@ -16561,7 +16606,11 @@ mod doc_mcp_hwp_write_cli_tests {
         let data = fs::read("samples/issue_1133.hwp").expect("sample");
         let before_head = nested_notice_color_at(&data, 0);
         let before_tail = nested_notice_color_at(&data, 8);
-        let target = if before_head == 0 { "#FF0000" } else { "#000000" };
+        let target = if before_head == 0 {
+            "#FF0000"
+        } else {
+            "#000000"
+        };
         let result = set_hwp_cell_char_format_by_path_bytes_for_cli(
             &data,
             0,
@@ -16572,9 +16621,19 @@ mod doc_mcp_hwp_write_cli_tests {
             &format!(r#"{{"textColor":"{target}"}}"#),
         )
         .expect("nested char format");
-        assert_ne!(nested_notice_color_at(&result.bytes, 0), before_head, "range recolored");
-        assert_eq!(nested_notice_color_at(&result.bytes, 8), before_tail, "outside the range kept");
-        assert!(set_hwp_cell_char_format_by_path_bytes_for_cli(&data, 0, 29, "[]", 0, 1, "{}").is_err());
+        assert_ne!(
+            nested_notice_color_at(&result.bytes, 0),
+            before_head,
+            "range recolored"
+        );
+        assert_eq!(
+            nested_notice_color_at(&result.bytes, 8),
+            before_tail,
+            "outside the range kept"
+        );
+        assert!(
+            set_hwp_cell_char_format_by_path_bytes_for_cli(&data, 0, 29, "[]", 0, 1, "{}").is_err()
+        );
     }
 
     #[test]

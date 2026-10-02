@@ -3,8 +3,8 @@
 use super::super::helpers::{
     border_line_type_to_u8_val, color_ref_to_css, json_u32, navigate_path_to_table,
 };
-use crate::document_core::{DocumentCore, TableTransposeClipboard};
 use super::text_editing::apply_replacements_to_copied_paragraph;
+use crate::document_core::{DocumentCore, TableTransposeClipboard};
 use crate::error::HwpError;
 use crate::model::control::Control;
 use crate::model::event::DocumentEvent;
@@ -354,11 +354,7 @@ impl DocumentCore {
                     para.char_count -= 8;
                 }
 
-                Self::reflow_paragraph_line_segs_after_control_delete(
-                    para,
-                    &self.styles,
-                    self.dpi,
-                );
+                Self::reflow_paragraph_line_segs_after_control_delete(para, &self.styles, self.dpi);
 
                 section.raw_stream = None;
             }
@@ -3833,10 +3829,7 @@ impl DocumentCore {
             | (0x03 << 24)
             | (1 << 26)
             | (1 << 28);
-        let packed_flags =
-            crate::serializer::control::pack_common_attr_bits(
-                &table.common,
-            );
+        let packed_flags = crate::serializer::control::pack_common_attr_bits(&table.common);
         let merged_flags = (existing_flags & !known_mask) | (packed_flags & known_mask);
         table.common.attr = merged_flags;
         table.raw_ctrl_data[common_obj_offsets::FLAGS].copy_from_slice(&merged_flags.to_le_bytes());
@@ -4567,13 +4560,14 @@ impl DocumentCore {
         {
             let t = self.get_table_mut(section_idx, parent_para_idx, control_idx)?;
             for (i, cell) in t.cells.iter().enumerate() {
-                let target = if cell.row == 0 { head_height } else { body_height };
+                let target = if cell.row == 0 {
+                    head_height
+                } else {
+                    body_height
+                };
                 let delta = target - cell.height as i32;
                 if delta > 0 {
-                    ups.push(format!(
-                        "{{\"cellIdx\":{},\"heightDelta\":{}}}",
-                        i, delta
-                    ));
+                    ups.push(format!("{{\"cellIdx\":{},\"heightDelta\":{}}}", i, delta));
                 }
             }
         }
@@ -4918,8 +4912,7 @@ mod nested_resize_tests {
     const NESTED_PATH: [(usize, usize, usize); 2] = [(0, 0, 4), (0, 0, 0)];
 
     fn load() -> DocumentCore {
-        let bytes =
-            std::fs::read("samples/pic-in-table-01.hwp").expect("read pic-in-table-01.hwp");
+        let bytes = std::fs::read("samples/pic-in-table-01.hwp").expect("read pic-in-table-01.hwp");
         DocumentCore::from_bytes(&bytes).expect("parse pic-in-table-01.hwp")
     }
 
@@ -4936,7 +4929,10 @@ mod nested_resize_tests {
     fn resize_by_path_reaches_a_table_nested_inside_a_form_cell() {
         let mut doc = load();
         let before = nested_widths(&doc);
-        assert!(before.len() >= 3, "내부표 셀이 3개 이상이어야 합니다: {before:?}");
+        assert!(
+            before.len() >= 3,
+            "내부표 셀이 3개 이상이어야 합니다: {before:?}"
+        );
 
         // 열 사이에서 너비를 주고받는다 (합은 보존).
         doc.resize_table_cells_by_path_native(
@@ -5008,13 +5004,8 @@ mod nested_resize_tests {
                 .collect()
         };
         let before = widths(&doc);
-        doc.resize_table_cells_native(
-            0,
-            PARENT_PARA,
-            0,
-            r#"[{"cellIdx":0,"heightDelta":500}]"#,
-        )
-        .expect("최상위 표 크기 조절 실패");
+        doc.resize_table_cells_native(0, PARENT_PARA, 0, r#"[{"cellIdx":0,"heightDelta":500}]"#)
+            .expect("최상위 표 크기 조절 실패");
         assert_eq!(widths(&doc), before, "높이만 바꿨으므로 폭은 그대로");
     }
 }

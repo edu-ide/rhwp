@@ -1581,8 +1581,13 @@ impl DocumentCore {
         use crate::model::paragraph::{CharShapeRef, LineSeg};
         use crate::model::shape::{CommonObjAttr, HorzRelTo, ShapeComponentAttr, VertRelTo};
 
-        let (natural_width_px, natural_height_px) =
-            Self::probe_natural_size(image_data, natural_width_px, natural_height_px, width, height);
+        let (natural_width_px, natural_height_px) = Self::probe_natural_size(
+            image_data,
+            natural_width_px,
+            natural_height_px,
+            width,
+            height,
+        );
 
         // 유효성 검사
         if section_idx >= self.document.sections.len() {
@@ -4444,8 +4449,13 @@ impl DocumentCore {
         use crate::model::image::{CropInfo, ImageAttr, ImageEffect, Picture};
         use crate::model::shape::{CommonObjAttr, HorzRelTo, ShapeComponentAttr, VertRelTo};
 
-        let (natural_width_px, natural_height_px) =
-            Self::probe_natural_size(image_data, natural_width_px, natural_height_px, width, height);
+        let (natural_width_px, natural_height_px) = Self::probe_natural_size(
+            image_data,
+            natural_width_px,
+            natural_height_px,
+            width,
+            height,
+        );
 
         if section_idx >= self.document.sections.len() {
             return Err(HwpError::RenderError(format!(

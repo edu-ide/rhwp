@@ -19206,10 +19206,7 @@ impl TypesetEngine {
                     // 답변 박스처럼 셀 내용이 여러 페이지로 흐르는 케이스).
                     let tac_oversized_splittable = tac_effective
                         && table.row_count > 1
-                        && !matches!(
-                            table.page_break,
-                            crate::model::table::TablePageBreak::None
-                        )
+                        && !matches!(table.page_break, crate::model::table::TablePageBreak::None)
                         && table_measured_h > st.base_available_height();
                     if tac_effective && !tac_oversized_splittable {
                         self.typeset_tac_table(
@@ -19226,19 +19223,21 @@ impl TypesetEngine {
                             styles,
                             preceding_stored_vpos(paragraphs_all, para_idx),
                         );
-                    } else if !tac_effective && self.try_typeset_empty_para_float_table(
-                        st,
-                        para_idx,
-                        ctrl_idx,
-                        para,
-                        table,
-                        &ft,
-                        composed,
-                        next_para,
-                        styles,
-                        para_start_height,
-                        &mut para_float_lanes,
-                    ) {
+                    } else if !tac_effective
+                        && self.try_typeset_empty_para_float_table(
+                            st,
+                            para_idx,
+                            ctrl_idx,
+                            para,
+                            table,
+                            &ft,
+                            composed,
+                            next_para,
+                            styles,
+                            para_start_height,
+                            &mut para_float_lanes,
+                        )
+                    {
                         // Empty host para-float table placed by horizontal lane reservation.
                     } else {
                         let pages_before_block_table = st.pages.len();

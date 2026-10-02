@@ -3935,9 +3935,15 @@ pub(crate) fn recalculate_section_vpos(
     // 직전 문단이 이번 편집의 변조 대상이었는가 + 직전 문단에 적용된 delta.
     let mut prev_modified = false;
     let mut prev_delta: i32 = 0;
+    // A paragraph without LineSegs can still occupy space (for example, a table).
+    // Its stored gap cannot be reconstructed from the two text paragraphs' styles.
+    let mut crossed_empty_paragraph = prev_idx.is_some_and(|pp| pp + 1 < start_para);
 
     for pi in start_para..paragraphs.len() {
         if paragraphs[pi].line_segs.is_empty() {
+            if pi != start_para && !is_ignored(pi) {
+                crossed_empty_paragraph = true;
+            }
             continue;
         }
 
@@ -3967,6 +3973,17 @@ pub(crate) fn recalculate_section_vpos(
         let delta = if is_reset {
             // 단/쪽 리셋 경계 — 저장 좌표 유지.
             0
+        } else if crossed_empty_paragraph && !is_ignored(pi) {
+            // Preserve the intervening paragraph's stored occupancy. Only carry
+            // the preceding text paragraph's actual flow-end change across it.
+            let stored_end = if prev_idx == Some(start_para) && !is_ignored(start_para) {
+                start_stored_end.or(orig_prev_end)
+            } else {
+                orig_prev_end
+            };
+            stored_end
+                .map(|end| next_vpos.saturating_sub(end))
+                .unwrap_or(prev_delta)
         } else if para_modified || prev_modified {
             // 변조 인접 경계 — 이동 후 흐름에 스타일 여백 gap 으로 다시 잇는다.
             let gap = prev_idx
@@ -3998,6 +4015,7 @@ pub(crate) fn recalculate_section_vpos(
         prev_modified = para_modified;
         prev_delta = delta;
         prev_idx = Some(pi);
+        crossed_empty_paragraph = false;
     }
 }
 
