@@ -256,6 +256,7 @@ fn command_def() -> Value {
             "name": prim("string", "명령 이름. `rhwp <name>` 으로 호출한다."),
             "category": r("CommandCategory"),
             "summary": prim("string", "한 줄 요약 (사람·에이전트 공용)"),
+            "usage": prim("string", "명령 호출 형식. Office 명령 catalog에서 제공한다."),
             "json": prim("boolean", "`--json` 기계 계약을 가지면 true. 없으면 키 자체가 없다."),
             "batch": prim("boolean", "`batch` 축으로도 돌릴 수 있으면 true."),
             "flags": array_of(prim("string", "플래그 이름"), "이 명령이 받는 플래그. json 명령에만 붙는다."),

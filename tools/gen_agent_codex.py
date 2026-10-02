@@ -146,7 +146,7 @@ FAMILIES = [
      ["convert", "export-hwpx", "export-hml", "export-markdown", "export-doclang", "export-pdf", "export-svg", "thumbnail", "render-diff", "build-from-ingest", "scaffold", "split-document",
       "export-png-gpu", "gpu-info"]),
     ("50_검증_사다리", "검증 사다리 — 판정은 데이터다",
-     ["verify", "ir-diff", "replay", "audit", "lineage", "hwpx-roundtrip",
+     ["verify", "ir-diff", "replay", "audit", "lineage", "hwpx-roundtrip", "lint",
       "layout-anomaly",
       "keygen", "verify-signature", "harness",
       "harness init", "harness wrap", "harness-status", "anchor", "gate", "bundle", "disclose", "settle",
@@ -333,7 +333,8 @@ def main():
     commands = {c["name"]: c for c in caps["commands"]}
     prov = provenance_map()
     help_all = help_lines()
-    hl = {}
+    hl = {name: cmd["usage"].removeprefix("rhwp ")
+          for name, cmd in commands.items() if "usage" in cmd}
     for line in help_all:
         stripped = line.strip()
         for name in commands:
@@ -344,6 +345,12 @@ def main():
     changed = []
     for fname, title, members in FAMILIES:
         chapters = []
+        # Office catalog의 명령은 기존 조회·편집·변환 장에 분류한다.
+        office_category = {"10_조회": "query", "30_편집과_계획": "edit",
+                           "40_변환과_렌더": "export"}.get(fname)
+        if office_category:
+            members = members + [name for name, cmd in commands.items()
+                                 if "usage" in cmd and cmd["category"] == office_category]
         for m in members:
             if m in commands and m not in assigned:
                 chapters.append(command_chapter(commands[m], prov, hl))

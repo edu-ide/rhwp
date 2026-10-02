@@ -3,7 +3,6 @@
 mod diagnostics;
 mod edit;
 mod metadata;
-mod office;
 mod protocol;
 mod public;
 mod sink;
@@ -32,9 +31,6 @@ pub(crate) fn print_help() {
         println!("  {:<28} {}", command.command, command.summary);
     }
     println!();
-    println!("Office MCP 확장 명령:");
-    office::print();
-    println!();
     println!("계층형 명령:");
     println!("  rhwp edit --help            편집 하위 명령의 이름순 index");
     println!("  rhwp inspect --help         검사 하위 명령의 이름순 index");
@@ -50,6 +46,15 @@ pub(crate) fn print_help() {
 /// 명령의 존재·그룹·사용법·옵션·예시는 `metadata::HelpSpec`이 정본이다. 이 캡처는
 /// 표·입출력 제약처럼 아직 서술형으로 유지한 세부 설명을 그 정본 아래에 붙일 뿐이다.
 fn legacy_detail_lines(head: &str, sub: Option<&str>) -> Vec<String> {
+    if sub.is_none() {
+        if let Some(entry) = crate::cli::catalog::office_command(head) {
+            return entry
+                .details
+                .iter()
+                .map(|line| format!("  {line}"))
+                .collect();
+        }
+    }
     sink::collect(head, sub, || {
         public::print();
         edit::print();
@@ -125,19 +130,7 @@ pub(crate) fn scoped_help(rest: &[String]) -> Option<i32> {
         .get(1)
         .map(String::as_str)
         .filter(|s| !s.starts_with('-') && metadata::is_declared_subcommand(head, s));
-    let spec = match metadata::command_help(head, sub) {
-        Some(spec) => spec,
-        None => {
-            let lines = sink::collect(head, None, office::print);
-            if lines.is_empty() {
-                return None;
-            }
-            for line in lines {
-                println!("{line}");
-            }
-            return Some(0);
-        }
-    };
+    let spec = metadata::command_help(head, sub)?;
     let mut lines = structured_lines(&spec);
 
     // 그룹 자체의 짧은 index는 구조화된 메타데이터만으로 충분하다. 개별 명령과

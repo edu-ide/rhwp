@@ -1,8 +1,7 @@
 //! [#5511 Stage 1~2] 최상위 dispatch와 자기서술·모듈 소유권의 characterization 계약.
 //!
-//! handler 이동 전에 실제 `main()` 102개 arm과 catalog를 양방향으로 대조한다.
-//! help·capabilities·MCP의 현재 결과도 같은 catalog와 비교하되, 이 단계에서는
-//! 기존 출력 생성기를 바꾸지 않는다.
+//! 실제 `main()` 224개 arm과 catalog를 양방향으로 대조한다.
+//! help·capabilities·MCP의 공개 결과도 같은 catalog와 비교한다.
 #![cfg(not(target_arch = "wasm32"))]
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -107,7 +106,7 @@ fn catalog_is_unique_and_matches_all_top_level_dispatch_arms() {
     let dispatch = dispatch_names();
     let dispatch_set: BTreeSet<&str> = dispatch.iter().copied().collect();
 
-    assert_eq!(commands().len(), 102, "characterization 기준선");
+    assert_eq!(commands().len(), 224, "upstream 102개와 Office 122개");
     assert_eq!(catalog_names.len(), commands().len(), "catalog 이름 중복");
     assert_eq!(dispatch.len(), dispatch_set.len(), "dispatch arm 이름 중복");
     assert_eq!(dispatch_set, catalog_names, "dispatch↔catalog drift");
@@ -156,6 +155,29 @@ fn capabilities_order_and_metadata_match_catalog() {
             "{} feature 계약",
             declared.name
         );
+    }
+}
+
+#[test]
+fn office_commands_preserve_usage_options_and_real_protocol_participation() {
+    let value = json(&["capabilities"]);
+    let live = value["commands"].as_array().expect("commands");
+    assert_eq!(catalog::office_commands().len(), 122);
+    for declared in catalog::office_commands() {
+        let actual = live
+            .iter()
+            .find(|entry| entry["name"] == declared.command.name)
+            .unwrap_or_else(|| panic!("{} capabilities 누락", declared.command.name));
+        assert_eq!(actual["usage"], format!("rhwp {}", declared.usage));
+        assert_eq!(actual["summary"], declared.summary);
+        assert_eq!(actual["flags"], serde_json::json!(declared.flags()));
+        assert_eq!(
+            catalog::find(declared.command.name),
+            Some(&declared.command)
+        );
+        assert!(!actual["json"].as_bool().unwrap_or(false));
+        assert!(!actual["batch"].as_bool().unwrap_or(false));
+        assert!(!declared.command.mcp);
     }
 }
 

@@ -429,6 +429,8 @@ fn main() {
     }
 }
 
+// [#5511] 최상위 dispatch 끝 — 소유 모듈 이동과 무관한 characterization 경계다.
+
 struct HwpCreateCliResult {
     bytes: Vec<u8>,
     paragraph_count: usize,
@@ -6357,15 +6359,16 @@ fn set_hwp_cell_shape_text_bytes_for_cli(
             .get_mut(textbox_para_idx)
             .ok_or_else(|| format!("글상자 문단 {} 범위 초과", textbox_para_idx))?;
         paragraph.text = text.to_string();
-        paragraph.char_count = text.encode_utf16().count() as u32;
+        let mut code_units = 0u32;
         paragraph.char_offsets = text
             .chars()
-            .scan(0u32, |offset, ch| {
-                let current = *offset;
-                *offset += if ch == '\t' { 8 } else { ch.len_utf16() as u32 };
-                Some(current)
+            .map(|ch| {
+                let current = code_units;
+                code_units += if ch == '\t' { 8 } else { ch.len_utf16() as u32 };
+                current
             })
             .collect();
+        paragraph.char_count = code_units + 1;
         paragraph.has_para_text = true;
     }
     let (bytes, page_count_before, page_count_after) = serialize_hwp_verified_for_cli(&mut core)?;
@@ -15326,8 +15329,6 @@ fn delete_master_page_cli(args: &[String]) {
     write_hwp_cli_output(&output, &result.bytes).unwrap_or_else(|e| exit_cli_error(&e));
     print_hwp_edit_cli_result(output, result);
 }
-
-// [#5511] 최상위 dispatch 끝 — 소유 모듈 이동과 무관한 characterization 경계다.
 
 /// [#3346] `export-tables --json` 과 `batch export-tables` 가 공유하는 봉투.
 fn tables_json_value(

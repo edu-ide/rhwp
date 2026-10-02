@@ -1753,12 +1753,15 @@ impl LayoutEngine {
 
                 // 표 컨트롤이 없는 문단: 텍스트 먼저, 컨트롤 나중 (기존 동작)
                 // 표 컨트롤이 있는 문단: 문단 앞 간격 적용 → 표 먼저 배치 → 텍스트(엔터 등) 나중
-                if !has_table_ctrl
-                    || composed
-                        .lines
-                        .iter()
-                        .any(|line| line.runs.iter().any(|run| !run.text.trim().is_empty()))
-                {
+                // 앞 조각에만 텍스트가 있고 현재 조각은 빈 TAC host인 경우,
+                // 저장된 표 포함 줄 높이를 텍스트 높이로 다시 소비하지 않는다.
+                let has_visible_text = composed
+                    .lines
+                    .iter()
+                    .skip(start_line)
+                    .take(end_line.saturating_sub(start_line))
+                    .any(|line| line.runs.iter().any(|run| !run.text.trim().is_empty()));
+                if !has_table_ctrl || has_visible_text {
                     let is_last_para = cp_idx == last_rendered_para_idx;
                     let numbered_comp = if start_line == 0 {
                         self.apply_paragraph_numbering(
@@ -1806,10 +1809,6 @@ impl LayoutEngine {
                     );
                     self.keep_continuation_column_top_spacing_before.set(false);
 
-                    let has_visible_text = composed
-                        .lines
-                        .iter()
-                        .any(|line| line.runs.iter().any(|run| !run.text.trim().is_empty()));
                     if has_visible_text {
                         has_preceding_text = true;
                     }
@@ -2544,10 +2543,46 @@ impl LayoutEngine {
                                 // calc_nested_split_rows 로 행 범위를 필터한다.
                                 {
                                     // 중첩 표가 셀 가용 공간을 초과하면 행 범위 필터 적용
+                                    // 빈 TAC continuation의 저장 줄은 표 외곽 밴드다.
+                                    // 그 높이를 텍스트로 다시 소비하지 않되, vpos가
+                                    // 되감긴 첫 줄의 문단 앞 간격과 줄간격은 보존한다.
+                                    let continuation_leading = if !has_preceding_text
+                                        && !has_visible_text
+                                        && nested_table.common.treat_as_char
+                                        && cut_units.is_some_and(|(su, _)| su > 0)
+                                        && start_line > 0
+                                        && end_line == start_line + 1
+                                    {
+                                        para.line_segs
+                                            .get(start_line)
+                                            .zip(para.line_segs.get(start_line - 1))
+                                            .filter(|(seg, prev)| {
+                                                let stored = seg.tag
+                                                    & crate::model::paragraph::LineSeg::TAG_IMPLEMENTATION_PROPERTY
+                                                    == 0;
+                                                let outer_band = i64::from(nested_table.common.height)
+                                                    + i64::from(nested_table.outer_margin_top)
+                                                    + i64::from(nested_table.outer_margin_bottom);
+                                                stored
+                                                    && seg.vertical_pos < prev.vertical_pos
+                                                    && (i64::from(seg.line_height) - outer_band).abs() <= 8
+                                            })
+                                            .map(|(seg, _)| {
+                                                styles
+                                                    .para_styles
+                                                    .get(para.para_shape_id as usize)
+                                                    .map(|style| style.spacing_before)
+                                                    .unwrap_or(0.0)
+                                                    + hwpunit_to_px(seg.line_spacing.max(0), self.dpi)
+                                            })
+                                            .unwrap_or(0.0)
+                                    } else {
+                                        0.0
+                                    };
                                     let nested_y = if has_preceding_text {
                                         para_y
                                     } else {
-                                        inner_area.y
+                                        inner_area.y + continuation_leading
                                     };
                                     let available_h =
                                         (inner_area.height - (nested_y - inner_area.y)).max(0.0);
@@ -2940,7 +2975,9 @@ impl LayoutEngine {
             // 여러 줄이 통째로 안 보였다) 클립 상자만 콘텐츠에 맞춰 넓힌다.
             // 테두리는 render_rows 좌표로 따로 수집하므로 영향받지 않고,
             // end_cut 이 있는 중간 조각은 다음 쪽 몫을 가려야 하므로 제외한다.
-            if matches!(cell_node.node_type, RenderNodeType::TableCell(ref tc) if tc.clip) {
+            if cut_units.is_none_or(|(_, end_unit)| end_unit == usize::MAX)
+                && matches!(cell_node.node_type, RenderNodeType::TableCell(ref tc) if tc.clip)
+            {
                 fn deepest_bottom(node: &RenderNode, acc: &mut f64) {
                     let bottom = node.bbox.y + node.bbox.height;
                     if bottom > *acc {
@@ -2961,7 +2998,12 @@ impl LayoutEngine {
                 let page_limit = (col_area.y + col_area.height - cell_node.bbox.y).max(0.0);
                 let needed = (content_bottom - cell_node.bbox.y).min(page_limit);
                 if needed > cell_node.bbox.height {
-                    cell_clip_grow = cell_clip_grow.max(needed - cell_node.bbox.height);
+                    // 중간 셀의 clip 확대가 이미 조각 안에 들어오면 표 하단은
+                    // 그대로다. 셀 높이 증가량을 더하면 뒤 행의 공간을 다시
+                    // 소비해 바깥 괘선만 쪽 밖으로 밀린다(#2287).
+                    let fragment_bottom = table_node.bbox.y + table_node.bbox.height;
+                    cell_clip_grow =
+                        cell_clip_grow.max((cell_node.bbox.y + needed - fragment_bottom).max(0.0));
                     cell_node.bbox.height = needed;
                 }
             }
@@ -3806,8 +3848,18 @@ impl LayoutEngine {
             fragment_row_col_x
         };
 
-        // 셀 클립을 넓혔다면 표 하단 경계도 같이 내린다 (테두리와 내용 정합).
-        if cell_clip_grow > 0.0 {
+        // 마지막 long-child 조각의 셀은 중첩 표의 bottom stroke를 보존하려고
+        // paint clip만 늘릴 수 있다. 그 여유는 부모 행의 논리 높이가 아니므로
+        // 바깥 테두리를 내리지 않는다(#3128). 아래 자손 포섭에도 같은 경계를 쓴다.
+        let terminal_long_child_clip_only = is_continuation
+            && end_row >= table.row_count as usize
+            && end_cut.is_empty()
+            && native_terminal_child_host_line_spacing(
+                self.profile.get().hwp5_stored_pagination_layout(),
+                table,
+                self.dpi,
+            ) > 0.5;
+        if cell_clip_grow > 0.0 && !terminal_long_child_clip_only {
             if let Some(last) = grid_row_y.last_mut() {
                 *last += cell_clip_grow;
             }
@@ -3830,14 +3882,27 @@ impl LayoutEngine {
             body_top_clip,
         ));
 
-        // 쪽이 끊긴 자리를 닫는다.
+        // 새로 조판한 표에서 쪽이 끊긴 자리를 닫는다.
         //
         // 셀의 위/아래 테두리는 **행 경계**를 그리는 값이다. 행이 쪽을 걸치면
         // 잘린 자리에는 그릴 테두리가 없어서 상자가 아래로 열린 채 끝나고 다음
         // 쪽이 열린 채 시작한다. 그렇다고 행 테두리를 켜면 쪽 안에 있는 진짜
         // 행 경계에까지 줄이 생긴다. 두 자리는 성격이 다르므로 여기서 따로
         // 그린다 — 조각이 잘렸을 때만, 표 폭 전체로.
-        {
+        // 저장된 HWP/HWPX 조각은 원본 행/셀 경계가 paint frame을 소유한다.
+        // 편집하지 않은 원본에 새 선을 합성하면 한컴에서 열린 nonterminal
+        // 경계를 닫고, 투명 wrapper에도 검은 선을 만든다(42065 p2/p8).
+        // 텍스트 편집으로 reflow한 표와 새 문서의 조각은 이 closure를 유지한다.
+        let preserves_source_cell_frames = (self.profile.get().hwp5_stored_pagination_layout()
+            || self.profile.get().hwpx_stored_layout())
+            && table.cells.iter().any(|cell| {
+                cell.paragraphs.iter().any(|paragraph| {
+                    paragraph.line_segs.iter().any(|seg| {
+                        seg.tag & crate::model::paragraph::LineSeg::TAG_IMPLEMENTATION_PROPERTY == 0
+                    })
+                })
+            });
+        if !preserves_source_cell_frames || table.text_reflowed_after_edit {
             let cut_top = is_continuation && !start_cut.is_empty();
             let cut_bottom = !end_cut.is_empty();
             if cut_top || cut_bottom {
@@ -3912,14 +3977,6 @@ impl LayoutEngine {
         {
             let physical_page_bottom = col_area.y + col_area.height;
             let logical_table_bottom = table_node.bbox.y + table_node.bbox.height;
-            let terminal_long_child_clip_only = is_continuation
-                && end_row >= table.row_count as usize
-                && end_cut.is_empty()
-                && native_terminal_child_host_line_spacing(
-                    self.profile.get().hwp5_stored_pagination_layout(),
-                    table,
-                    self.dpi,
-                ) > 0.5;
             fn descendant_bottom(
                 node: &RenderNode,
                 physical_page_bottom: f64,

@@ -139,6 +139,28 @@ fn table_common_offsets(doc: &HwpDocument, pos: TablePos) -> (i32, i32) {
     )
 }
 
+fn assert_table_width_survives_save(doc: &mut HwpDocument, pos: TablePos, width: u64) {
+    let Control::Table(table) =
+        &doc.document().sections[pos.section].paragraphs[pos.para].controls[pos.control]
+    else {
+        panic!("expected table control");
+    };
+    assert_eq!(table.common.width as u64, width, "렌더링 표 너비 보존");
+
+    let saved = doc.export_hwp().expect("export resized table");
+    let reparsed = parse_document(&saved).expect("parse resized table");
+    let saved_pos = find_first_table(&reparsed);
+    let Control::Table(table) = &reparsed.sections[saved_pos.section].paragraphs[saved_pos.para]
+        .controls[saved_pos.control]
+    else {
+        panic!("expected saved table control");
+    };
+    assert_eq!(
+        table.common.width as u64, width,
+        "셀 조절 후 저장·재파싱에서도 표 너비를 보존해야 함"
+    );
+}
+
 fn table_cell_bbox_value(doc: &HwpDocument, pos: TablePos, cell_idx: u64, key: &str) -> f64 {
     let json = doc
         .get_table_cell_bboxes(
@@ -377,6 +399,7 @@ fn compensated_cell_resize_keeps_cellprotect2_table_common_size() {
         (after_cell22_x - before_cell22_x).abs() <= 0.2,
         "보상 셀 너비 조절은 뒤쪽 셀 x를 밀면 안 됨: before={before_cell22_x}, after={after_cell22_x}"
     );
+    assert_table_width_survives_save(&mut doc, pos, before_width);
 }
 
 #[test]
@@ -628,6 +651,7 @@ fn cell_width_equal_local_hints_keep_selected_row_independent() {
             && (after_stable_w - before_stable_w).abs() <= 0.2,
         "선택 행 밖 셀은 전역 grid 회귀로 흔들리면 안 됨: x {before_stable_x}->{after_stable_x}, w {before_stable_w}->{after_stable_w}"
     );
+    assert_table_width_survives_save(&mut doc, pos, before_width);
 }
 
 #[test]

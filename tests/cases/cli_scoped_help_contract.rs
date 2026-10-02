@@ -191,8 +191,8 @@ fn whole_help_is_a_sorted_command_index() {
     assert_eq!(out.status.code(), Some(0));
     let text = stdout_of(&out);
     assert!(
-        text.lines().count() < 200,
-        "root help가 여전히 상세 매뉴얼이다: {}",
+        text.lines().count() <= declared().len() + 30,
+        "root help는 명령당 한 줄과 30행 이내 안내로 구성해야 한다: {}",
         text.lines().count()
     );
     assert!(
@@ -219,6 +219,16 @@ fn whole_help_is_a_sorted_command_index() {
         .filter(|name| !internal_diagnostics.contains(&name.as_str()))
         .collect();
     expected.sort();
+    for (name, _) in declared() {
+        let marker = format!("  {name:<28}");
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with(&marker))
+                .count(),
+            1,
+            "root index는 {name} 을 정확히 한 줄로 표시해야 한다"
+        );
+    }
     let mut previous = 0usize;
     for name in expected {
         let marker = format!("  {name:<28}");
@@ -358,6 +368,50 @@ fn dump_commands_no_longer_read_help_as_a_file() {
         assert!(
             !String::from_utf8_lossy(&out.stderr).contains("파일을 읽을 수 없습니다"),
             "{cmd} 가 아직 --help 를 파일로 읽는다"
+        );
+    }
+}
+
+#[test]
+fn office_help_preserves_coordinates_and_repair_commands() {
+    for (name, required) in [
+        (
+            "move-table-to-cell",
+            vec!["--src-para", "--dst-cell-para", "--offset"],
+        ),
+        (
+            "move-table-from-cell",
+            vec!["--src-control", "--src-cell-para"],
+        ),
+        (
+            "repair-nested-tables",
+            vec!["[-o <출력.hwp>]", "instance id"],
+        ),
+        ("lint", vec!["rhwp lint <파일.hwp>", "오류·경고"]),
+        (
+            "get-header-footer-para-info",
+            vec!["--kind", "--apply-to", "--hf-para"],
+        ),
+        (
+            "set-cell-text",
+            vec!["--cell-path", "--cell-para", "중첩 표"],
+        ),
+        (
+            "insert-picture",
+            vec!["--inline", "--natural-width", "이미지 헤더"],
+        ),
+    ] {
+        let output = run(&[name, "--help"]);
+        assert_eq!(output.status.code(), Some(0), "{name}");
+        assert!(output.stderr.is_empty(), "{name}");
+        let text = stdout_of(&output);
+        for term in required {
+            assert!(text.contains(term), "{name} 도움말에 {term} 누락:\n{text}");
+        }
+        assert!(text.contains(&format!("명령: {name}")), "{name}");
+        assert!(
+            !text.contains("create-hwp"),
+            "다른 Office 명령이 섞였다: {name}"
         );
     }
 }

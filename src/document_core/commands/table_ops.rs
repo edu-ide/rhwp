@@ -3149,9 +3149,9 @@ impl DocumentCore {
                     .copy_from_slice(&original_width.to_le_bytes());
             }
         }
-        if applied_height_delta == 0
-            || (force_local_resize && updates.iter().any(|u| u.height_delta != 0))
-        {
+        let preserve_height = applied_height_delta == 0
+            || (force_local_resize && updates.iter().any(|u| u.height_delta != 0));
+        if preserve_height {
             table.common.height = original_height;
             if table.raw_ctrl_data.len() >= common_obj_offsets::HEIGHT.end {
                 table.raw_ctrl_data[common_obj_offsets::HEIGHT]
@@ -3198,6 +3198,19 @@ impl DocumentCore {
                     );
                 }
             }
+        }
+
+        if preserve_height && updates.iter().any(|u| u.height_delta != 0) {
+            // Cell text reflow recomputes dimensions. Keep the frame height for an
+            // explicit compensated/local height resize after that recomputation.
+            // Width-only edits still allow content-driven height growth.
+            let table = self.resolve_table_by_path_mut(section_idx, parent_para_idx, path)?;
+            table.common.height = original_height;
+            patch_raw_ctrl_field(
+                &mut table.raw_ctrl_data,
+                common_obj_offsets::HEIGHT,
+                &original_height.to_le_bytes(),
+            );
         }
 
         self.document.sections[section_idx].raw_stream = None;
@@ -3805,16 +3818,17 @@ impl DocumentCore {
             }
         }
 
-        // serialize_table() writes raw_ctrl_data as-is. Keep CommonObjAttr flags in sync
-        // with the parsed common cache while preserving unknown raw bits.
-        while table.raw_ctrl_data.len() < common_obj_offsets::FLAGS.end {
-            table.raw_ctrl_data.push(0);
-        }
-        let existing_flags = u32::from_le_bytes(
-            table.raw_ctrl_data[common_obj_offsets::FLAGS]
-                .try_into()
-                .unwrap(),
-        );
+        // serialize_table() writes populated raw_ctrl_data as-is. Preserve an empty
+        // raw buffer so the serializer synthesizes the complete common attributes.
+        let existing_flags = if table.raw_ctrl_data.len() >= common_obj_offsets::FLAGS.end {
+            u32::from_le_bytes(
+                table.raw_ctrl_data[common_obj_offsets::FLAGS]
+                    .try_into()
+                    .unwrap(),
+            )
+        } else {
+            table.common.attr
+        };
         let known_mask: u32 = 0x01
             | (0x03 << 3)
             | (0x07 << 5)
@@ -3832,7 +3846,11 @@ impl DocumentCore {
         let packed_flags = crate::serializer::control::pack_common_attr_bits(&table.common);
         let merged_flags = (existing_flags & !known_mask) | (packed_flags & known_mask);
         table.common.attr = merged_flags;
-        table.raw_ctrl_data[common_obj_offsets::FLAGS].copy_from_slice(&merged_flags.to_le_bytes());
+        patch_raw_ctrl_field(
+            &mut table.raw_ctrl_data,
+            common_obj_offsets::FLAGS,
+            &merged_flags.to_le_bytes(),
+        );
 
         // 캡션 생성/수정
         let mut caption_created = false;

@@ -3210,6 +3210,10 @@ impl DocumentCore {
             let owner_width = table.common.width;
             table.update_ctrl_dimensions();
             table.common.width = owner_width;
+            if table.raw_ctrl_data.len() >= common_obj_offsets::WIDTH.end {
+                table.raw_ctrl_data[common_obj_offsets::WIDTH]
+                    .copy_from_slice(&owner_width.to_le_bytes());
+            }
             table.dirty = true;
             (
                 table.common.treat_as_char,

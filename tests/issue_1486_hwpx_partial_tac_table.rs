@@ -121,6 +121,120 @@ fn collect_text_run_bboxes(node: &RenderNode, needle: &str, out: &mut Vec<Boundi
 }
 
 #[test]
+fn issue_1486_blank_tac_continuation_does_not_repeat_previous_fragment_text_height() {
+    for sample in ["samples/hwpx_sample2.hwp", SAMPLE] {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(sample);
+        let bytes = fs::read(&path).unwrap_or_else(|e| panic!("read {sample}: {e}"));
+        let doc = rhwp::document_core::DocumentCore::from_bytes(&bytes)
+            .unwrap_or_else(|e| panic!("parse {sample}: {e}"));
+        assert_eq!(doc.page_count(), 29, "{sample}: source PDF page count");
+
+        let rhwp::model::control::Control::Table(wrapper) =
+            &doc.document().sections[0].paragraphs[74].controls[0]
+        else {
+            panic!("{sample}: expected paragraph 74 wrapper table");
+        };
+        let host = &wrapper.cells[0].paragraphs[21];
+        assert_eq!(host.line_segs.len(), 2, "{sample}: mixed TAC host lines");
+        assert_eq!(host.line_segs[1].vertical_pos, 0);
+        assert_eq!(host.line_segs[1].line_height, 12080);
+        assert_eq!(host.line_segs[1].line_spacing, 600);
+        assert_eq!(
+            doc.document().doc_info.para_shapes[host.para_shape_id as usize].spacing_before,
+            600,
+            "{sample}: host paragraph keeps its own leading"
+        );
+        let rhwp::model::control::Control::Table(nested) = &host.controls[0] else {
+            panic!("{sample}: expected TAC table in host paragraph");
+        };
+        assert!(nested.common.treat_as_char);
+        assert_eq!(
+            host.line_segs[1].line_height as u32,
+            nested.common.height
+                + nested.outer_margin_top as u32
+                + nested.outer_margin_bottom as u32,
+            "{sample}: stored continuation line owns the table outer band"
+        );
+        let continuation_start = host.line_seg_text_start(1);
+        let visible_before_cut: String = host
+            .text
+            .chars()
+            .zip(&host.char_offsets)
+            .filter(|(_, offset)| **offset < continuation_start)
+            .map(|(character, _)| character)
+            .collect();
+        let continuation_text: String = host
+            .text
+            .chars()
+            .zip(&host.char_offsets)
+            .filter(|(_, offset)| **offset >= continuation_start)
+            .map(|(character, _)| character)
+            .collect();
+        assert!(
+            visible_before_cut.contains("[청약신청주택]"),
+            "{sample}: text before the TAC continuation: {visible_before_cut:?}"
+        );
+        assert!(
+            continuation_text.trim().is_empty(),
+            "{sample}: blank TAC continuation: {continuation_text:?}"
+        );
+
+        let previous_page = doc.build_page_render_tree(7).expect("render page 8");
+        let continuation_page = doc.build_page_render_tree(8).expect("render page 9");
+        assert!(render_tree_contains_text(
+            &previous_page.root,
+            "[청약신청주택]"
+        ));
+        let mut headers = Vec::new();
+        collect_text_run_bboxes(&continuation_page.root, "조회방법", &mut headers);
+        assert_eq!(headers.len(), 1, "{sample}: continuation table header");
+        let mut tables = Vec::new();
+        collect_issue_1486_tables(&continuation_page.root, &mut tables);
+        assert_eq!(tables.len(), 1, "{sample}: continuation table border");
+        let table_border_y = tables[0]
+            .children
+            .iter()
+            .filter_map(|child| match &child.node_type {
+                RenderNodeType::Line(line)
+                    if child.visible
+                        && line.style.width > 0.0
+                        && (line.y1 - line.y2).abs() <= 0.1
+                        && (line.y1 - tables[0].bbox.y).abs() <= 0.6
+                        && (line.x1 - line.x2).abs() > tables[0].bbox.width / 4.0 =>
+                {
+                    Some(line.y1)
+                }
+                _ => None,
+            })
+            .min_by(f64::total_cmp)
+            .unwrap_or_else(|| panic!("{sample}: missing painted table top border"));
+        // 같은 PDF의 표 위 테두리: top=39.077pt.
+        let pdf_table_y = 39.077 * 96.0 / 72.0;
+        assert!(
+            (table_border_y - pdf_table_y).abs() <= 4.0,
+            "{sample}: TAC continuation leading: border_y={table_border_y}, PDF_y={pdf_table_y}",
+        );
+        // 한컴 HWP/HWPX 2024 및 HWPX 2020 PDF 9쪽: top=43.872pt.
+        let pdf_header_y = 43.872 * 96.0 / 72.0;
+        eprintln!(
+            "[issue_1486 continuation] sample={sample} table_y={} border_y={table_border_y} PDF_table_y={pdf_table_y} header_y={} PDF_header_y={pdf_header_y}",
+            tables[0].bbox.y,
+            headers[0].y,
+        );
+        assert!(
+            (headers[0].y - pdf_header_y).abs() <= 4.0,
+            "{sample}: blank TAC host repeated its table-sized line height: header_y={}, PDF_y={pdf_header_y}",
+            headers[0].y,
+        );
+        assert_eq!(
+            doc.take_overflow_cell_lines(),
+            0,
+            "{sample}: following table text must stay inside page 9"
+        );
+    }
+}
+
+#[test]
 fn issue_1486_partial_table_tac_nested_table_stays_inside_page_body() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(SAMPLE);
     let bytes = fs::read(&path).unwrap_or_else(|e| panic!("read {SAMPLE}: {e}"));

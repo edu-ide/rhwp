@@ -13,6 +13,7 @@
 use std::fs;
 use std::path::Path;
 
+use rhwp::diagnostics::layout_anomaly::{scan_page, AnomalyOptions};
 use rhwp::document_core::DocumentCore;
 
 /// (샘플, 한글 실측 쪽수)
@@ -51,5 +52,24 @@ fn issue_2097_block_band_fill_page_pins() {
             *expected,
             "{sample}: 한글 COM 실측 쪽수와 불일치"
         );
+        if *sample == "samples/task2097/18095317_eogu_geumji.hwp" {
+            // The clean baseline has one existing overflow on physical page 21.
+            // Restoring the 21-page source owner must not add the continuation
+            // overflow formerly caused by taking another unit after its frame.
+            let options = AnomalyOptions::default();
+            let mut off_canvas_pages = Vec::new();
+            for page in 0..core.page_count() {
+                let tree = core
+                    .build_page_render_tree(page)
+                    .unwrap_or_else(|e| panic!("render {sample} page {page}: {e:?}"));
+                let anomalies = scan_page(page, &tree.root, core.page_count(), &options);
+                off_canvas_pages.extend(anomalies.off_canvas.iter().map(|_| page));
+            }
+            assert_eq!(
+                off_canvas_pages,
+                [20],
+                "{sample}: a stored continuation frame consumed an extra unit"
+            );
+        }
     }
 }

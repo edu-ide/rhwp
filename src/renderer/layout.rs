@@ -9638,7 +9638,19 @@ impl LayoutEngine {
                         tbl_inline_x,
                         None,
                         Some(para_y_for_table + visible_outer_top_px),
-                        outer_host_stored_vpos_hu,
+                        outer_host_stored_vpos_hu.map(|vpos_hu| {
+                            let host_style = composed
+                                .get(para_index)
+                                .map(|paragraph| paragraph.para_style_id as usize)
+                                .unwrap_or(para.para_shape_id as usize);
+                            table_layout::StoredTableHostAnchor {
+                                vpos_hu,
+                                zero_spacing_before: styles
+                                    .para_styles
+                                    .get(host_style)
+                                    .is_some_and(|style| style.spacing_before == 0.0),
+                            }
+                        }),
                         allow_para_top_bleed,
                         false,
                         physical_outer_box_paint_inset,

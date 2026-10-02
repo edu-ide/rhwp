@@ -135,3 +135,133 @@ fn no_assignment_drops_the_terminator() {
         offenders.join("\n  ")
     );
 }
+
+/// 실제 CLI의 셀 글상자 편집을 저장·재파싱하여 탭 확장과 surrogate pair를 함께 확인한다.
+#[test]
+fn cell_textbox_cli_counts_tabs_utf16_and_the_terminator() {
+    use rhwp::model::control::Control;
+    use std::process::Command;
+
+    let binary = std::env::var("CARGO_BIN_EXE_rhwp")
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_rhwp").to_string());
+    let run = |args: &[&str]| -> serde_json::Value {
+        let output = Command::new(&binary)
+            .args(args)
+            .output()
+            .expect("rhwp 실행");
+        assert!(
+            output.status.success(),
+            "rhwp {} 실패: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).expect("CLI JSON")
+    };
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "rhwp-char-count-textbox-{}-{nonce}.hwp",
+        std::process::id()
+    ));
+    let file = path.to_str().unwrap();
+    run(&["create-hwp", "--text", "사업 양식", "-o", file]);
+    let table = run(&[
+        "create-table",
+        file,
+        "--section",
+        "0",
+        "--para",
+        "0",
+        "--offset",
+        "0",
+        "--rows",
+        "2",
+        "--cols",
+        "2",
+        "-o",
+        file,
+    ]);
+    let para_idx = table["paraIdx"].as_u64().expect("table paraIdx") as usize;
+    let table_ctrl = table["controlIdx"].as_u64().expect("table controlIdx") as usize;
+    let para = para_idx.to_string();
+    let cell_path = serde_json::json!([
+        {"controlIndex": table_ctrl, "cellIndex": 3, "cellParaIndex": 0}
+    ])
+    .to_string();
+    let shape = run(&[
+        "create-shape",
+        file,
+        "--section",
+        "0",
+        "--para",
+        &para,
+        "--cell-path",
+        &cell_path,
+        "--offset",
+        "0",
+        "--width",
+        "5000",
+        "--height",
+        "3000",
+        "--shape-type",
+        "textbox",
+        "--treat-as-char",
+        "--text-wrap",
+        "InFrontOfText",
+        "-o",
+        file,
+    ]);
+    let shape_ctrl = shape["controlIdx"].as_u64().expect("shape controlIdx") as usize;
+    let ctrl = shape_ctrl.to_string();
+
+    // 새 문단 생성(2번)과 기존 문단 재편집(0번), 빈 문자열도 같은 규약을 따른다.
+    for (index, text) in [(2usize, "가\t😀나\t"), (0, ""), (2, "😀\tA")] {
+        let textbox_para = index.to_string();
+        run(&[
+            "set-cell-shape-text",
+            file,
+            "--section",
+            "0",
+            "--para",
+            &para,
+            "--cell-path",
+            &cell_path,
+            "--ctrl",
+            &ctrl,
+            "--textbox-para",
+            &textbox_para,
+            "--text",
+            text,
+            "-o",
+            file,
+        ]);
+        let document = load(&path);
+        let Control::Table(table) = &document.sections[0].paragraphs[para_idx].controls[table_ctrl]
+        else {
+            panic!("표 컨트롤");
+        };
+        let Control::Shape(shape) = &table.cells[3].paragraphs[0].controls[shape_ctrl] else {
+            panic!("셀 글상자 컨트롤");
+        };
+        let textbox = shape.drawing().unwrap().text_box.as_ref().expect("글상자");
+        let paragraph = &textbox.paragraphs[index];
+        assert_eq!(paragraph.text, text);
+        assert_eq!(paragraph.char_count, body_code_units(paragraph) + 1);
+        let mut code_units = 0u32;
+        let expected_offsets: Vec<u32> = text
+            .chars()
+            .map(|ch| {
+                let offset = code_units;
+                code_units += if ch == '\t' { 8 } else { ch.len_utf16() as u32 };
+                offset
+            })
+            .collect();
+        assert_eq!(paragraph.char_offsets, expected_offsets);
+        for paragraph in &textbox.paragraphs {
+            assert_eq!(paragraph.char_count, body_code_units(paragraph) + 1);
+        }
+    }
+    std::fs::remove_file(&path).expect("임시 HWP 제거");
+}

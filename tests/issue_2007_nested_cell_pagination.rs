@@ -35,6 +35,80 @@ fn lock_issue_2007_layout() -> MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+#[test]
+fn edited_new_table_keeps_page_cut_closure_borders() {
+    let _issue_2007_layout = lock_issue_2007_layout();
+    let mut core = DocumentCore::new_empty();
+    core.create_blank_document_native().expect("blank document");
+    core.create_table_ex_native(0, 0, 0, 1, 1, true, None, None)
+        .expect("new table");
+    let (para_index, control_index) = core.document().sections[0]
+        .paragraphs
+        .iter()
+        .enumerate()
+        .find_map(|(para_index, paragraph)| {
+            paragraph
+                .controls
+                .iter()
+                .position(|control| matches!(control, rhwp::model::control::Control::Table(_)))
+                .map(|control_index| (para_index, control_index))
+        })
+        .expect("new table control");
+    core.set_table_properties_native(0, para_index, control_index, r#"{"pageBreak":1}"#)
+        .expect("allow page breaks inside the long cell");
+    let text = "새 표의 긴 셀을 편집하면 쪽 경계에도 테두리가 필요하다. ".repeat(1000);
+    core.insert_text_in_cell_native(0, para_index, control_index, 0, 0, 0, &text)
+        .expect("edit long cell through DocumentCore");
+    let rhwp::model::control::Control::Table(table) =
+        &core.document().sections[0].paragraphs[para_index].controls[control_index]
+    else {
+        panic!("expected new table");
+    };
+    assert!(
+        core.page_count() >= 3,
+        "long cell must span several pages: pages={}, page_break={:?}, height={}, cell_height={}, lines={}, edited={}",
+        core.page_count(),
+        table.page_break,
+        table.common.height,
+        table.cells[0].height,
+        table.cells[0].paragraphs[0].line_segs.len(),
+        table.text_reflowed_after_edit,
+    );
+
+    let mut fragments = Vec::new();
+    for page in 0..core.page_count() {
+        let tree = core.build_page_render_tree(page).expect("render new table");
+        if let Some(table) = find_table_fragment(&tree.root, para_index, control_index) {
+            fragments.push(table.clone());
+        }
+    }
+    assert!(
+        fragments.len() >= 3,
+        "new table must have continuation fragments"
+    );
+    for (index, table) in fragments.iter().enumerate() {
+        let left = table.bbox.x;
+        let right = left + table.bbox.width;
+        if index > 0 {
+            assert!(
+                has_visible_full_width_horizontal_line_near(table, left, right, table.bbox.y),
+                "new table continuation {index} is missing its top closure"
+            );
+        }
+        if index + 1 < fragments.len() {
+            assert!(
+                has_visible_full_width_horizontal_line_near(
+                    table,
+                    left,
+                    right,
+                    table.bbox.y + table.bbox.height,
+                ),
+                "new table fragment {index} is missing its bottom closure"
+            );
+        }
+    }
+}
+
 fn page_text(node: &RenderNode, out: &mut String) {
     if let RenderNodeType::TextRun(run) = &node.node_type {
         out.push_str(&run.text);
@@ -1273,6 +1347,75 @@ fn issue_2007_cell_vpos_reset_does_not_overlap_following_paragraphs() {
             "p{} nested-cell continuation has overlapping painted text lines; \
              descendant LINE_SEG vpos reset must not rebase to the cell top",
             page_index + 1
+        );
+    }
+}
+
+#[test]
+fn issue_2287_middle_cell_clip_keeps_fragment_bottom_in_page() {
+    let _issue_2007_layout = lock_issue_2007_layout();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("samples/task2287/1342000_edu_curriculum_map.hwp");
+    let bytes = fs::read(path).expect("#2287 fixture read");
+    let core = DocumentCore::from_bytes(&bytes).expect("#2287 fixture parse");
+
+    fn descendant_bottom(node: &RenderNode) -> f64 {
+        node.children
+            .iter()
+            .map(descendant_bottom)
+            .fold(node.bbox.y + node.bbox.height, f64::max)
+    }
+
+    for (page, para, control, row) in [(32, 0, 2, 29), (82, 10, 0, 17)] {
+        let tree = core.build_page_render_tree(page).expect("#2287 fragment");
+        let table = find_table_fragment(&tree.root, para, control).expect("#2287 source table");
+        let middle_cell = table
+            .children
+            .iter()
+            .find(|node| {
+                matches!(&node.node_type, RenderNodeType::TableCell(cell)
+                    if cell.row == row && cell.col == 3 && cell.clip)
+            })
+            .expect("completed middle cell with an expanded paint clip");
+        let cell_bottom = middle_cell.bbox.y + middle_cell.bbox.height;
+        let content_bottom = middle_cell
+            .children
+            .iter()
+            .map(descendant_bottom)
+            .fold(middle_cell.bbox.y, f64::max);
+        let following_cell_top = table
+            .children
+            .iter()
+            .filter(|node| {
+                matches!(&node.node_type, RenderNodeType::TableCell(cell)
+                    if cell.row > row && cell.col == 3)
+            })
+            .map(|node| node.bbox.y)
+            .min_by(f64::total_cmp)
+            .expect("later rows in the same fragment");
+        assert!(
+            cell_bottom > following_cell_top + 1.0 && cell_bottom + 0.5 >= content_bottom,
+            "p{} middle-cell clip must still retain its content past the next row: clip={cell_bottom}, content={content_bottom}, next={following_cell_top}",
+            page + 1,
+        );
+
+        let cells_bottom = table
+            .children
+            .iter()
+            .filter(|node| matches!(node.node_type, RenderNodeType::TableCell(_)))
+            .map(|node| node.bbox.y + node.bbox.height)
+            .fold(table.bbox.y, f64::max);
+        let frame_bottom = table
+            .children
+            .iter()
+            .filter(|node| matches!(node.node_type, RenderNodeType::Line(_)))
+            .map(|node| node.bbox.y + node.bbox.height)
+            .fold(table.bbox.y + table.bbox.height, f64::max);
+        assert!(
+            frame_bottom <= cells_bottom + 0.5 && frame_bottom <= tree.root.bbox.height + 0.5,
+            "p{} middle-cell clip growth must not add blank height below the fragment: frame={frame_bottom}, cells={cells_bottom}, page={}",
+            page + 1,
+            tree.root.bbox.height,
         );
     }
 }

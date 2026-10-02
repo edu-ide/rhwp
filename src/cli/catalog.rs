@@ -1,8 +1,12 @@
 //! 최상위 CLI 명령 catalog.
 //!
-//! 이 목록은 #5511 Stage 1의 characterization 기준선이다. 아직 handler나 help 문구를
-//! 소유하지 않는다. 표면을 한 번에 전환하지 않도록 먼저 명령 이름, 분류, 가시성,
-//! feature, JSON·batch·MCP 참여 상태만 고정한다.
+//! 명령 이름·분류·가시성·feature・JSON·batch·MCP 참여 상태를 소유한다.
+//! Office 명령의 사용법과 요약도 같은 정의에서 help와 capabilities로 투영한다.
+
+#[path = "metadata/help/office.rs"]
+mod office;
+
+pub(crate) use office::OfficeCommandSpec;
 
 /// `capabilities.commands[].category`의 현재 값.
 #[allow(dead_code)]
@@ -1026,10 +1030,28 @@ pub(crate) const COMMANDS: &[CommandSpec] = &[
     ),
 ];
 
-pub(crate) const fn commands() -> &'static [CommandSpec] {
-    COMMANDS
+pub(crate) fn commands() -> &'static [CommandSpec] {
+    static ALL: std::sync::OnceLock<Vec<CommandSpec>> = std::sync::OnceLock::new();
+    ALL.get_or_init(|| {
+        COMMANDS
+            .iter()
+            .copied()
+            .chain(office_commands().iter().map(|entry| entry.command))
+            .collect()
+    })
+}
+
+pub(crate) const fn office_commands() -> &'static [OfficeCommandSpec] {
+    office::COMMANDS
+}
+
+#[allow(dead_code)]
+pub(crate) fn office_command(name: &str) -> Option<&'static OfficeCommandSpec> {
+    office_commands()
+        .iter()
+        .find(|entry| entry.command.name == name)
 }
 
 pub(crate) fn find(name: &str) -> Option<&'static CommandSpec> {
-    COMMANDS.iter().find(|command| command.name == name)
+    commands().iter().find(|command| command.name == name)
 }

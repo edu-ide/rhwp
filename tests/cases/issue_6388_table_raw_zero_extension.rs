@@ -13,6 +13,7 @@
 
 use rhwp::document_core::DocumentCore;
 use rhwp::model::control::Control;
+use rhwp::model::shape::{HorzAlign, TextWrap};
 use rhwp::model::table::Table;
 
 /// 표 4개 전부 `raw_ctrl_data` 가 비어 있는 HWP5 표본.
@@ -166,43 +167,60 @@ fn issue_6388_hwpx_tables_survive_move_and_save() {
 /// 위치 속성 setter 도 같은 계약이다 — `vertOffset`/`horzOffset` 경로의 0 확장.
 #[test]
 fn issue_6388_position_props_do_not_grow_empty_raw() {
-    let mut core = DocumentCore::from_bytes(&read_fixture(EMPTY_RAW_SAMPLE)).expect("파싱");
-    let c = first_table_coord(&core);
-    let (w, h) = {
-        let t = table_at(&core, c);
-        (t.common.width, t.common.height)
-    };
+    for sample in std::iter::once(EMPTY_RAW_SAMPLE).chain(HWPX_SAMPLES) {
+        let mut core = DocumentCore::from_bytes(&read_fixture(sample)).expect("파싱");
+        let c = first_table_coord(&core);
+        let (w, h) = {
+            let t = table_at(&core, c);
+            assert!(t.raw_ctrl_data.is_empty(), "{sample}: 전제: 빈 raw 표");
+            (t.common.width, t.common.height)
+        };
 
-    core.set_table_properties_native(c.0, c.1, c.2, r#"{"vertOffset":2000,"horzOffset":1500}"#)
-        .expect("위치 속성 설정");
+        core.set_table_properties_native(c.0, c.1, c.2, r#"{"vertOffset":2000,"horzOffset":1500}"#)
+            .expect("위치 속성 설정");
 
-    {
-        let t = table_at(&core, c);
+        {
+            let t = table_at(&core, c);
+            assert!(
+                t.raw_ctrl_data.is_empty(),
+                "{sample}: 위치 속성 setter 가 빈 raw 를 0 확장하면 안 된다 (#6388)"
+            );
+            assert_eq!(t.common.vertical_offset, 2000, "세로 오프셋 반영");
+            assert_eq!(t.common.horizontal_offset, 1500, "가로 오프셋 반영");
+        }
+
+        core.set_table_properties_native(
+            c.0,
+            c.1,
+            c.2,
+            r#"{"textWrap":"BehindText","horzAlign":"Right"}"#,
+        )
+        .expect("raw 없이 위치 플래그 설정");
         assert!(
-            t.raw_ctrl_data.is_empty(),
-            "위치 속성 setter 가 빈 raw 를 0 확장하면 안 된다 (#6388)"
+            table_at(&core, c).raw_ctrl_data.is_empty(),
+            "{sample}: 위치 플래그 동기화도 빈 raw 를 보존해야 함"
         );
-        assert_eq!(t.common.vertical_offset, 2000, "세로 오프셋 반영");
-        assert_eq!(t.common.horizontal_offset, 1500, "가로 오프셋 반영");
-    }
 
-    let saved = core.export_hwp_native().expect("저장");
-    let reparsed = DocumentCore::from_bytes(&saved).expect("재파싱");
-    let rc = first_table_coord(&reparsed);
-    let t = table_at(&reparsed, rc);
-    assert_eq!(
-        (t.common.width, t.common.height),
-        (w, h),
-        "위치 속성 변경 후 저장·재파싱에서 표 크기가 사라졌다 (#6388)"
-    );
-    assert_eq!(
-        t.common.vertical_offset, 2000,
-        "세로 오프셋이 저장에 반영됐다"
-    );
-    assert_eq!(
-        t.common.horizontal_offset, 1500,
-        "가로 오프셋이 저장에 반영됐다"
-    );
+        let saved = core.export_hwp_native().expect("저장");
+        let reparsed = DocumentCore::from_bytes(&saved).expect("재파싱");
+        let rc = first_table_coord(&reparsed);
+        let t = table_at(&reparsed, rc);
+        assert_eq!(
+            (t.common.width, t.common.height),
+            (w, h),
+            "{sample}: 위치 속성 변경 후 저장·재파싱에서 표 크기가 사라졌다 (#6388)"
+        );
+        assert_eq!(
+            t.common.vertical_offset, 2000,
+            "세로 오프셋이 저장에 반영됐다"
+        );
+        assert_eq!(
+            t.common.horizontal_offset, 1500,
+            "가로 오프셋이 저장에 반영됐다"
+        );
+        assert_eq!(t.common.text_wrap, TextWrap::BehindText, "텍스트 배치 저장");
+        assert_eq!(t.common.horz_align, HorzAlign::Right, "가로 정렬 저장");
+    }
 }
 
 /// raw 가 있는 표(한컴 파스본)의 dual-write 는 종전대로 유지된다.

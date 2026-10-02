@@ -78,7 +78,9 @@ fn top_level_spec(entry: &serde_json::Value) -> Option<HelpSpec> {
         .to_string();
     let summary = entry["summary"].as_str()?.to_string();
     let subcommands = subcommands(entry);
-    let usage = if subcommands.is_empty() {
+    let usage = if let Some(usage) = entry["usage"].as_str() {
+        usage.to_string()
+    } else if subcommands.is_empty() {
         format!("rhwp {command} [옵션]")
     } else {
         format!("rhwp {command} <하위명령> [옵션]")

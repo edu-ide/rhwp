@@ -416,6 +416,15 @@ fn capabilities_command_entries() -> Vec<serde_json::Value> {
     let mut commands = Vec::new();
     core::extend(&mut commands);
     extended::extend(&mut commands);
+    commands.extend(crate::cli::catalog::office_commands().iter().map(|entry| {
+        serde_json::json!({
+            "name": entry.command.name,
+            "category": entry.command.category.as_str(),
+            "summary": entry.summary,
+            "usage": format!("rhwp {}", entry.usage),
+            "flags": entry.flags(),
+        })
+    }));
     attach_subcommands(&mut commands);
     commands
 }

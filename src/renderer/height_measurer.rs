@@ -353,6 +353,165 @@ pub fn fit_measured_table_to_declared_height(
     fitted
 }
 
+/// A short label may share the physical title frame with the empty cell below
+/// it, beside a vertically merged title cell. Its stored line box can exceed
+/// its own cellSz without growing that title frame. Preserve measured body rows
+/// and recover only those label/empty rows inside the stored table object. A
+/// stale empty tail can yield its excess space without reducing a body row.
+/// Callers restrict this to native HWP5.
+pub(crate) fn fit_stored_spanning_label_rows(
+    table: &Table,
+    measured_rows: &[f64],
+    dpi: f64,
+) -> Option<Vec<f64>> {
+    let row_count = table.row_count as usize;
+    if row_count < 3
+        || measured_rows.len() != row_count
+        || table.common.treat_as_char
+        || !matches!(table.page_break, TablePageBreak::RowBreak)
+        || !matches!(table.common.text_wrap, TextWrap::TopAndBottom)
+        || !matches!(table.common.vert_rel_to, VertRelTo::Para)
+        || table.common.height == 0
+        || table.common.height >= 0x8000_0000
+        || table.text_reflowed_after_edit
+        || !table.local_resize_rows.is_empty()
+        || !table.local_resize_cols.is_empty()
+        || !table.local_resize_cell_heights.is_empty()
+        || !table.local_resize_cell_widths.is_empty()
+    {
+        return None;
+    }
+    let blank = |cell: &crate::model::table::Cell| {
+        cell.paragraphs
+            .iter()
+            .all(|para| para.text.trim().is_empty())
+    };
+    let stored_bottom = |cell: &crate::model::table::Cell| {
+        cell.paragraphs
+            .iter()
+            .flat_map(|para| para.line_segs.iter())
+            .map(|seg| hwpunit_to_px(seg.vertical_pos.saturating_add(seg.line_height), dpi))
+            .fold(0.0f64, f64::max)
+    };
+    let padded_bottom = |cell: &crate::model::table::Cell| {
+        let padding = cell.effective_padding(&table.padding);
+        stored_bottom(cell) + hwpunit_to_px(i32::from(padding.top) + i32::from(padding.bottom), dpi)
+    };
+    if table.cells.iter().any(|cell| {
+        cell.height == 0
+            || cell.height >= 0x8000_0000
+            || cell.row as usize + cell.row_span as usize > row_count
+            || cell.text_direction != 0
+            || cell.paragraphs.is_empty()
+            || !crate::renderer::cell_vpos_ladder_is_intact(&cell.paragraphs)
+            || cell.paragraphs.iter().any(|para| {
+                !para.controls.is_empty()
+                    || crate::renderer::para_has_no_stored_line_segs(para)
+                    || para.line_segs.iter().any(|seg| seg.vertical_pos < 0)
+            })
+            || (cell.row_span > 1
+                && !blank(cell)
+                && padded_bottom(cell) > hwpunit_to_px(cell.height as i32, dpi) + 0.5)
+    }) {
+        return None;
+    }
+    let mut declared_rows = vec![0.0f64; row_count];
+    for cell in &table.cells {
+        if cell.row_span == 1 {
+            let row = cell.row as usize;
+            declared_rows[row] = declared_rows[row].max(hwpunit_to_px(cell.height as i32, dpi));
+        }
+    }
+    if declared_rows.iter().any(|height| *height <= 0.0) {
+        return None;
+    }
+    let mut label_rows = vec![false; row_count];
+    for label in &table.cells {
+        let row = label.row as usize;
+        if label.row_span != 1
+            || row + 1 >= row_count
+            || blank(label)
+            || label.paragraphs.len() != 1
+            || label.paragraphs[0].line_segs.len() != 1
+            || label.paragraphs[0].line_segs[0].vertical_pos != 0
+            || padded_bottom(label) <= hwpunit_to_px(label.height as i32, dpi)
+        {
+            continue;
+        }
+        let below_is_blank = table.cells.iter().any(|cell| {
+            cell.row as usize == row + 1
+                && cell.row_span == 1
+                && cell.col == label.col
+                && cell.col_span == label.col_span
+                && blank(cell)
+        });
+        let adjacent_title_owns_frame = table.cells.iter().any(|cell| {
+            cell.row == label.row
+                && cell.row_span == 2
+                && cell.col == label.col + label.col_span
+                && !blank(cell)
+                && stored_bottom(label)
+                    + hwpunit_to_px(i32::from(label.effective_padding(&table.padding).top), dpi)
+                    <= hwpunit_to_px(cell.height as i32, dpi)
+        });
+        let other_row_content_fits = table.cells.iter().all(|cell| {
+            cell.row != label.row
+                || cell.row_span != 1
+                || std::ptr::eq(cell, label)
+                || blank(cell)
+                || padded_bottom(cell) <= declared_rows[row] + 0.5
+        });
+        label_rows[row] |= below_is_blank && adjacent_title_owns_frame && other_row_content_fits;
+    }
+    if !label_rows.iter().any(|is_label| *is_label) {
+        return None;
+    }
+    let mut fitted = measured_rows.to_vec();
+    for row in 0..row_count {
+        let empty_row = table
+            .cells
+            .iter()
+            .filter(|cell| cell.row as usize == row && cell.row_span == 1)
+            .all(blank);
+        if label_rows[row] || empty_row {
+            fitted[row] = declared_rows[row];
+        }
+    }
+    // Restoring the label row exposes the merged title's genuine residual.
+    // Keep it in that title's final row, rather than moving it to the table tail.
+    let mut spans: Vec<_> = table
+        .cells
+        .iter()
+        .filter(|cell| cell.row_span > 1)
+        .collect();
+    spans.sort_by_key(|cell| cell.row_span);
+    for cell in spans {
+        let row = cell.row as usize;
+        let end = row + cell.row_span as usize;
+        let declared = hwpunit_to_px(cell.height as i32, dpi);
+        let current = fitted[row..end].iter().sum::<f64>();
+        if declared > current {
+            fitted[end - 1] += declared - current;
+        }
+    }
+    let spacing = hwpunit_to_px(table.cell_spacing as i32, dpi);
+    let declared_height = hwpunit_to_px(table.common.height as i32, dpi);
+    let mut fitted_height =
+        fitted.iter().sum::<f64>() + spacing * row_count.saturating_sub(1) as f64;
+    let excess = fitted_height - declared_height;
+    let tail = row_count - 1;
+    let empty_tail = table
+        .cells
+        .iter()
+        .filter(|cell| cell.row as usize == tail)
+        .all(|cell| cell.row_span == 1 && blank(cell));
+    if excess > 0.5 && excess <= fitted[tail] && empty_tail {
+        fitted[tail] -= excess;
+        fitted_height -= excess;
+    }
+    ((fitted_height - declared_height).abs() <= 0.5).then_some(fitted)
+}
+
 /// 빈 host의 native HWP5 RowBreak 표에서 마지막 중첩 셀만 선언 높이를 초과해
 /// 과대 측정된 경우, 앞 행의 실제 경계는 보존하고 마지막 행만 선언 총높이에 맞춘다.
 ///
@@ -2790,6 +2949,12 @@ impl HeightMeasurer {
         for h in &mut row_heights {
             if *h <= 0.0 {
                 *h = hwpunit_to_px(400, self.dpi);
+            }
+        }
+
+        if self.is_native_hwp5 {
+            if let Some(fitted) = fit_stored_spanning_label_rows(table, &row_heights, self.dpi) {
+                row_heights = fitted;
             }
         }
 

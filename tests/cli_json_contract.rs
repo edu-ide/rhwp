@@ -579,6 +579,47 @@ fn capabilities_covers_every_help_command() {
     );
 }
 
+#[test]
+fn capabilities_exposes_office_edit_and_diagnostic_commands() {
+    let cap = parse_stdout_json(&["capabilities"], &run(&["capabilities"]));
+    let commands = cap["commands"].as_array().expect("commands");
+    for (name, category, flags) in [
+        (
+            "set-cell-text",
+            "edit",
+            vec!["--cell-path", "--cell-para", "--text", "-o"],
+        ),
+        ("get-cell-text", "query", vec!["--para", "--cell-path"]),
+        ("lint", "diagnostic", vec![]),
+        (
+            "get-header-footer-para-info",
+            "query",
+            vec!["--kind", "--hf-para"],
+        ),
+    ] {
+        let command = commands
+            .iter()
+            .find(|entry| entry["name"] == name)
+            .unwrap_or_else(|| panic!("Office 명령 {name} 누락"));
+        assert_eq!(command["category"], category, "{name}");
+        assert!(command["usage"]
+            .as_str()
+            .unwrap()
+            .starts_with(&format!("rhwp {name} ")));
+        assert!(!command["summary"].as_str().unwrap().is_empty());
+        for flag in flags {
+            assert!(
+                command["flags"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|value| value == flag),
+                "{name}: {flag}"
+            );
+        }
+    }
+}
+
 // ── export-structure --json ────────────────────────────────────────────────
 
 #[test]

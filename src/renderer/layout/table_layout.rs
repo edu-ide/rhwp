@@ -3,7 +3,8 @@
 use super::super::composer::{compose_paragraph, ComposedLine, ComposedParagraph};
 use super::super::height_measurer::{
     fit_measured_table_declared_tail_to_declared_height,
-    fit_measured_table_nested_tail_to_declared_height, MeasuredTable,
+    fit_measured_table_nested_tail_to_declared_height, fit_stored_spanning_label_rows,
+    MeasuredTable,
 };
 use super::super::page_layout::LayoutRect;
 use super::super::render_tree::*;
@@ -16,6 +17,11 @@ use crate::model::table::{TablePageBreak, VerticalAlign};
 use crate::renderer::float_placement::{
     original_hwpx_column_rowbreak_equal_outer_margin_hu, signed_hwpunit,
 };
+
+pub(crate) struct StoredTableHostAnchor {
+    pub(super) vpos_hu: i32,
+    pub(super) zero_spacing_before: bool,
+}
 
 const ROWBREAK_OBJECT_BOTTOM_BLEED_TOLERANCE_PX: f64 = 64.0;
 /// [#3738 Stage 19] native HWP5가 빈 1×1 RowBreak picture table에 남기는 stale page
@@ -2369,11 +2375,15 @@ impl LayoutEngine {
         inline_x_override: Option<f64>,
         nested_split: Option<&NestedTableSplit>,
         para_y: Option<f64>,
-        outer_host_stored_vpos_hu: Option<i32>,
+        outer_host_anchor: Option<StoredTableHostAnchor>,
         allow_para_top_bleed: bool,
         clamp_header_negative_para_offset: bool,
         physical_outer_box_paint_inset: bool,
     ) -> f64 {
+        let outer_host_stored_vpos_hu = outer_host_anchor.as_ref().map(|anchor| anchor.vpos_hu);
+        let host_line_owns_object_top = outer_host_anchor
+            .as_ref()
+            .is_some_and(|anchor| anchor.zero_spacing_before);
         if table.cells.is_empty() {
             if depth == 0 {
                 return y_start;
@@ -2899,6 +2909,32 @@ impl LayoutEngine {
             } else {
                 computed_y
             }
+        };
+        // The recovered spanning frame and its stored host line describe one
+        // complete physical object. Empty host spacing must not displace that
+        // object after pagination has retained its source page owner.
+        let flow_table_y = if depth == 0
+            && inline_x_override.is_none()
+            && !physical_outer_box_paint_inset
+            && host_line_owns_object_top
+            && self.profile.get().hwp5_stored_pagination_layout()
+            && fit_stored_spanning_label_rows(table, &row_heights, self.dpi).is_some()
+        {
+            outer_host_stored_vpos_hu
+                .map(|vpos| col_area.y + hwpunit_to_px(vpos, self.dpi))
+                .filter(|source_y| {
+                    *source_y >= col_area.y
+                        && *source_y + table_height <= col_area.y + col_area.height + 0.5
+                        && !col_node.children.iter().any(|node| {
+                            matches!(&node.node_type, RenderNodeType::Table(previous)
+                                if previous.para_index.zip(table_meta).is_some_and(
+                                    |(previous, (current, _))| previous < current))
+                                && node.bbox.y + node.bbox.height > *source_y + 0.5
+                        })
+                })
+                .unwrap_or(flow_table_y)
+        } else {
+            flow_table_y
         };
         let table_y = flow_table_y
             + if physical_outer_box_paint_inset {
@@ -3840,6 +3876,11 @@ impl LayoutEngine {
                 relaxed_pad,
                 true,
             );
+        }
+        if self.profile.get().native_hwp5_layout() {
+            if let Some(fitted) = fit_stored_spanning_label_rows(table, &row_heights, self.dpi) {
+                row_heights = fitted;
+            }
         }
         if fit_common_height {
             self.fit_row_heights_to_common_height(table, &mut row_heights);
@@ -11146,9 +11187,10 @@ impl LayoutEngine {
     /// paint되지 않는 마지막 줄의 trailing line/paragraph spacing.
     ///
     /// `CellUnit` 전체 높이는 표를 통째로 측정할 때 필요하므로 변경하지 않는다.
-    /// 실제 컷이 control-free 문단 경계의 `양수 vpos -> 0 이하`에서 끝날 때만
-    /// 이 값을 빼서, 마지막 가시 줄은 현 쪽에 남기고 그 뒤의 공백은 물리 쪽
-    /// 경계에서 버린다. control 문단의 로컬 좌표 reset은 물리 경계가 아니다.
+    /// 실제 컷이 control-free 문단 사이의 저장 reset 또는 한 문단 안의
+    /// `0 -> 0` 저장 restart에서 끝날 때만 이 값을 뺀다. 마지막 가시 줄은
+    /// 현 쪽에 남기고 뒤의 공백은 물리 쪽 경계에서 버린다. control 문단의
+    /// 로컬 좌표 reset과 편집 뒤의 재조판 높이는 이 근거로 줄이지 않는다.
     fn native_multirow_saved_reset_trailing_trim(
         &self,
         table: &crate::model::table::Table,
@@ -11176,6 +11218,31 @@ impl LayoutEngine {
 
         let previous_unit = &units[end_cut - 1];
         let next_unit = &units[end_cut];
+        // A same-paragraph zero-to-zero source restart owns two physical
+        // frames. Keep the last glyph in the first frame, but discard its
+        // unpainted trailing spacing at that exact cut. Edited and locally
+        // resized cells must continue to use their reflowed unit heights.
+        if previous_unit.para_idx == next_unit.para_idx
+            && next_unit.vis_start > 0
+            && previous_unit.vis_end == next_unit.vis_start
+            && !table.text_reflowed_after_edit
+            && table.local_resize_rows.is_empty()
+            && table.local_resize_cols.is_empty()
+            && table.local_resize_cell_widths.is_empty()
+            && table.local_resize_cell_heights.is_empty()
+        {
+            if let Some(paragraph) = cell.paragraphs.get(next_unit.para_idx) {
+                if paragraph.controls.is_empty() && Self::native_source_line_reset(cell, next_unit)
+                {
+                    if let Some(previous) = paragraph.line_segs.get(next_unit.vis_start - 1) {
+                        if previous.vertical_pos == 0 {
+                            return hwpunit_to_px(previous.line_spacing.max(0), self.dpi)
+                                .min(previous_unit.height.max(0.0));
+                        }
+                    }
+                }
+            }
+        }
         if !next_unit.hard_break_before
             || next_unit.para_idx <= previous_unit.para_idx
             || previous_unit.vis_start >= previous_unit.vis_end
@@ -11560,6 +11627,136 @@ impl LayoutEngine {
         start_cut: &[usize],
         styles: &ResolvedStyleSet,
     ) -> Option<RowCutResult> {
+        self.source_frame_cut_for_row(table, row, start_cut, styles, None)
+    }
+
+    /// Source line bands can restart below the generic half-page frame floor.
+    /// An ambiguous paragraph-local zero requires an independent cell with
+    /// the same frame height. A strong restart near physical capacity may
+    /// instead have a naturally shorter companion or one remaining owner.
+    pub(crate) fn native_source_frame_cut_for_row(
+        &self,
+        table: &crate::model::table::Table,
+        row: usize,
+        start_cut: &[usize],
+        styles: &ResolvedStyleSet,
+        budget: f64,
+    ) -> Option<RowCutResult> {
+        if !self.profile.get().hwp5_stored_pagination_layout()
+            || table.common.treat_as_char
+            || table.text_reflowed_after_edit
+            || !table.local_resize_rows.is_empty()
+            || !table.local_resize_cols.is_empty()
+            || !table.local_resize_cell_widths.is_empty()
+            || !table.local_resize_cell_heights.is_empty()
+            || !matches!(
+                table.page_break,
+                crate::model::table::TablePageBreak::RowBreak
+            )
+            || table
+                .cells
+                .iter()
+                .filter(|cell| cell.row as usize == row)
+                .any(|cell| {
+                    cell.row_span != 1
+                        || cell.paragraphs.iter().any(|paragraph| {
+                            !paragraph.controls.is_empty()
+                                || crate::renderer::para_has_no_stored_line_segs(paragraph)
+                                || paragraph
+                                    .line_segs
+                                    .iter()
+                                    .any(|segment| segment.vertical_pos < 0)
+                        })
+                })
+        {
+            return None;
+        }
+        self.source_frame_cut_for_row(table, row, start_cut, styles, Some(budget))
+    }
+
+    fn native_source_line_reset(cell: &crate::model::table::Cell, unit: &CellUnit) -> bool {
+        let Some(paragraph) = cell.paragraphs.get(unit.para_idx) else {
+            return false;
+        };
+        let Some(current) = paragraph.line_segs.get(unit.vis_start) else {
+            return false;
+        };
+        let previous = if unit.vis_start > 0 {
+            paragraph.line_segs.get(unit.vis_start - 1)
+        } else {
+            unit.para_idx
+                .checked_sub(1)
+                .and_then(|index| cell.paragraphs.get(index))
+                .and_then(|previous| previous.line_segs.last())
+        };
+        let Some(previous) = previous else {
+            return false;
+        };
+        if current.vertical_pos != 0
+            || previous.line_height <= 0
+            || previous.vertical_pos < 0
+            || previous.tag & crate::model::paragraph::LineSeg::TAG_IMPLEMENTATION_PROPERTY != 0
+            || current.tag & crate::model::paragraph::LineSeg::TAG_IMPLEMENTATION_PROPERTY != 0
+        {
+            return false;
+        }
+        if unit.vis_start > 0 {
+            // Two distinct lines inside one source paragraph cannot share
+            // the same painted band. Zero-to-zero is also a saved restart.
+            return previous.vertical_pos.saturating_add(previous.line_height) > 0;
+        }
+        // Paragraph-local zero alone is ambiguous. A neighbouring
+        // paragraph must retain the cell-global ladder on one side of
+        // the restart; ordinary paragraphs that all begin at zero do not.
+        previous.vertical_pos > 0
+            && (cell
+                .paragraphs
+                .get(unit.para_idx - 1)
+                .and_then(|previous| previous.line_segs.first())
+                .is_some_and(|first| first.vertical_pos > 0)
+                || cell
+                    .paragraphs
+                    .get(unit.para_idx + 1)
+                    .and_then(|next| next.line_segs.first())
+                    .is_some_and(|first| first.vertical_pos > 0))
+    }
+
+    fn native_source_cross_paragraph_reset(
+        cell: &crate::model::table::Cell,
+        unit: &CellUnit,
+    ) -> bool {
+        unit.vis_start == 0
+            && unit.para_idx > 0
+            && cell
+                .paragraphs
+                .get(unit.para_idx)
+                .and_then(|p| p.line_segs.first())
+                .is_some_and(|line| {
+                    line.vertical_pos == 0
+                        && line.line_height > 0
+                        && line.tag & crate::model::paragraph::LineSeg::TAG_IMPLEMENTATION_PROPERTY
+                            == 0
+                })
+            && cell
+                .paragraphs
+                .get(unit.para_idx - 1)
+                .and_then(|p| p.line_segs.last())
+                .is_some_and(|line| {
+                    line.vertical_pos > 0
+                        && line.line_height > 0
+                        && line.tag & crate::model::paragraph::LineSeg::TAG_IMPLEMENTATION_PROPERTY
+                            == 0
+                })
+    }
+
+    fn source_frame_cut_for_row(
+        &self,
+        table: &crate::model::table::Table,
+        row: usize,
+        start_cut: &[usize],
+        styles: &ResolvedStyleSet,
+        native_budget: Option<f64>,
+    ) -> Option<RowCutResult> {
         let mut row_cells: Vec<&crate::model::table::Cell> = table
             .cells
             .iter()
@@ -11574,30 +11771,110 @@ impl LayoutEngine {
         // protection may intentionally rewind a unit *before* the stored
         // boundary, which is correct for a capacity cut but not when asking
         // for the source frame itself.
-        let frame_height = row_cells
+        let candidates: Vec<_> = row_cells
             .iter()
             .enumerate()
-            .filter_map(|(cell_idx, cell)| {
+            .map(|(cell_idx, cell)| {
                 let units = self.cell_units(cell, table, styles);
                 let start = start_cut
                     .get(cell_idx)
                     .copied()
                     .unwrap_or(0)
                     .min(units.len());
-                units
-                    .iter()
-                    .enumerate()
-                    .skip(start + 1)
-                    .find(|(_, unit)| unit.stored_frame_break_before)
-                    .map(|(end, _)| {
-                        units[start..end]
-                            .iter()
-                            .map(|unit| unit.height)
-                            .sum::<f64>()
-                    })
+                let mut height = 0.0;
+                for (index, unit) in units.iter().enumerate().skip(start) {
+                    let strong_reset = unit.stored_frame_break_before
+                        || (native_budget.is_some() && Self::native_source_line_reset(cell, unit));
+                    let paired_reset = native_budget.is_some()
+                        && Self::native_source_cross_paragraph_reset(cell, unit);
+                    if index > start && (strong_reset || paired_reset) {
+                        return Some((index, height, strong_reset));
+                    }
+                    height += unit.height;
+                }
+                None
             })
-            .filter(|height| *height > 0.5)
+            .collect();
+        let natural_heights: Vec<_> = row_cells
+            .iter()
+            .enumerate()
+            .map(|(index, cell)| {
+                let units = self.cell_units(cell, table, styles);
+                let start = start_cut.get(index).copied().unwrap_or(0).min(units.len());
+                let trailing_spacing = units
+                    .last()
+                    .and_then(|unit| {
+                        cell.paragraphs.get(unit.para_idx).and_then(|paragraph| {
+                            paragraph.line_segs.get(unit.vis_end.saturating_sub(1))
+                        })
+                    })
+                    .map(|seg| hwpunit_to_px(seg.line_spacing.max(0), self.dpi))
+                    .unwrap_or(0.0);
+                units[start..].iter().map(|unit| unit.height).sum::<f64>() + trailing_spacing
+            })
+            .collect();
+        let frame_height = candidates
+            .iter()
+            .enumerate()
+            .filter_map(|(index, candidate)| {
+                let (_, height, strong) = (*candidate)?;
+                let natural_partner = native_budget.is_some()
+                    && candidates.iter().enumerate().any(|(other, candidate)| {
+                        other != index
+                            && candidate.is_none()
+                            && (natural_heights[other] - height).abs() <= 0.5
+                    });
+                (height > 0.5 && (strong || natural_partner)).then_some(height)
+            })
             .reduce(f64::min)?;
+        if let Some(budget) = native_budget {
+            // A paragraph-local zero cannot establish a physical boundary on
+            // its own. A second visible cell must independently own the same
+            // frame, or finish naturally at its exact height. Fully consumed partners
+            // do not own this continuation.
+            let visible: Vec<_> = row_cells
+                .iter()
+                .enumerate()
+                .filter_map(|(index, cell)| {
+                    let units = self.cell_units(cell, table, styles);
+                    let start = start_cut.get(index).copied().unwrap_or(0).min(units.len());
+                    units
+                        .iter()
+                        .skip(start)
+                        .any(|unit| !unit.empty_spacer && unit.vis_start < unit.vis_end)
+                        .then_some((index, natural_heights[index]))
+                })
+                .collect();
+            let strong_capacity_frame = (frame_height - budget).abs() <= 24.0
+                && candidates.iter().any(|candidate| {
+                    candidate.is_some_and(|(_, height, strong)| {
+                        strong && (height - frame_height).abs() <= 0.5
+                    })
+                });
+            let aligned = visible.iter().all(|(index, natural_height)| {
+                candidates[*index].map_or(
+                    (*natural_height - frame_height).abs() <= 0.5
+                        || (strong_capacity_frame && *natural_height <= frame_height + 0.5),
+                    |(_, height, _)| (height - frame_height).abs() <= 0.5,
+                )
+            });
+            if !aligned
+                || (visible.len() < 2
+                    && (frame_height - budget).abs() > 24.0
+                    && !candidates.iter().enumerate().any(|(index, candidate)| {
+                        candidate.is_some_and(|(end, _, _)| {
+                            self.cell_units(row_cells[index], table, styles)[end]
+                                .stored_frame_break_before
+                        })
+                    }))
+            {
+                return None;
+            }
+        }
+        let frame_ends: Vec<_> = candidates
+            .iter()
+            .map(|candidate| candidate.map(|(end, height, _)| (end, height)))
+            .collect();
 
         let mut end_cut = Vec::with_capacity(row_cells.len());
         let mut consumed_height = 0.0f64;
@@ -11612,7 +11889,9 @@ impl LayoutEngine {
             let mut end = start;
             let mut height = 0.0f64;
             while end < units.len()
-                && !units[end].stored_frame_break_before
+                && (end == start
+                    || (!units[end].stored_frame_break_before
+                        && frame_ends[cell_idx].is_none_or(|(frame_end, _)| end < frame_end)))
                 && (height <= 0.5 || height + units[end].height <= frame_height + 0.5)
             {
                 height += units[end].height;
@@ -11629,6 +11908,82 @@ impl LayoutEngine {
             fully_consumed,
             consumed_height,
         })
+    }
+
+    /// Whether this continuation begins at the source's physical frame reset.
+    pub(crate) fn row_cut_starts_at_stored_frame_reset(
+        &self,
+        table: &crate::model::table::Table,
+        row: usize,
+        start_cut: &[usize],
+        styles: &ResolvedStyleSet,
+    ) -> bool {
+        let mut cells: Vec<_> = table
+            .cells
+            .iter()
+            .filter(|cell| cell.row as usize == row && cell.row_span == 1)
+            .collect();
+        cells.sort_by_key(|cell| cell.col);
+        let mut visible_owners = 0;
+        let mut strong_reset = false;
+        for (index, cell) in cells.iter().enumerate() {
+            let units = self.cell_units(cell, table, styles);
+            let start = start_cut.get(index).copied().unwrap_or(0);
+            if !units
+                .iter()
+                .skip(start)
+                .any(|unit| !unit.empty_spacer && unit.vis_start < unit.vis_end)
+            {
+                continue;
+            }
+            visible_owners += 1;
+            let Some(unit) = units.get(start) else {
+                return false;
+            };
+            let strong =
+                unit.stored_frame_break_before || Self::native_source_line_reset(cell, unit);
+            strong_reset |= strong;
+            if start == 0 || !(strong || Self::native_source_cross_paragraph_reset(cell, unit)) {
+                return false;
+            }
+        }
+        let matched_natural_partner = cells.iter().enumerate().any(|(index, cell)| {
+            let units = self.cell_units(cell, table, styles);
+            let start = start_cut.get(index).copied().unwrap_or(0);
+            if start == 0 || start >= units.len() {
+                return false;
+            }
+            if !Self::native_source_cross_paragraph_reset(cell, &units[start]) {
+                return false;
+            }
+            let prefix: f64 = units[..start].iter().map(|unit| unit.height).sum();
+            cells.iter().enumerate().any(|(other, partner)| {
+                let partner_units = self.cell_units(partner, table, styles);
+                let partner_start = start_cut.get(other).copied().unwrap_or(0);
+                other != index
+                    && partner_start == partner_units.len()
+                    && partner_units
+                        .iter()
+                        .any(|unit| !unit.empty_spacer && unit.vis_start < unit.vis_end)
+                    && {
+                        let trailing_spacing = partner_units
+                            .last()
+                            .and_then(|unit| {
+                                partner.paragraphs.get(unit.para_idx).and_then(|paragraph| {
+                                    paragraph.line_segs.get(unit.vis_end.saturating_sub(1))
+                                })
+                            })
+                            .map(|seg| hwpunit_to_px(seg.line_spacing.max(0), self.dpi))
+                            .unwrap_or(0.0);
+                        (partner_units.iter().map(|unit| unit.height).sum::<f64>()
+                            + trailing_spacing
+                            - prefix)
+                            .abs()
+                            <= 0.5
+                    }
+            })
+        });
+        visible_owners > 0 && (strong_reset || matched_natural_partner)
     }
 
     /// Extend an existing row cut to the end of the omitted source paragraph.
@@ -15935,6 +16290,120 @@ mod row_cut_tests {
             ),
             "control 문단의 로컬 vpos=0은 plain-text 물리 frame reset으로 승격하지 않음"
         );
+
+        // Native physical-frame cuts require independent plain-text owners,
+        // and saved geometry loses its authority after editing or resizing.
+        let source_fixture = |left: Vec<Paragraph>, right: Vec<Paragraph>| {
+            let mut host = rowbreak_table(vec![
+                cell(0, 0, left),
+                cell(0, 1, right),
+                cell(1, 0, vec![visible_text_para(1, 0)]),
+            ]);
+            host.common.treat_as_char = false;
+            host.common.text_wrap = TextWrap::TopAndBottom;
+            host
+        };
+        let source_engine = || {
+            let engine = LayoutEngine::new(96.0);
+            engine.set_layout_profile(crate::model::provenance::LayoutCompatibilityProfile::new(
+                false, false, false, false, false, true,
+            ));
+            engine
+        };
+        {
+            let engine = source_engine();
+            let left = vec![visible_text_para(3, 0), visible_text_para(2, 0)];
+            let matched = source_fixture(left.clone(), vec![visible_text_para(3, 0)]);
+            let cut = engine
+                .native_source_frame_cut_for_row(&matched, 0, &[], &styles, 48.0)
+                .expect("same-height natural owner confirms the cross-paragraph source frame");
+            assert_eq!(cut.end_cut, [3, 3]);
+            let short_label = source_fixture(left.clone(), vec![visible_text_para(1, 0)]);
+            assert!(
+                engine
+                    .native_source_frame_cut_for_row(&short_label, 0, &[], &styles, 48.0)
+                    .is_none(),
+                "a short label does not confirm an ordinary paragraph-local zero"
+            );
+            let ordinary = source_fixture(left.clone(), left);
+            assert!(
+                engine
+                    .native_source_frame_cut_for_row(&ordinary, 0, &[], &styles, 48.0)
+                    .is_none(),
+                "two ordinary paragraphs starting locally at zero need an independent frame witness"
+            );
+        }
+        {
+            let engine = source_engine();
+            let mut strong = visible_text_para(5, 0);
+            strong.line_segs[3].vertical_pos = 0;
+            strong.line_segs[4].vertical_pos = 1200;
+            let host = source_fixture(vec![strong], vec![visible_text_para(1, 0)]);
+            let cut = engine
+                .native_source_frame_cut_for_row(&host, 0, &[], &styles, 48.0)
+                .expect("a strong source restart near capacity may have a shorter natural owner");
+            assert_eq!(cut.end_cut, [3, 1]);
+            assert!(
+                engine
+                    .native_source_frame_cut_for_row(&host, 0, &[], &styles, 200.0)
+                    .is_none(),
+                "a shorter natural owner cannot establish an unrelated frame far from capacity"
+            );
+        }
+        {
+            let engine = source_engine();
+            let host = source_fixture(
+                vec![visible_text_para(3, 0), visible_text_para(2, 0)],
+                vec![visible_text_para(3, 0)],
+            );
+            assert!(engine
+                .native_source_frame_cut_for_row(&host, 0, &[], &styles, 48.0)
+                .is_some());
+            let mut edited = host.clone();
+            edited.text_reflowed_after_edit = true;
+            assert!(engine
+                .native_source_frame_cut_for_row(&edited, 0, &[], &styles, 48.0)
+                .is_none());
+            for variant in 0..4 {
+                let mut resized = host.clone();
+                match variant {
+                    0 => resized.local_resize_rows.push(0),
+                    1 => resized.local_resize_cols.push(0),
+                    2 => resized.local_resize_cell_widths.push((0, 10000)),
+                    _ => resized.local_resize_cell_heights.push((0, 10000)),
+                }
+                assert!(
+                    engine
+                        .native_source_frame_cut_for_row(&resized, 0, &[], &styles, 48.0)
+                        .is_none(),
+                    "local resize variant {variant} invalidates saved pagination"
+                );
+            }
+            let mut synthetic = host.clone();
+            for segment in &mut synthetic.cells[0].paragraphs[0].line_segs {
+                segment.tag = LineSeg::TAG_IMPLEMENTATION_PROPERTY;
+            }
+            assert!(engine
+                .native_source_frame_cut_for_row(&synthetic, 0, &[], &styles, 48.0)
+                .is_none());
+        }
+        let engine = source_engine();
+        let source = source_fixture(
+            vec![visible_text_para(3, 0), visible_text_para(2, 0)],
+            vec![visible_text_para(3, 0)],
+        );
+        for variant in 0..3 {
+            let mut invalid = source.clone();
+            match variant {
+                0 => invalid.cells[0].paragraphs[1].controls = non_inline_picture_para(0).controls,
+                1 => invalid.cells[0].paragraphs[0].line_segs[0].vertical_pos = -1,
+                _ => invalid.cells[0].row_span = 2,
+            }
+            assert!(
+                engine.native_source_frame_cut_for_row(&invalid, 0, &[], &styles, 48.0).is_none(),
+                "control, negative vpos, and spanning cells cannot own a plain native frame: {variant}"
+            );
+        }
     }
 
     #[test]
@@ -16000,6 +16469,58 @@ mod row_cut_tests {
             0.0,
             "control을 소유한 이전 문단도 plain-text 저장 reset으로 승격하지 않음"
         );
+
+        // A same-paragraph saved 0-to-0 restart discards only unpainted line
+        // spacing; edited or control-owned paragraphs retain their full units.
+        {
+            let mut paragraph = visible_text_para(3, 0);
+            paragraph.line_segs[0].line_spacing = 472;
+            paragraph.line_segs[1].vertical_pos = 0;
+            paragraph.line_segs[2].vertical_pos = 1200;
+            let mut host = rowbreak_table(vec![
+                cell(0, 0, vec![paragraph]),
+                cell(0, 1, vec![visible_text_para(1, 0)]),
+                cell(1, 0, vec![visible_text_para(1, 0)]),
+            ]);
+            host.common.treat_as_char = false;
+            host.common.text_wrap = TextWrap::TopAndBottom;
+            let mut first = saved_reset_unit(22.293333333, 0, 1, false);
+            first.vis_start = 0;
+            let mut next = saved_reset_unit(16.0, 0, 2, false);
+            next.vis_start = 1;
+            let units = [first, next];
+            let trim = eng.native_multirow_saved_reset_trailing_trim(
+                &host,
+                &host.cells[0],
+                &units,
+                1,
+                &styles,
+            );
+            assert!((trim - 472.0 / 75.0).abs() < 0.001);
+            host.text_reflowed_after_edit = true;
+            assert_eq!(
+                eng.native_multirow_saved_reset_trailing_trim(
+                    &host,
+                    &host.cells[0],
+                    &units,
+                    1,
+                    &styles
+                ),
+                0.0
+            );
+            host.text_reflowed_after_edit = false;
+            host.cells[0].paragraphs[0].controls = non_inline_picture_para(0).controls;
+            assert_eq!(
+                eng.native_multirow_saved_reset_trailing_trim(
+                    &host,
+                    &host.cells[0],
+                    &units,
+                    1,
+                    &styles
+                ),
+                0.0
+            );
+        }
     }
 
     #[test]
