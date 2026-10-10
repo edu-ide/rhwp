@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+### CLI·agent
+
+- `insert-cell-text` / `delete-cell-text` 가 `--section N` 을 받는다 (`--cell-path` 경로형 전용, 기본 0). 다중 구역 문서에서
+  첫 구역 밖 표의 중첩 표 셀(표 안의 표)도 편집할 수 있다. core 의 `*_in_cell_by_path` 는 이미 구역 번호를 받고 있었고 CLI 래퍼가
+  0 으로 고정돼 있던 것을 푼 것이다. `--ctrl/--cell` 형에 `--section` 을 주면 사용법 오류로 거부한다.
+
 ## [0.8.6] — 2026-09-02
 
 > v0.8.4 이후 기능 기준선의 2,214커밋에서 확인한 262개 PR provenance를 바탕으로 준비한 누적 PATCH
